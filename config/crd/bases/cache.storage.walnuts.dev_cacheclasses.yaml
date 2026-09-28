@@ -37,13 +37,17 @@ spec:
                   message: quota requires the xfs-project backend
                 - rule: "!has(self.backend) || self.backend != 'xfs-project' || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled)"
                   message: xfs-project backend requires quota to be enabled
-                - rule: "!has(self.maxBytes) || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')"
+                - rule: "!has(self.maxBytes) || quantity(string(self.maxBytes)).sign() >= 0"
+                  message: maxBytes must not be negative
+                - rule: "!has(self.quota) || !has(self.quota.defaultMaxBytes) || quantity(string(self.quota.defaultMaxBytes)).sign() >= 0"
+                  message: quota.defaultMaxBytes must not be negative
+                - rule: "!has(self.maxBytes) || quantity(string(self.maxBytes)).sign() <= 0 || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')"
                   message: maxBytes requires quota to be enabled with the xfs-project backend
-                - rule: "!has(self.quota) || !has(self.quota.defaultMaxBytes) || (has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')"
+                - rule: "!has(self.quota) || !has(self.quota.defaultMaxBytes) || quantity(string(self.quota.defaultMaxBytes)).sign() <= 0 || (has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')"
                   message: quota.defaultMaxBytes requires quota to be enabled with the xfs-project backend
-                - rule: "!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || has(self.maxBytes) || (has(self.quota) && has(self.quota.defaultMaxBytes))"
+                - rule: "!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || ((has(self.maxBytes) && quantity(string(self.maxBytes)).sign() > 0) || (has(self.quota.defaultMaxBytes) && quantity(string(self.quota.defaultMaxBytes)).sign() > 0))"
                   message: quota requires maxBytes or quota.defaultMaxBytes
-                - rule: "!has(self.maxBytes) || !has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))"
+                - rule: "!has(self.maxBytes) || quantity(string(self.maxBytes)).sign() <= 0 || !has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))"
                   message: quota.defaultMaxBytes must not exceed maxBytes
                 - rule: "!has(self.pressure) || ((!has(self.pressure.highFreePercent) && !has(self.pressure.lowFreePercent)) || (has(self.pressure.highFreePercent) && has(self.pressure.lowFreePercent) && ((self.pressure.highFreePercent == 0 && self.pressure.lowFreePercent == 0) || self.pressure.highFreePercent > self.pressure.lowFreePercent)))"
                   message: highFreePercent and lowFreePercent must be configured together, with the high value greater than the low value

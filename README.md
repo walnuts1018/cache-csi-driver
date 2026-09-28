@@ -17,7 +17,7 @@ helm install cache-csi-driver \
 
 このchartは`CacheClass` CRD、`CSIDriver`、read-onlyのClusterRole、ServiceAccount、Node DaemonSetをインストールします。Node pluginはmount system callを使うためprivileged containerとして動作します。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
-fallback専用volumeのデータはNode上の`/run/cache-csi/fallback`に配置します。標準的なLinuxでは`/run`はtmpfsですが、すべてのNode構成で保証されるわけではありません。fallbackデータをメモリ上に保つ場合は、`fallbackRootDir`をNode上のtmpfs内のパスに設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
+Kubernetes APIからPod namespaceやCacheClassを解決できない場合、または通常cacheのmountに失敗した場合は、volume固有で共有されないfallback directoryを使います。fallbackデータはNode上の`/run/cache-csi/fallback`に配置します。標準的なLinuxでは`/run`はtmpfsですが、すべてのNode構成で保証されるわけではありません。fallbackデータをメモリ上に保つ場合は、`fallbackRootDir`をNode上のtmpfs内のパスに設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
 `preventPodSchedulingIfMissing`を有効にしているため、CSI pluginが登録されていないNodeへのPod配置を防ぎます。Cluster Autoscalerを使う場合は、CSI node-aware schedulingを有効にしてください。
 
@@ -75,7 +75,7 @@ spec:
 | `rbac.createPodEvictions` | `true` | `evictRunning`用のPod Eviction権限 |
 | `nodeSelector` | `kubernetes.io/os: linux` | DaemonSetを配置するNode |
 
-`CacheClass.spec.maxBytes`は、各cache identityに対してvolume側が要求できるquota上限です。`quota.enabled`と`backend: xfs-project`が必要で、volume attributeの`maxBytes`がこの上限を超える場合はmount要求を拒否します。volume attributeに`maxBytes`がない場合は`quota.defaultMaxBytes`をそのidentityのhard limitとして使います。`quota.defaultMaxBytes`を設定しない場合はvolume側の`maxBytes`が必要です。quotaを有効にするCacheClassには`spec.maxBytes`または`quota.defaultMaxBytes`を設定してください。`examples/cacheclass-xfs-project.yaml`と`examples/pod-inline-cache-xfs-project.yaml`に設定例があります。
+`CacheClass.spec.maxBytes`は、各cache identityに対してvolume側が要求できるquota上限です。`quota.enabled`と`backend: xfs-project`が必要で、volume attributeの`maxBytes`がこの上限を超える場合はmount要求を拒否します。volume attributeに`maxBytes`がない場合は`quota.defaultMaxBytes`を設定していればその値を使い、未設定なら`spec.maxBytes`を使います。quotaを有効にするCacheClassには`spec.maxBytes`または`quota.defaultMaxBytes`を設定してください。`examples/cacheclass-xfs-project.yaml`と`examples/pod-inline-cache-xfs-project.yaml`に設定例があります。
 
 現在、class全体の集約byte上限はありません。`pressure`はNode-local cache filesystemの空き容量とinodeに対するGC水位を設定し、実際のfilesystem使用量に応じてcacheを回収します。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
 
