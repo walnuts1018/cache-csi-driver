@@ -94,7 +94,7 @@ func run(logger *slog.Logger) error {
 	cacheManager := manager.New(store, manager.Options{
 		Interval:     *gcInterval,
 		Client:       client,
-		InspectMount: driver.IsMountedAt,
+		InspectMount: driver.VerifyCacheMount,
 		Logger:       logger,
 	})
 	if err := cacheManager.Recover(); err != nil {

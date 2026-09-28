@@ -16,8 +16,8 @@ func TestIsSingleNodeAccessMode(t *testing.T) {
 	}{
 		{name: "single node writer", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, want: true},
 		{name: "single node reader only", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY, want: true},
-		{name: "single node single writer requires advertised capability", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER, want: false},
-		{name: "single node multi writer requires advertised capability", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER, want: false},
+		{name: "single node single writer", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER, want: true},
+		{name: "single node multi writer", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER, want: true},
 		{name: "multi node reader only", mode: csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY, want: false},
 		{name: "multi node single writer", mode: csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER, want: false},
 		{name: "multi node multi writer", mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER, want: false},

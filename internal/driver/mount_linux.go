@@ -3,6 +3,7 @@
 package driver
 
 import (
+	"errors"
 	"os"
 	"slices"
 	"strings"
@@ -12,6 +13,36 @@ import (
 )
 
 var errNotMounted = unix.EINVAL
+
+type systemMounter struct{}
+
+func newMounter() mounter { return systemMounter{} }
+
+func (systemMounter) bindMount(source, target string) error {
+	return bindMount(source, target)
+}
+
+func (systemMounter) remountOptions(target string, readOnly, noExec bool) error {
+	return remountOptions(target, readOnly, noExec)
+}
+
+func (systemMounter) unmount(target string) error { return unmount(target) }
+
+func (systemMounter) mountedAt(target string) (bool, error) { return mountedAt(target) }
+
+func (systemMounter) sameCacheMount(source, target string, readOnly, noExec bool) (bool, error) {
+	return sameCacheMount(source, target, readOnly, noExec)
+}
+
+func (systemMounter) sameCacheSource(source, target string) (bool, error) {
+	return sameCacheSource(source, target)
+}
+
+func (systemMounter) sourceMounted(source string) (bool, error) { return sourceMounted(source) }
+
+func (systemMounter) filesystemReadOnly(path string) (bool, error) {
+	return filesystemReadOnly(path)
+}
 
 func bindMount(source, target string) error {
 	return unix.Mount(source, target, "", unix.MS_BIND, "")
@@ -55,6 +86,30 @@ func sameCacheSource(source, target string) (bool, error) {
 		return false, nil
 	}
 	return sameMountedSource(source, target)
+}
+
+func sourceMounted(source string) (bool, error) {
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		return false, err
+	}
+	mounts, err := mountinfo.GetMounts(nil)
+	if err != nil {
+		return false, err
+	}
+	for _, mount := range mounts {
+		mountInfo, err := os.Stat(mount.Mountpoint)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		if os.SameFile(sourceInfo, mountInfo) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func sameMountedSource(source, target string) (bool, error) {

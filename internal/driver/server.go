@@ -31,6 +31,17 @@ type ProjectQuota interface {
 	Configure(context.Context, string, string, uint32, int64) error
 }
 
+type mounter interface {
+	bindMount(string, string) error
+	remountOptions(string, bool, bool) error
+	unmount(string) error
+	mountedAt(string) (bool, error)
+	sameCacheMount(string, string, bool, bool) (bool, error)
+	sameCacheSource(string, string) (bool, error)
+	sourceMounted(string) (bool, error)
+	filesystemReadOnly(string) (bool, error)
+}
+
 type Options struct {
 	NodeID        string
 	KubeletRoot   string
@@ -44,6 +55,7 @@ type Server struct {
 	store         *cache.Store
 	resolver      ClassResolver
 	quota         ProjectQuota
+	mounter       mounter
 	options       Options
 	locks         operationLocks
 	identityLocks operationLocks
@@ -62,7 +74,7 @@ func New(store *cache.Store, resolver ClassResolver, quotaManager ProjectQuota, 
 	if options.VendorVersion == "" {
 		options.VendorVersion = "dev"
 	}
-	return &Server{store: store, resolver: resolver, quota: quotaManager, options: options}
+	return &Server{store: store, resolver: resolver, quota: quotaManager, mounter: newMounter(), options: options}
 }
 
 func (s *Server) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
@@ -86,6 +98,8 @@ func (s *Server) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.Nod
 
 func (*Server) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	types := []csi.NodeServiceCapability_RPC_Type{
+		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+		csi.NodeServiceCapability_RPC_GET_VOLUME_HEALTH,
 		csi.NodeServiceCapability_RPC_GET_STORAGE_HEALTH,
 	}
 	capabilities := make([]*csi.NodeServiceCapability, 0, len(types))
@@ -157,7 +171,7 @@ func (s *Server) validatePublishRequest(req *csi.NodePublishVolumeRequest) (podV
 }
 
 func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (bool, error) {
-	mounted, err := mountedAt(req.GetTargetPath())
+	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
 	if err != nil {
 		return false, status.Errorf(codes.Internal, "inspect target mount: %v", err)
 	}
@@ -172,7 +186,10 @@ func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (bool,
 		if lease.Target != req.GetTargetPath() {
 			return false, status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
 		}
-		same, err := sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), lease.NoExec)
+		if lease.ReadOnly != req.GetReadonly() {
+			return false, status.Error(codes.AlreadyExists, "volume ID is already published with a different readonly flag")
+		}
+		same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), lease.NoExec)
 		if err != nil {
 			return false, status.Errorf(codes.Internal, "verify existing cache mount: %v", err)
 		}
@@ -182,7 +199,7 @@ func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (bool,
 		return false, status.Error(codes.AlreadyExists, "target is mounted from a different source or with different options")
 	}
 	fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
-	same, err := sameCacheMount(fallback, req.GetTargetPath(), req.GetReadonly(), true)
+	same, err := s.mounter.sameCacheMount(fallback, req.GetTargetPath(), req.GetReadonly(), true)
 	if err != nil {
 		return false, status.Errorf(codes.Internal, "verify fallback mount: %v", err)
 	}
@@ -204,13 +221,7 @@ func (s *Server) publish(ctx context.Context, req *csi.NodePublishVolumeRequest,
 		return err
 	}
 	lease := cache.Lease{ID: req.GetVolumeId(), Target: req.GetTargetPath(), Namespace: volumeContext.namespace, PodName: volumeContext.name, PodUID: volumeContext.uid, ReadOnly: req.GetReadonly(), NoExec: policy.NoExec}
-	if err := s.publishNewCache(ctx, req, identity, lease, policy); err != nil {
-		if releaseErr := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
-			return status.Errorf(codes.Internal, "publish cache failed: %v; release lease failed: %v", err, releaseErr)
-		}
-		return err
-	}
-	return nil
+	return s.publishNewCache(ctx, req, identity, lease, policy)
 }
 
 func (s *Server) prepareLease(req *csi.NodePublishVolumeRequest, identity string, noExec bool) error {
@@ -284,9 +295,14 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 	if err := spec.Validate(); err != nil {
 		return cache.Policy{}, err
 	}
+	sharingPolicy := spec.SharingPolicy
+	if sharingPolicy == "" {
+		sharingPolicy = cachev1alpha1.SharingPolicyShared
+	}
 	policy := cache.Policy{
 		ClassName:          className,
 		ClassUID:           classUID,
+		SharingPolicy:      string(sharingPolicy),
 		NoExec:             spec.NoExec,
 		SchemaVersion:      spec.SchemaVersion,
 		CrashRecoveryReuse: spec.CrashRecovery == "reuse",
@@ -328,19 +344,36 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 	source, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 	if err != nil {
 		code := codes.Internal
-		if errors.Is(err, cache.ErrQuotaPolicyConflict) {
+		if errors.Is(err, cache.ErrQuotaPolicyConflict) || errors.Is(err, cache.ErrExclusivePolicyConflict) {
 			code = codes.FailedPrecondition
 		}
 		return status.Errorf(code, "acquire cache: %v", err)
 	}
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "apply cache quota: %v", err)
+		return s.rollbackPublish(req, status.Errorf(codes.FailedPrecondition, "apply cache quota: %v", err))
 	}
 	source, err = s.store.Expose(identity)
 	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "expose cache generation: %v", err)
+		return s.rollbackPublish(req, status.Errorf(codes.FailedPrecondition, "expose cache generation: %v", err))
 	}
-	return s.mount(req, source, policy.NoExec)
+	if err := s.mount(req, source, policy.NoExec); err != nil {
+		mounted, inspectErr := s.mounter.mountedAt(req.GetTargetPath())
+		if inspectErr != nil {
+			return status.Errorf(codes.Internal, "publish cache failed: %v; inspect mount before lease rollback: %v", err, inspectErr)
+		}
+		if mounted {
+			return status.Errorf(codes.Internal, "publish cache failed: %v; cache mount remains and its lease was retained", err)
+		}
+		return s.rollbackPublish(req, err)
+	}
+	return nil
+}
+
+func (s *Server) rollbackPublish(req *csi.NodePublishVolumeRequest, publishErr error) error {
+	if err := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); err != nil {
+		return status.Errorf(codes.Internal, "publish cache failed: %v; release lease failed: %v", publishErr, err)
+	}
+	return publishErr
 }
 
 func (s *Server) publishCache(ctx context.Context, req *csi.NodePublishVolumeRequest, identity, source string, policy cache.Policy) error {
@@ -359,11 +392,13 @@ func (s *Server) mount(req *csi.NodePublishVolumeRequest, source string, noExec 
 	if err := makeTargetDirectory(target); err != nil {
 		return status.Errorf(codes.Internal, "prepare mount target: %v", err)
 	}
-	if err := bindMount(source, target); err != nil {
+	if err := s.mounter.bindMount(source, target); err != nil {
 		return status.Errorf(codes.Internal, "bind cache: %v", err)
 	}
-	if err := remountOptions(target, req.GetReadonly(), noExec); err != nil {
-		_ = unmount(target)
+	if err := s.mounter.remountOptions(target, req.GetReadonly(), noExec); err != nil {
+		if unmountErr := s.mounter.unmount(target); unmountErr != nil && !errors.Is(unmountErr, errNotMounted) && !errors.Is(unmountErr, os.ErrNotExist) {
+			return status.Errorf(codes.Internal, "apply cache mount options: %v; unmount failed: %v", err, unmountErr)
+		}
 		return status.Errorf(codes.Internal, "apply cache mount options: %v", err)
 	}
 	return nil
@@ -380,12 +415,12 @@ func (s *Server) publishFallback(req *csi.NodePublishVolumeRequest) error {
 	if err := ensureFallbackDirectory(source); err != nil {
 		return status.Errorf(codes.Internal, "create fallback cache: %v", err)
 	}
-	mounted, err := mountedAt(req.GetTargetPath())
+	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
 	if err != nil {
 		return status.Errorf(codes.Internal, "inspect fallback target: %v", err)
 	}
 	if mounted {
-		if same, err := sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), true); err != nil {
+		if same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), true); err != nil {
 			return status.Errorf(codes.Internal, "verify fallback target: %v", err)
 		} else if same {
 			return nil
@@ -395,11 +430,11 @@ func (s *Server) publishFallback(req *csi.NodePublishVolumeRequest) error {
 	if err := makeTargetDirectory(req.GetTargetPath()); err != nil {
 		return status.Errorf(codes.Internal, "prepare fallback target: %v", err)
 	}
-	if err := bindMount(source, req.GetTargetPath()); err != nil {
+	if err := s.mounter.bindMount(source, req.GetTargetPath()); err != nil {
 		return status.Errorf(codes.Internal, "bind fallback cache: %v", err)
 	}
-	if err := remountOptions(req.GetTargetPath(), req.GetReadonly(), true); err != nil {
-		if unmountErr := unmount(req.GetTargetPath()); unmountErr != nil {
+	if err := s.mounter.remountOptions(req.GetTargetPath(), req.GetReadonly(), true); err != nil {
+		if unmountErr := s.mounter.unmount(req.GetTargetPath()); unmountErr != nil {
 			return status.Errorf(codes.Internal, "apply fallback mount options: %v; unmount failed: %v", err, unmountErr)
 		}
 		return status.Errorf(codes.Internal, "apply fallback mount options: %v", err)
@@ -420,7 +455,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
-	mounted, err := mountedAt(req.GetTargetPath())
+	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "inspect target mount: %v", err)
 	}
@@ -429,14 +464,14 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 			return nil, status.Error(codes.FailedPrecondition, "volume lease target does not match")
 		}
 		if mounted {
-			same, err := sameCacheMount(source, req.GetTargetPath(), lease.ReadOnly, lease.NoExec)
+			same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), lease.ReadOnly, lease.NoExec)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "verify cache mount: %v", err)
 			}
 			if !same {
 				return nil, status.Error(codes.FailedPrecondition, "target mount does not belong to this cache volume")
 			}
-			if err := unmount(req.GetTargetPath()); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
+			if err := s.mounter.unmount(req.GetTargetPath()); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
 				return nil, status.Errorf(codes.Internal, "unmount cache: %v", err)
 			}
 		}
@@ -450,12 +485,12 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	}
 	fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
 	if mounted {
-		if same, err := sameCacheSource(fallback, req.GetTargetPath()); err != nil {
+		if same, err := s.mounter.sameCacheSource(fallback, req.GetTargetPath()); err != nil {
 			return nil, status.Errorf(codes.Internal, "verify fallback mount: %v", err)
 		} else if !same {
 			return nil, status.Error(codes.FailedPrecondition, "target mount has no matching cache lease")
 		}
-		if err := unmount(req.GetTargetPath()); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
+		if err := s.mounter.unmount(req.GetTargetPath()); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
 			return nil, status.Errorf(codes.Internal, "unmount fallback cache: %v", err)
 		}
 	}
@@ -483,7 +518,7 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 		lease.Target = req.GetVolumePublishPath()
 		source = fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
 	}
-	mounted, err := mountedAt(lease.Target)
+	mounted, err := s.mounter.mountedAt(lease.Target)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "inspect cache mount: %v", err)
 	}
@@ -492,9 +527,9 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	}
 	var same bool
 	if found {
-		same, err = sameCacheMount(source, lease.Target, lease.ReadOnly, lease.NoExec)
+		same, err = s.mounter.sameCacheMount(source, lease.Target, lease.ReadOnly, lease.NoExec)
 	} else {
-		same, err = sameCacheSource(source, lease.Target)
+		same, err = s.mounter.sameCacheSource(source, lease.Target)
 	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "verify cache mount: %v", err)
@@ -513,7 +548,7 @@ func (s *Server) NodeGetStorageHealth(context.Context, *csi.NodeGetStorageHealth
 	if err := s.store.MetadataError(); err != nil {
 		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheMetadataUnreadable", "one or more cache metadata records cannot be read")
 	}
-	readOnly, err := filesystemReadOnly(s.store.Root())
+	readOnly, err := s.mounter.filesystemReadOnly(s.store.Root())
 	if err != nil {
 		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, "CacheRootUnavailable", "cache root filesystem cannot be inspected")
 	}
@@ -545,11 +580,11 @@ func isSingleNodeAccessMode(mode *csi.VolumeCapability_AccessMode) bool {
 	}
 	switch mode.GetMode() {
 	case csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY:
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER:
 		return true
 	case csi.VolumeCapability_AccessMode_UNKNOWN,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER:
@@ -611,7 +646,25 @@ func ensureFallbackDirectory(path string) error {
 
 func IsMountedAt(target string) (bool, error) { return mountedAt(target) }
 
-func RecoverCacheLeases(store *cache.Store) error { return store.RecoverLeases(mountedAt) }
+// VerifyCacheMountはleaseの情報を使ってcache bind mountを検証する。targetが不明な場合はsourceがmountされているか確認する。
+func VerifyCacheMount(source string, lease cache.Lease, policy cache.Policy) (bool, error) {
+	return verifyCacheMount(newMounter(), source, lease, policy)
+}
+
+func verifyCacheMount(mount mounter, source string, lease cache.Lease, _ cache.Policy) (bool, error) {
+	if lease.Target == "" {
+		return mount.sourceMounted(source)
+	}
+	return mount.sameCacheMount(source, lease.Target, lease.ReadOnly, lease.NoExec)
+}
+
+func RecoverCacheLeases(store *cache.Store) error { return recoverCacheLeases(store, newMounter()) }
+
+func recoverCacheLeases(store *cache.Store, mount mounter) error {
+	return store.RecoverLeases(func(source string, lease cache.Lease, policy cache.Policy) (bool, error) {
+		return verifyCacheMount(mount, source, lease, policy)
+	})
+}
 
 func ApplyQuota(ctx context.Context, store *cache.Store, quotaManager ProjectQuota, policy cache.Policy, identity, source string) error {
 	if !policy.QuotaEnabled {
