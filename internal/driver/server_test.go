@@ -302,6 +302,50 @@ func TestNodeUnpublishPreservesLeaseForForeignMount(t *testing.T) {
 	}
 }
 
+func TestNodeGetVolumeHealthReportsUnreadableMetadataAsInaccessible(t *testing.T) {
+	t.Parallel()
+
+	server, _, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request := newPublishRequest(t, server.options.KubeletRoot, "unreadable-metadata-volume")
+	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Acquire(cache.AcquireOptions{
+		Identity: identity,
+		Lease: cache.Lease{
+			ID:        request.GetVolumeId(),
+			Target:    request.GetTargetPath(),
+			Namespace: testDefault,
+			PodName:   testPodName,
+			PodUID:    testPodUID,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.Root(), identity, ".cache-csi.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := server.NodeGetVolumeHealth(t.Context(), &csi.NodeGetVolumeHealthRequest{VolumeId: request.GetVolumeId()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := response.GetVolumeHealth().GetHealthStatuses()
+	if len(statuses) != 1 || statuses[0].GetStatus() != csi.VolumeHealthErrorType_INACCESSIBLE || statuses[0].GetReason() != "VolumeMetadataUnreadable" {
+		t.Fatalf("volume health statuses = %+v, want inaccessible unreadable-metadata status", statuses)
+	}
+
+	storageResponse, err := server.NodeGetStorageHealth(t.Context(), &csi.NodeGetStorageHealthRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageHealth := storageResponse.GetBackendHealth()
+	if len(storageHealth) != 1 || storageHealth[0].GetStatus() != csi.StorageHealthErrorType_STORAGE_DEGRADED || storageHealth[0].GetReason() != "CacheMetadataUnreadable" {
+		t.Fatalf("storage health = %+v, want degraded unreadable-metadata status", storageHealth)
+	}
+}
+
 func TestRecoverCacheLeasesVerifiesMountSourceAndOptions(t *testing.T) {
 	t.Parallel()
 

@@ -556,6 +556,9 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	}
 	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
+		if errors.Is(err, cache.ErrDegradedMetadata) {
+			return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
+		}
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
 	if !found {
