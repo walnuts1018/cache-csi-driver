@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestMountUsesOpenTreeMountSetattrMoveMount exercises the mount APIs used by the driver. The ubuntu-26.04 hosted runner runs this test without CAP_SYS_ADMIN, so it reports a skip there and exercises the full mount only in Linux environments that grant that capability.
+// TestMountUsesOpenTreeMountSetattrMoveMountはdriverが使用するLinux mount APIを実際に呼び出して検証する。ubuntu-26.04の標準runnerではテスト実行プロセスに`CAP_SYS_ADMIN`が付与されないためスキップし、この権限を持つLinux環境ではmountまで実行する。
 func TestMountUsesOpenTreeMountSetattrMoveMount(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
