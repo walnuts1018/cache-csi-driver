@@ -12,6 +12,9 @@ func (spec CacheClassSpec) Validate() error {
 	if err := spec.validateQuota(); err != nil {
 		return err
 	}
+	if err := spec.validateSharingPolicy(); err != nil {
+		return err
+	}
 	if spec.Retention.Duration < 0 {
 		return fmt.Errorf("retention must not be negative")
 	}
@@ -32,6 +35,15 @@ func (spec CacheClassSpec) validateBackend() error {
 		return nil
 	default:
 		return fmt.Errorf("unsupported crashRecovery policy %q", spec.CrashRecovery)
+	}
+}
+
+func (spec CacheClassSpec) validateSharingPolicy() error {
+	switch spec.SharingPolicy {
+	case "", SharingPolicyShared, SharingPolicyExclusive:
+		return nil
+	default:
+		return fmt.Errorf("unsupported sharingPolicy %q", spec.SharingPolicy)
 	}
 }
 

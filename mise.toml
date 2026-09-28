@@ -2,6 +2,7 @@
 go = "1.27.1"
 golangci-lint = "2.13.2"
 helm = "4.2.4"
+"go:sigs.k8s.io/controller-tools/cmd/controller-gen" = "v0.22.0"
 
 [tasks.build]
 description = "Build the CSI node plugin"
@@ -16,8 +17,13 @@ description = "Run Go tests"
 run = "go test ./..."
 
 [tasks.manifests]
-description = "Copy the authoritative CacheClass CRD into the Helm chart"
-run = "cp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml"
+description = "Generate CacheClass API code and CRD manifests"
+run = """
+set -euo pipefail
+controller-gen crd:crdVersions=v1 paths=./api/v1alpha1 output:crd:artifacts:config=config/crd/bases
+controller-gen object paths=./api/v1alpha1
+cp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml
+"""
 
 [tasks."lint:go"]
 description = "lint the Go code"
