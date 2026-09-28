@@ -4,11 +4,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
 
 const firstLeaseID = "first"
+const otherLeaseID = "other"
 
 func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 	t.Parallel()
@@ -162,14 +164,14 @@ func TestQuotaModeChangeCreatesFreshGenerationAndReservesOldProjectID(t *testing
 	otherIdentity := stableIdentity("other-quota")
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: otherIdentity,
-		Lease:    Lease{ID: "other", Target: filepath.Join(t.TempDir(), "other")},
+		Lease:    Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
 		t.Fatal("project ID was reused before its old generation was removed")
 	}
-	if err := store.CleanupTrash(); err != nil {
+	if err := store.CleanupTrash(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err != nil {
@@ -255,9 +257,67 @@ func TestProjectIDAllocationStaysInsideConfiguredRange(t *testing.T) {
 	}
 }
 
-func TestMetadataReadFailuresStopCollectionEvictionAndQuotaAllocation(t *testing.T) {
+func TestMetadataDamageIsIsolatedAndProjectReservationSurvivesRestart(t *testing.T) {
 	t.Parallel()
-	store, err := NewStore(t.TempDir(), StoreOptions{})
+	root := t.TempDir()
+	store, err := NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthyIdentity := stableIdentity("healthy-cache")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: healthyIdentity,
+		Lease:    Lease{ID: "healthy", Target: filepath.Join(t.TempDir(), "healthy")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	brokenIdentity := stableIdentity("broken-metadata")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: brokenIdentity,
+		Lease:    Lease{ID: "broken", Target: filepath.Join(t.TempDir(), "broken")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	brokenProjectID, _, _, err := store.QuotaState(brokenIdentity, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokenEntry := filepath.Join(store.Root(), brokenIdentity)
+	if err := os.WriteFile(filepath.Join(brokenEntry, metadataName), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, _, err := store.LeaseDetails("broken"); err == nil {
+		t.Fatal("lease lookup accepted unreadable cache metadata")
+	}
+	if err := store.Collect(time.Now()); err != nil {
+		t.Fatalf("collection stopped on an unrelated broken object: %v", err)
+	}
+	if _, err := store.PressureVictims(); err != nil {
+		t.Fatalf("pressure scan stopped on an unrelated broken object: %v", err)
+	}
+	if _, _, _, _, found, err := store.LeaseDetails("healthy"); err != nil || !found {
+		t.Fatalf("healthy lease lookup was affected by broken metadata: found=%v error=%v", found, err)
+	}
+	otherIdentity := stableIdentity("other-quota-after-corruption")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: otherIdentity,
+		Lease:    Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	otherProjectID, _, _, err := store.QuotaState(otherIdentity, 1024)
+	if err != nil {
+		t.Fatalf("quota allocation stopped on broken metadata: %v", err)
+	}
+	if otherProjectID == brokenProjectID {
+		t.Fatal("project ID from the damaged object was reused")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,34 +326,247 @@ func TestMetadataReadFailuresStopCollectionEvictionAndQuotaAllocation(t *testing
 			t.Error(err)
 		}
 	})
-	identity := stableIdentity("healthy-cache")
+	if _, _, _, _, found, err := store.LeaseDetails("healthy"); err != nil || !found {
+		t.Fatalf("index rebuild failed for healthy lease: found=%v error=%v", found, err)
+	}
+	thirdIdentity := stableIdentity("third-quota-after-restart")
 	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "healthy", Target: filepath.Join(t.TempDir(), "healthy")},
+		Identity: thirdIdentity,
+		Lease:    Lease{ID: "third", Target: filepath.Join(t.TempDir(), "third")},
 	}); err != nil {
 		t.Fatal(err)
 	}
+	thirdProjectID, _, _, err := store.QuotaState(thirdIdentity, 1024)
+	if err != nil {
+		t.Fatalf("quota allocation failed after index rebuild: %v", err)
+	}
+	if thirdProjectID == brokenProjectID || thirdProjectID == otherProjectID {
+		t.Fatalf("project ID %d collides with an existing reservation", thirdProjectID)
+	}
+}
 
-	brokenIdentity := stableIdentity("broken-metadata")
-	brokenEntry := filepath.Join(store.Root(), brokenIdentity)
-	if err := os.MkdirAll(brokenEntry, 0o700); err != nil {
+func TestRecoverLeasesQuarantinesDamagedObjectOnlyWhenUnmounted(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name           string
+		mounted        bool
+		verifyErr      bool
+		wantQuarantine bool
+	}{
+		{name: "unmounted", wantQuarantine: true},
+		{name: "mounted", mounted: true},
+		{name: "unknown mount state", verifyErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			store, err := NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := store.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			identity := stableIdentity("damaged-" + test.name)
+			generationPath, _, err := store.Acquire(AcquireOptions{
+				Identity: identity,
+				Lease:    Lease{ID: "damaged", Target: filepath.Join(t.TempDir(), "target")},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			projectID, _, _, err := store.QuotaState(identity, 1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry := filepath.Join(root, identity)
+			if err := os.WriteFile(filepath.Join(entry, metadataName), []byte("{broken"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			err = store.RecoverLeases(func(source string, lease Lease, policy Policy) (bool, error) {
+				calls++
+				if source != generationPath || lease.ID != "" || policy != (Policy{}) {
+					t.Fatalf("damaged object verifier input = (%q, %+v, %+v)", source, lease, policy)
+				}
+				if test.verifyErr {
+					return false, errors.New("mount inspection failed")
+				}
+				return test.mounted, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls != 1 {
+				t.Fatalf("mount verifier calls = %d, want 1", calls)
+			}
+			if test.wantQuarantine {
+				if _, err := os.Stat(entry); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("unmounted damaged object was not detached: %v", err)
+				}
+				otherIdentity := stableIdentity("quota-during-quarantine")
+				if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
+					t.Fatal("project ID was reused before trash deletion")
+				}
+				if err := store.CleanupTrash(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				newProjectID, _, _, err := store.QuotaState(otherIdentity, 1024)
+				if err != nil {
+					t.Fatalf("project ID was not released after physical deletion: %v", err)
+				}
+				if newProjectID != projectID {
+					t.Fatalf("reallocated project ID = %d, want released ID %d", newProjectID, projectID)
+				}
+			} else {
+				if _, err := os.Stat(entry); err != nil {
+					t.Fatalf("uncertain or active damaged object was removed: %v", err)
+				}
+				if err := store.MetadataError(); !errors.Is(err, ErrDegradedMetadata) {
+					t.Fatalf("metadata health error = %v, want degraded metadata", err)
+				}
+				otherIdentity := stableIdentity("quota-while-degraded")
+				if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
+					t.Fatal("project ID was reused while damaged object may still be mounted")
+				}
+			}
+		})
+	}
+}
+
+func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
+	t.Parallel()
+	policy := Policy{SharingPolicy: SharingPolicyExclusive, EvictRunning: true}
+	store, identity, _, target, oldPath := pressureLease(t, "exclusive-cache", policy, 1)
+	victims, err := store.PressureVictims()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(brokenEntry, metadataName), []byte("{broken"), 0o600); err != nil {
+	if len(victims) != 1 || victims[0].ID != firstLeaseID {
+		t.Fatalf("pressure victims = %+v, want the active exclusive lease", victims)
+	}
+	retryPath, created, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: firstLeaseID, Target: target},
+		Policy:   policy,
+	})
+	if err != nil || created || retryPath != oldPath {
+		t.Fatalf("same lease retry = (%q, %v, %v), want original retired generation", retryPath, created, err)
+	}
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), "second")},
+		Policy:   policy,
+	}); !errors.Is(err, ErrExclusivePolicyConflict) {
+		t.Fatalf("second active lease error = %v, want exclusive conflict", err)
+	}
+	if err := store.Release(firstLeaseID, target); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Collect(time.Now()); err == nil {
-		t.Fatal("collection ignored unreadable cache metadata")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), "second")},
+		Policy:   policy,
+	}); err != nil {
+		t.Fatalf("new lease after old generation release: %v", err)
 	}
-	if _, err := store.PressureVictims(); err == nil {
-		t.Fatal("pressure eviction ignored unreadable cache metadata")
-	}
-	if _, _, _, _, _, err := store.LeaseDetails("unknown"); err == nil {
-		t.Fatal("lease lookup ignored unreadable cache metadata")
-	}
+}
 
-	if _, _, _, err := store.QuotaState(identity, 1024); err == nil {
-		t.Fatal("project ID allocation ignored unreadable cache metadata")
+func TestRecoveryVerifierReceivesRetiredGenerationSourceAndPolicy(t *testing.T) {
+	t.Parallel()
+	policy := Policy{NoExec: true, SharingPolicy: SharingPolicyExclusive, EvictRunning: true}
+	store, identity, _, target, oldPath := pressureLease(t, "recovery-retired-cache", policy, 1)
+	if _, err := store.PressureVictims(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverLeases(func(source string, lease Lease, recoveredPolicy Policy) (bool, error) {
+		if source != oldPath {
+			t.Errorf("recovered source = %q, want %q", source, oldPath)
+		}
+		if lease.ID != firstLeaseID || lease.Target != target || lease.Generation == "" {
+			t.Errorf("recovered lease = %+v, want retired lease %q at %q", lease, firstLeaseID, target)
+		}
+		if recoveredPolicy != policy {
+			t.Errorf("recovered policy = %+v, want %+v", recoveredPolicy, policy)
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, source, recoveredPolicy, found, err := store.LeaseDetails(firstLeaseID); err != nil || !found || source != oldPath || recoveredPolicy != policy {
+		t.Fatalf("retired lease after recovery = (%q, %+v, %v, %v), want preserved lease", source, recoveredPolicy, found, err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(t.TempDir(), StoreOptions{
+		Pressure: PressureConfig{HighFreePercent: 100, LowFreePercent: 99},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	identities := make([]string, 20)
+	for index := range identities {
+		identity := stableIdentity("pressure-unused-" + strconv.Itoa(index))
+		identities[index] = identity
+		target := filepath.Join(t.TempDir(), "target-"+strconv.Itoa(index))
+		if _, _, err := store.Acquire(AcquireOptions{
+			Identity: identity,
+			Lease:    Lease{ID: "lease-" + strconv.Itoa(index), Target: target},
+			Policy:   Policy{Retention: time.Hour},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Release("lease-"+strconv.Itoa(index), target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().Add(2 * time.Hour)
+	if err := store.Collect(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Collect(now); err != nil {
+		t.Fatal(err)
+	}
+	trash, err := store.readDir(filepath.Join(store.Root(), trashDirectoryName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trash) != len(identities) {
+		t.Fatalf("trash entries before pressure reclaim = %d, want %d", len(trash), len(identities))
+	}
+	store.pressureActive = true
+	if err := store.ReclaimPressure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, identity := range identities {
+		if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unused object %q remains after pressure reclaim: %v", identity, err)
+		}
+	}
+	trash, err = store.readDir(filepath.Join(store.Root(), trashDirectoryName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trash) != 0 {
+		t.Fatalf("trash entries = %d, want 0 after pressure reclaim", len(trash))
 	}
 }
 
@@ -377,13 +650,13 @@ func TestRetiredGenerationReservesProjectIDUntilDeleted(t *testing.T) {
 		t.Fatal("replacement generation reused the retired generation's project ID")
 	}
 	otherIdentity := stableIdentity("pressure-other-cache")
-	if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: "other", Target: filepath.Join(t.TempDir(), "other")}}); err != nil {
+	if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
 		t.Fatal("detached generation's project ID was reused before physical deletion")
 	}
-	if err := store.CleanupTrash(); err != nil {
+	if err := store.CleanupTrash(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err != nil {

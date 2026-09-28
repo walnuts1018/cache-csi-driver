@@ -16,36 +16,42 @@ import (
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 )
 
-type MountInspector func(string) (bool, error)
+type MountInspector func(source string, lease cache.Lease, policy cache.Policy) (bool, error)
 
 type Options struct {
-	Interval     time.Duration
-	Client       kubernetes.Interface
-	InspectMount MountInspector
-	Logger       *slog.Logger
+	Interval         time.Duration
+	PressureInterval time.Duration
+	Client           kubernetes.Interface
+	InspectMount     MountInspector
+	Logger           *slog.Logger
 }
 
 type Manager struct {
-	store        *cache.Store
-	interval     time.Duration
-	client       kubernetes.Interface
-	inspectMount MountInspector
-	logger       *slog.Logger
+	store            *cache.Store
+	interval         time.Duration
+	pressureInterval time.Duration
+	client           kubernetes.Interface
+	inspectMount     MountInspector
+	logger           *slog.Logger
 }
 
 func New(store *cache.Store, options Options) *Manager {
 	if options.Interval <= 0 {
 		options.Interval = 30 * time.Second
 	}
+	if options.PressureInterval <= 0 {
+		options.PressureInterval = 3 * time.Second
+	}
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
 	return &Manager{
-		store:        store,
-		interval:     options.Interval,
-		client:       options.Client,
-		inspectMount: options.InspectMount,
-		logger:       options.Logger,
+		store:            store,
+		interval:         options.Interval,
+		pressureInterval: options.PressureInterval,
+		client:           options.Client,
+		inspectMount:     options.InspectMount,
+		logger:           options.Logger,
 	}
 }
 
@@ -64,14 +70,19 @@ func (m *Manager) Run(ctx context.Context) {
 		return
 	}
 	m.collect(ctx, time.Now())
-	ticker := time.NewTicker(m.interval)
-	defer ticker.Stop()
+	m.pressure(ctx)
+	retentionTicker := time.NewTicker(m.interval)
+	defer retentionTicker.Stop()
+	pressureTicker := time.NewTicker(m.pressureInterval)
+	defer pressureTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
+		case now := <-retentionTicker.C:
 			m.collect(ctx, now)
+		case <-pressureTicker.C:
+			m.pressure(ctx)
 		}
 	}
 }
@@ -81,8 +92,21 @@ func (m *Manager) collect(ctx context.Context, now time.Time) {
 		m.logger.ErrorContext(ctx, "cache collection failed", "error", err)
 		return
 	}
-	if err := m.store.CleanupTrash(); err != nil {
+	if err := m.store.CleanupTrash(ctx); err != nil {
 		m.logger.ErrorContext(ctx, "cache trash cleanup failed", "error", err)
+		return
+	}
+}
+
+func (m *Manager) pressure(ctx context.Context) {
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	if err := m.store.ReclaimPressure(ctx); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		m.logger.ErrorContext(ctx, "cache pressure reclaim failed", "error", err)
 		return
 	}
 	if m.client == nil {

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json/v2"
@@ -21,9 +22,15 @@ import (
 
 const metadataName = ".cache-csi.json"
 const trashDirectoryName = ".trash"
+const projectRegistryName = ".project-ids.json"
 const trashBatchSize = 16
 
 var ErrQuotaPolicyConflict = errors.New("active cache generation cannot change its effective quota")
+var ErrExclusivePolicyConflict = errors.New("exclusive cache identity already has an active lease")
+var ErrDegradedMetadata = errors.New("cache metadata is degraded")
+
+const SharingPolicyShared = "Shared"
+const SharingPolicyExclusive = "Exclusive"
 
 type PressureConfig struct {
 	HighFreePercent      int
@@ -60,6 +67,7 @@ type RetiredGeneration struct {
 type Policy struct {
 	ClassName          string        `json:"className"`
 	ClassUID           string        `json:"classUID"`
+	SharingPolicy      string        `json:"sharingPolicy,omitempty"`
 	NoExec             bool          `json:"noExec"`
 	SchemaVersion      string        `json:"schemaVersion"`
 	CrashRecoveryReuse bool          `json:"crashRecoveryReuse"`
@@ -67,6 +75,29 @@ type Policy struct {
 	QuotaEnabled       bool          `json:"quotaEnabled"`
 	MaxBytes           int64         `json:"maxBytes"`
 	Retention          time.Duration `json:"retention"`
+}
+
+type projectReservation struct {
+	Identity   string `json:"identity"`
+	Generation string `json:"generation"`
+	TrashID    string `json:"trashID,omitempty"`
+}
+
+type projectReservationDocument struct {
+	Reservations        []projectIDReservation      `json:"reservations"`
+	UnknownReservations []unknownProjectReservation `json:"unknownReservations,omitempty"`
+}
+
+type projectIDReservation struct {
+	ProjectID  uint32 `json:"projectID"`
+	Identity   string `json:"identity"`
+	Generation string `json:"generation"`
+	TrashID    string `json:"trashID,omitempty"`
+}
+
+type unknownProjectReservation struct {
+	Identity string `json:"identity"`
+	TrashID  string `json:"trashID,omitempty"`
 }
 
 type policyAlias Policy
@@ -111,18 +142,24 @@ type AcquireOptions struct {
 }
 
 type Store struct {
-	root           string
-	rootFS         *os.Root
-	pressure       PressureConfig
-	projectIDStart uint32
-	projectIDCount uint32
-	pressureActive bool
-	mu             sync.Mutex
-	stopTrash      chan struct{}
-	trashDone      chan struct{}
-	trashRequests  chan chan error
-	closeOnce      sync.Once
-	closeErr       error
+	root                       string
+	rootFS                     *os.Root
+	pressure                   PressureConfig
+	projectIDStart             uint32
+	projectIDCount             uint32
+	pressureActive             bool
+	metadataByIdentity         map[string]Metadata
+	leaseIndex                 map[string]string
+	degraded                   map[string]error
+	projectReservations        map[uint32][]projectReservation
+	unknownProjectReservations map[string]string
+	trashMetadata              map[string]Metadata
+	mu                         sync.Mutex
+	stopTrash                  chan struct{}
+	trashDone                  chan struct{}
+	trashRequests              chan chan error
+	closeOnce                  sync.Once
+	closeErr                   error
 }
 
 func (s *Store) Root() string { return s.root }
@@ -228,17 +265,356 @@ func NewStore(root string, options StoreOptions) (*Store, error) {
 		return nil, fmt.Errorf("create cache trash directory: %w", err)
 	}
 	store := &Store{
-		root:           root,
-		rootFS:         rootFS,
-		pressure:       options.Pressure,
-		projectIDStart: options.ProjectIDStart,
-		projectIDCount: options.ProjectIDCount,
-		stopTrash:      make(chan struct{}),
-		trashDone:      make(chan struct{}),
-		trashRequests:  make(chan chan error),
+		root:                       root,
+		rootFS:                     rootFS,
+		pressure:                   options.Pressure,
+		projectIDStart:             options.ProjectIDStart,
+		projectIDCount:             options.ProjectIDCount,
+		metadataByIdentity:         make(map[string]Metadata),
+		leaseIndex:                 make(map[string]string),
+		degraded:                   make(map[string]error),
+		projectReservations:        make(map[uint32][]projectReservation),
+		unknownProjectReservations: make(map[string]string),
+		trashMetadata:              make(map[string]Metadata),
+		stopTrash:                  make(chan struct{}),
+		trashDone:                  make(chan struct{}),
+		trashRequests:              make(chan chan error),
+	}
+	if err := store.rebuildIndexes(); err != nil {
+		_ = rootFS.Close()
+		return nil, fmt.Errorf("rebuild cache indexes: %w", err)
 	}
 	go store.runTrashCollector()
 	return store, nil
+}
+
+func (s *Store) rebuildIndexes() error {
+	data, err := s.rootFS.ReadFile(projectRegistryName)
+	registryMissing := errors.Is(err, os.ErrNotExist)
+	if err == nil {
+		var document projectReservationDocument
+		if err := json.Unmarshal(data, &document); err != nil {
+			return fmt.Errorf("read project ID registry: %w", err)
+		}
+		for _, item := range document.Reservations {
+			if item.ProjectID == 0 || item.Identity == "" || item.Generation == "" {
+				return errors.New("project ID registry contains an invalid reservation")
+			}
+			s.addProjectReservation(item.ProjectID, projectReservation{Identity: item.Identity, Generation: item.Generation, TrashID: item.TrashID})
+		}
+		for _, reservation := range document.UnknownReservations {
+			if reservation.Identity == "" {
+				return errors.New("project ID registry contains an invalid unknown reservation")
+			}
+			s.unknownProjectReservations[reservation.Identity] = reservation.TrashID
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read project ID registry: %w", err)
+	}
+
+	entries, err := s.readDir(s.root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == trashDirectoryName {
+			continue
+		}
+		path := filepath.Join(s.root, entry.Name())
+		meta, err := s.readMetadata(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			s.markDegraded(entry.Name(), err)
+			continue
+		}
+		if err := validateMetadata(entry.Name(), meta); err != nil {
+			s.markDegraded(entry.Name(), err)
+			continue
+		}
+		s.indexObjectMetadata(meta)
+	}
+
+	trashEntries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
+	if err != nil {
+		return err
+	}
+	for _, entry := range trashEntries {
+		if !entry.IsDir() {
+			continue
+		}
+		meta, err := s.readMetadata(filepath.Join(s.root, trashDirectoryName, entry.Name()))
+		if err != nil {
+			s.markDegraded(filepath.Join(trashDirectoryName, entry.Name()), err)
+			continue
+		}
+		s.trashMetadata[entry.Name()] = meta
+		s.addMetadataReservations(meta, entry.Name())
+	}
+	if registryMissing && len(s.degraded) > 0 {
+		for identity := range s.degraded {
+			if filepath.Dir(identity) == "." {
+				s.unknownProjectReservations[identity] = ""
+			}
+		}
+	}
+	if err := s.reconcileProjectReservations(entries, trashEntries); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) reconcileProjectReservations(entries, trashEntries []os.DirEntry) error {
+	objects := make(map[string]os.DirEntry, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() && entry.Name() != trashDirectoryName {
+			objects[entry.Name()] = entry
+		}
+	}
+	trash := make(map[string]os.DirEntry, len(trashEntries))
+	for _, entry := range trashEntries {
+		if entry.IsDir() {
+			trash[entry.Name()] = entry
+		}
+	}
+
+	for projectID, reservations := range s.projectReservations {
+		kept := make([]projectReservation, 0, len(reservations))
+		for _, reservation := range reservations {
+			reservation, retain := s.reconcileProjectReservation(projectID, reservation, objects, trash)
+			if retain {
+				kept = append(kept, reservation)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.projectReservations, projectID)
+		} else {
+			s.projectReservations[projectID] = kept
+		}
+	}
+	for identity, trashID := range s.unknownProjectReservations {
+		trashID, retain := s.reconcileUnknownProjectReservation(identity, trashID, objects, trash)
+		if retain {
+			s.unknownProjectReservations[identity] = trashID
+		} else {
+			delete(s.unknownProjectReservations, identity)
+		}
+	}
+
+	for _, meta := range s.metadataByIdentity {
+		s.addMetadataReservations(meta, "")
+	}
+	if err := s.persistProjectReservations(); err != nil {
+		return fmt.Errorf("persist rebuilt project ID registry: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) reconcileProjectReservation(projectID uint32, reservation projectReservation, objects, trash map[string]os.DirEntry) (projectReservation, bool) {
+	if reservation.TrashID != "" {
+		if _, exists := trash[reservation.TrashID]; exists {
+			return reservation, true
+		}
+		if meta, exists := s.metadataByIdentity[reservation.Identity]; exists && metadataHasProjectReservation(meta, projectID, reservation.Generation) {
+			reservation.TrashID = ""
+			return reservation, true
+		}
+		if _, damaged := s.degraded[reservation.Identity]; damaged {
+			if _, objectExists := objects[reservation.Identity]; objectExists {
+				reservation.TrashID = ""
+				return reservation, true
+			}
+		}
+		return reservation, false
+	}
+	if _, damaged := s.degraded[reservation.Identity]; damaged {
+		_, exists := objects[reservation.Identity]
+		return reservation, exists
+	}
+	if meta, exists := s.metadataByIdentity[reservation.Identity]; exists {
+		return reservation, metadataHasProjectReservation(meta, projectID, reservation.Generation)
+	}
+	if _, exists := objects[reservation.Identity]; exists {
+		return reservation, true
+	}
+	for trashID, meta := range s.trashMetadata {
+		if meta.Identity == reservation.Identity && metadataHasProjectReservation(meta, projectID, reservation.Generation) {
+			reservation.TrashID = trashID
+			return reservation, true
+		}
+	}
+	return reservation, false
+}
+
+func (s *Store) reconcileUnknownProjectReservation(identity, trashID string, objects, trash map[string]os.DirEntry) (string, bool) {
+	if trashID != "" {
+		if _, exists := trash[trashID]; exists {
+			return trashID, true
+		}
+		_, objectExists := objects[identity]
+		return "", objectExists
+	}
+	if _, objectExists := objects[identity]; objectExists {
+		return "", true
+	}
+	for candidateTrashID, meta := range s.trashMetadata {
+		if meta.Identity == identity {
+			return candidateTrashID, true
+		}
+	}
+	return "", false
+}
+
+func metadataHasProjectReservation(meta Metadata, projectID uint32, generation string) bool {
+	if meta.ProjectID == projectID && meta.Generation == generation {
+		return true
+	}
+	return slices.ContainsFunc(meta.Retired, func(retired RetiredGeneration) bool {
+		return retired.ProjectID == projectID && retired.Generation == generation
+	})
+}
+
+func (s *Store) addMetadataReservations(meta Metadata, trashID string) {
+	if meta.ProjectID != 0 {
+		s.addProjectReservation(meta.ProjectID, projectReservation{Identity: meta.Identity, Generation: meta.Generation, TrashID: trashID})
+	}
+	for _, retired := range meta.Retired {
+		if retired.ProjectID != 0 {
+			s.addProjectReservation(retired.ProjectID, projectReservation{Identity: meta.Identity, Generation: retired.Generation, TrashID: trashID})
+		}
+	}
+}
+
+func (s *Store) addProjectReservation(projectID uint32, reservation projectReservation) {
+	for index, existing := range s.projectReservations[projectID] {
+		if existing.Identity == reservation.Identity && existing.Generation == reservation.Generation {
+			s.projectReservations[projectID][index] = reservation
+			return
+		}
+	}
+	s.projectReservations[projectID] = append(s.projectReservations[projectID], reservation)
+}
+
+func (s *Store) persistProjectReservations() error {
+	reservations := make([]projectIDReservation, 0)
+	for projectID, owners := range s.projectReservations {
+		for _, owner := range owners {
+			reservations = append(reservations, projectIDReservation{ProjectID: projectID, Identity: owner.Identity, Generation: owner.Generation, TrashID: owner.TrashID})
+		}
+	}
+	unknownReservations := make([]unknownProjectReservation, 0, len(s.unknownProjectReservations))
+	for identity, trashID := range s.unknownProjectReservations {
+		unknownReservations = append(unknownReservations, unknownProjectReservation{Identity: identity, TrashID: trashID})
+	}
+	sort.Slice(unknownReservations, func(i, j int) bool { return unknownReservations[i].Identity < unknownReservations[j].Identity })
+	sort.Slice(reservations, func(i, j int) bool {
+		if reservations[i].ProjectID == reservations[j].ProjectID {
+			if reservations[i].Identity == reservations[j].Identity {
+				return reservations[i].Generation < reservations[j].Generation
+			}
+			return reservations[i].Identity < reservations[j].Identity
+		}
+		return reservations[i].ProjectID < reservations[j].ProjectID
+	})
+	data, err := json.Marshal(projectReservationDocument{Reservations: reservations, UnknownReservations: unknownReservations})
+	if err != nil {
+		return err
+	}
+	temp := ".project-ids-" + uuid.NewV7().String()
+	file, err := s.rootFS.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		_ = s.rootFS.Remove(temp)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = s.rootFS.Remove(temp)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = s.rootFS.Remove(temp)
+		return err
+	}
+	if err := s.rootFS.Rename(temp, projectRegistryName); err != nil {
+		_ = s.rootFS.Remove(temp)
+		return err
+	}
+	directory, err := s.rootFS.Open(".")
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+func (s *Store) indexObjectMetadata(meta Metadata) {
+	if previous, exists := s.metadataByIdentity[meta.Identity]; exists {
+		for _, lease := range previous.Leases {
+			delete(s.leaseIndex, lease.ID)
+		}
+	}
+	s.metadataByIdentity[meta.Identity] = meta
+	delete(s.degraded, meta.Identity)
+	for _, lease := range meta.Leases {
+		s.leaseIndex[lease.ID] = meta.Identity
+	}
+	for projectID, reservations := range s.projectReservations {
+		kept := slices.DeleteFunc(reservations, func(reservation projectReservation) bool {
+			return reservation.Identity == meta.Identity && reservation.TrashID == "" && !metadataHasProjectReservation(meta, projectID, reservation.Generation)
+		})
+		if len(kept) == 0 {
+			delete(s.projectReservations, projectID)
+		} else {
+			s.projectReservations[projectID] = kept
+		}
+	}
+	for _, retired := range meta.Retired {
+		if retired.ProjectID == 0 {
+			continue
+		}
+		s.addProjectReservation(retired.ProjectID, projectReservation{Identity: meta.Identity, Generation: retired.Generation})
+	}
+	if meta.ProjectID != 0 {
+		s.addProjectReservation(meta.ProjectID, projectReservation{Identity: meta.Identity, Generation: meta.Generation})
+	}
+}
+
+func (s *Store) markDegraded(identity string, cause error) {
+	if meta, exists := s.metadataByIdentity[identity]; exists {
+		for _, lease := range meta.Leases {
+			delete(s.leaseIndex, lease.ID)
+		}
+	}
+	delete(s.metadataByIdentity, identity)
+	s.degraded[identity] = fmt.Errorf("%w: %v", ErrDegradedMetadata, cause)
+}
+
+func validateMetadata(identity string, meta Metadata) error {
+	if meta.Identity != identity || meta.Generation == "" {
+		return errors.New("cache metadata identity or generation is inconsistent")
+	}
+	if !validSharingPolicy(meta.Policy.SharingPolicy) {
+		return errors.New("cache metadata has an unsupported sharing policy")
+	}
+	for _, retired := range meta.Retired {
+		if retired.Generation == "" || !validSharingPolicy(retired.Policy.SharingPolicy) {
+			return errors.New("cache metadata has an invalid retired generation policy")
+		}
+	}
+	return nil
+}
+
+func validSharingPolicy(policy string) bool {
+	return policy == "" || policy == SharingPolicyShared || policy == SharingPolicyExclusive
 }
 
 func validatePressure(pressure PressureConfig) error {
@@ -274,14 +650,21 @@ func (s *Store) runTrashCollector() {
 	}
 }
 
-func (s *Store) CleanupTrash() error {
+func (s *Store) CleanupTrash(ctx context.Context) error {
 	response := make(chan error, 1)
 	select {
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-s.stopTrash:
 		return errors.New("cache store is closed")
 	case s.trashRequests <- response:
 	}
-	return <-response
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-response:
+		return err
+	}
 }
 
 func (s *Store) cleanupTrashBatch() error {
@@ -293,38 +676,143 @@ func (s *Store) cleanupTrashBatch() error {
 	for _, entry := range entries[:min(len(entries), trashBatchSize)] {
 		if err := s.removeAll(filepath.Join(s.root, trashDirectoryName, entry.Name())); err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
+			continue
 		}
+		s.mu.Lock()
+		for projectID, reservations := range s.projectReservations {
+			kept := slices.DeleteFunc(reservations, func(reservation projectReservation) bool {
+				return reservation.TrashID == entry.Name()
+			})
+			if len(kept) == 0 {
+				delete(s.projectReservations, projectID)
+			} else {
+				s.projectReservations[projectID] = kept
+			}
+		}
+		delete(s.trashMetadata, entry.Name())
+		delete(s.degraded, filepath.Join(trashDirectoryName, entry.Name()))
+		for identity, trashID := range s.unknownProjectReservations {
+			if trashID == entry.Name() {
+				delete(s.unknownProjectReservations, identity)
+			}
+		}
+		if err := s.persistProjectReservations(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("persist project ID registry after trash cleanup: %w", err))
+		}
+		s.mu.Unlock()
 	}
 	return cleanupErr
 }
 
-func (s *Store) detachToTrash(path string) error {
-	trashPath := filepath.Join(s.root, trashDirectoryName, uuid.NewV7().String())
-	if err := s.rename(path, trashPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+func (s *Store) cleanupTrashFully(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.CleanupTrash(ctx); err != nil {
+			return err
+		}
+		entries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
+		if err != nil {
+			return err
+		}
+		if len(entries) == 0 {
 			return nil
+		}
+	}
+}
+
+func (s *Store) detachToTrash(path string) error {
+	relative, err := s.relative(path)
+	if err != nil {
+		return err
+	}
+	isObject := filepath.Dir(relative) == "." && filepath.Base(relative) != trashDirectoryName
+	identity := filepath.Base(relative)
+	var meta Metadata
+	if isObject {
+		meta, _ = s.readMetadata(path)
+	}
+	trashPath := filepath.Join(s.root, trashDirectoryName, uuid.NewV7().String())
+	trashID := filepath.Base(trashPath)
+	if isObject {
+		if err := s.reserveObjectForTrash(identity, trashID, meta); err != nil {
+			return err
+		}
+	}
+	if err := s.rename(path, trashPath); err != nil {
+		if isObject {
+			err = errors.Join(err, s.restoreObjectTrashReservation(identity, trashID))
 		}
 		return err
 	}
-	for _, directory := range []string{filepath.Dir(path), filepath.Join(s.root, trashDirectoryName)} {
-		relative, err := s.relative(directory)
-		if err != nil {
-			return err
+	if isObject {
+		s.indexObjectInTrash(identity, trashID, meta)
+	}
+	return errors.Join(s.syncDirectory(filepath.Dir(path)), s.syncDirectory(filepath.Join(s.root, trashDirectoryName)))
+}
+
+func (s *Store) reserveObjectForTrash(identity, trashID string, meta Metadata) error {
+	for projectID, reservations := range s.projectReservations {
+		for index, reservation := range reservations {
+			if reservation.Identity == identity {
+				reservation.TrashID = trashID
+				reservations[index] = reservation
+			}
 		}
-		handle, err := s.rootFS.Open(relative)
-		if err != nil {
-			return err
-		}
-		syncErr := handle.Sync()
-		closeErr := handle.Close()
-		if syncErr != nil {
-			return syncErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
+		s.projectReservations[projectID] = reservations
+	}
+	if _, damaged := s.degraded[identity]; damaged || meta.Identity != identity {
+		s.unknownProjectReservations[identity] = trashID
+	}
+	if err := s.persistProjectReservations(); err != nil {
+		return fmt.Errorf("persist project ID reservation before cache quarantine: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) restoreObjectTrashReservation(identity, trashID string) error {
+	for projectID, reservations := range s.projectReservations {
+		for index, reservation := range reservations {
+			if reservation.Identity == identity && reservation.TrashID == trashID {
+				reservation.TrashID = ""
+				reservations[index] = reservation
+			}
+		}
+		s.projectReservations[projectID] = reservations
+	}
+	if s.unknownProjectReservations[identity] == trashID {
+		s.unknownProjectReservations[identity] = ""
+	}
+	if err := s.persistProjectReservations(); err != nil {
+		return fmt.Errorf("restore project ID reservation after failed cache quarantine: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) indexObjectInTrash(identity, trashID string, meta Metadata) {
+	delete(s.metadataByIdentity, identity)
+	for _, lease := range meta.Leases {
+		delete(s.leaseIndex, lease.ID)
+	}
+	if meta.Identity == identity {
+		s.trashMetadata[trashID] = meta
+	}
+	delete(s.degraded, identity)
+}
+
+func (s *Store) syncDirectory(path string) error {
+	relative, err := s.relative(path)
+	if err != nil {
+		return err
+	}
+	handle, err := s.rootFS.Open(relative)
+	if err != nil {
+		return err
+	}
+	syncErr := handle.Sync()
+	closeErr := handle.Close()
+	return errors.Join(syncErr, closeErr)
 }
 
 func (s *Store) detachGenerationToTrash(path string, identity string, retired RetiredGeneration) error {
@@ -338,6 +826,12 @@ func (s *Store) detachGenerationToTrash(path string, identity string, retired Re
 			return nil
 		}
 		return err
+	}
+	if retired.ProjectID != 0 {
+		s.addProjectReservation(retired.ProjectID, projectReservation{Identity: identity, Generation: retired.Generation, TrashID: filepath.Base(trashPath)})
+		if err := s.persistProjectReservations(); err != nil {
+			return fmt.Errorf("persist project ID reservation for retired generation: %w", err)
+		}
 	}
 	if err := s.writeMetadata(trashPath, Metadata{Identity: identity, Generation: retired.Generation, ProjectID: retired.ProjectID, ProjectAssigned: retired.ProjectAssigned, QuotaBytes: retired.QuotaBytes, Policy: retired.Policy}); err != nil {
 		return err
@@ -358,13 +852,14 @@ func Identity(namespaceUID, cacheClass, cacheClassUID, cacheKey, schema string) 
 func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !validIdentity(options.Identity) || options.Lease.ID == "" || len(options.Lease.ID) > 1024 || strings.ContainsRune(options.Lease.ID, '\x00') || !filepath.IsAbs(options.Lease.Target) {
-		return "", false, errors.New("invalid cache identity, lease ID, or target path")
-	}
-	if existingIdentity, existing, found, err := s.findLease(options.Lease.ID); err != nil {
+	if err := validateAcquireOptions(options); err != nil {
 		return "", false, err
-	} else if found && (existingIdentity != options.Identity || !slices.ContainsFunc(existing.Leases, func(lease Lease) bool { return lease.ID == options.Lease.ID && lease.Target == options.Lease.Target })) {
-		return "", false, errors.New("cache lease ID is already in use")
+	}
+	if err := s.degraded[options.Identity]; err != nil {
+		return "", false, err
+	}
+	if path, found, err := s.existingLeasePath(options); found || err != nil {
+		return path, false, err
 	}
 	entry := filepath.Join(s.root, options.Identity)
 	if err := s.ensureDirectory(entry); err != nil {
@@ -372,6 +867,7 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 	}
 	meta, err := s.readMetadata(entry)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.markDegraded(options.Identity, err)
 		return "", false, fmt.Errorf("read cache metadata: %w", err)
 	}
 	if errors.Is(err, os.ErrNotExist) {
@@ -380,8 +876,19 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 		}
 		meta = Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
 	} else {
-		if meta.Identity != options.Identity || meta.Generation == "" {
-			return "", false, errors.New("cache metadata identity is inconsistent")
+		if err := validateMetadata(options.Identity, meta); err != nil {
+			s.markDegraded(options.Identity, err)
+			return "", false, err
+		}
+		for _, lease := range meta.Leases {
+			_, existingPolicy, err := leaseGenerationAndPolicy(meta, lease)
+			if err != nil {
+				s.markDegraded(options.Identity, err)
+				return "", false, err
+			}
+			if options.Policy.SharingPolicy == "Exclusive" || existingPolicy.SharingPolicy == "Exclusive" {
+				return "", false, ErrExclusivePolicyConflict
+			}
 		}
 		if s.activeLeaseCount(meta) > 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes) {
 			return "", false, ErrQuotaPolicyConflict
@@ -399,6 +906,51 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 		}
 	}
 	return s.createLease(entry, options, meta)
+}
+
+func validateAcquireOptions(options AcquireOptions) error {
+	if !validIdentity(options.Identity) || options.Lease.ID == "" || len(options.Lease.ID) > 1024 || strings.ContainsRune(options.Lease.ID, '\x00') || !filepath.IsAbs(options.Lease.Target) {
+		return errors.New("invalid cache identity, lease ID, or target path")
+	}
+	if !validSharingPolicy(options.Policy.SharingPolicy) {
+		return errors.New("unsupported cache sharing policy")
+	}
+	return nil
+}
+
+func (s *Store) existingLeasePath(options AcquireOptions) (string, bool, error) {
+	existingIdentity, existing, found, err := s.findLease(options.Lease.ID)
+	if err != nil || !found {
+		return "", found, err
+	}
+	if existingIdentity != options.Identity {
+		return "", true, errors.New("cache lease ID is already in use")
+	}
+	leaseIndex := slices.IndexFunc(existing.Leases, func(lease Lease) bool { return lease.ID == options.Lease.ID })
+	if leaseIndex < 0 || existing.Leases[leaseIndex].Target != options.Lease.Target {
+		return "", true, errors.New("cache lease ID is already in use")
+	}
+	generation, _, err := leaseGenerationAndPolicy(existing, existing.Leases[leaseIndex])
+	if err != nil {
+		return "", true, err
+	}
+	return filepath.Join(s.root, options.Identity, "generations", generation), true, nil
+}
+
+func leaseGenerationAndPolicy(meta Metadata, lease Lease) (string, Policy, error) {
+	generation := lease.Generation
+	if generation == "" {
+		generation = meta.Generation
+	}
+	if generation == meta.Generation {
+		return generation, meta.Policy, nil
+	}
+	for _, retired := range meta.Retired {
+		if retired.Generation == generation {
+			return generation, retired.Policy, nil
+		}
+	}
+	return "", Policy{}, errors.New("cache lease references an unknown generation")
 }
 
 func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
@@ -504,20 +1056,15 @@ func (s *Store) LeaseDetails(leaseID string) (string, Lease, string, Policy, boo
 		return "", Lease{}, "", Policy{}, found, err
 	}
 	for _, lease := range meta.Leases {
-		if lease.ID == leaseID {
-			generation := lease.Generation
-			if generation == "" {
-				generation = meta.Generation
-			}
-			policy := meta.Policy
-			for _, retired := range meta.Retired {
-				if retired.Generation == generation {
-					policy = retired.Policy
-					break
-				}
-			}
-			return identity, lease, filepath.Join(s.root, identity, "generations", generation), policy, true, nil
+		if lease.ID != leaseID {
+			continue
 		}
+		generation, policy, err := leaseGenerationAndPolicy(meta, lease)
+		if err != nil {
+			s.markDegraded(identity, err)
+			return "", Lease{}, "", Policy{}, false, err
+		}
+		return identity, lease, filepath.Join(s.root, identity, "generations", generation), policy, true, nil
 	}
 	return "", Lease{}, "", Policy{}, false, nil
 }
@@ -529,16 +1076,21 @@ func (s *Store) QuotaState(identity string, maxBytes int64) (uint32, bool, bool,
 		return 0, false, false, errors.New("valid cache identity and positive quota limit are required")
 	}
 	entry := filepath.Join(s.root, identity)
-	meta, err := s.readMetadata(entry)
+	meta, err := s.readObjectMetadata(identity)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return 0, false, false, err
+		}
 		return 0, false, false, err
 	}
 	if meta.ProjectID == 0 {
-		projectID, err := s.projectIDLocked(identity)
+		projectID, err := s.projectIDLocked(identity, meta.Generation)
 		if err != nil {
 			return 0, false, false, err
 		}
 		meta.ProjectID = projectID
+	} else {
+		s.addProjectReservation(meta.ProjectID, projectReservation{Identity: identity, Generation: meta.Generation})
 	}
 	if err := s.writeMetadata(entry, meta); err != nil {
 		return 0, false, false, err
@@ -553,7 +1105,7 @@ func (s *Store) Expose(identity string) (string, error) {
 		return "", errors.New("invalid cache identity")
 	}
 	entry := filepath.Join(s.root, identity)
-	meta, err := s.readMetadata(entry)
+	meta, err := s.readObjectMetadata(identity)
 	if err != nil {
 		return "", err
 	}
@@ -579,7 +1131,7 @@ func (s *Store) MarkQuotaApplied(identity string, maxBytes int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := filepath.Join(s.root, identity)
-	meta, err := s.readMetadata(entry)
+	meta, err := s.readObjectMetadata(identity)
 	if err != nil {
 		return err
 	}
@@ -591,7 +1143,7 @@ func (s *Store) MarkProjectAssigned(identity string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := filepath.Join(s.root, identity)
-	meta, err := s.readMetadata(entry)
+	meta, err := s.readObjectMetadata(identity)
 	if err != nil {
 		return err
 	}
@@ -599,57 +1151,26 @@ func (s *Store) MarkProjectAssigned(identity string) error {
 	return s.writeMetadata(entry, meta)
 }
 
-func (s *Store) projectIDLocked(identity string) (uint32, error) {
-	used := map[uint32]struct{}{}
-	entries, err := s.readDir(s.root)
-	if err != nil {
-		return 0, err
-	}
-	for _, current := range entries {
-		if !current.IsDir() || current.Name() == trashDirectoryName {
-			continue
-		}
-		other, err := s.readMetadata(filepath.Join(s.root, current.Name()))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return 0, fmt.Errorf("read cache metadata while allocating project ID: %w", err)
-		}
-		if current.Name() != identity && other.ProjectID != 0 {
-			used[other.ProjectID] = struct{}{}
-		}
-		for _, retired := range other.Retired {
-			if retired.ProjectID != 0 {
-				used[retired.ProjectID] = struct{}{}
-			}
-		}
-	}
-	trashEntries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
-	if err != nil {
-		return 0, err
-	}
-	for _, current := range trashEntries {
-		if !current.IsDir() {
-			continue
-		}
-		other, err := s.readMetadata(filepath.Join(s.root, trashDirectoryName, current.Name()))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return 0, fmt.Errorf("read trashed cache metadata while allocating project ID: %w", err)
-		}
-		if other.ProjectID != 0 {
-			used[other.ProjectID] = struct{}{}
-		}
+func (s *Store) projectIDLocked(identity, generation string) (uint32, error) {
+	if len(s.unknownProjectReservations) > 0 {
+		return 0, errors.New("project ID allocation is unavailable while damaged cache projects are quarantined")
 	}
 	hash, _ := hex.DecodeString(identity[:8])
 	hashValue := uint32(hash[0])<<24 | uint32(hash[1])<<16 | uint32(hash[2])<<8 | uint32(hash[3])
 	offset := hashValue % s.projectIDCount
 	projectID := s.projectIDStart + offset
 	for range s.projectIDCount {
-		if _, exists := used[projectID]; !exists {
+		if _, exists := s.projectReservations[projectID]; !exists {
+			s.addProjectReservation(projectID, projectReservation{Identity: identity, Generation: generation})
+			if err := s.persistProjectReservations(); err != nil {
+				s.projectReservations[projectID] = slices.DeleteFunc(s.projectReservations[projectID], func(reservation projectReservation) bool {
+					return reservation.Identity == identity && reservation.Generation == generation
+				})
+				if len(s.projectReservations[projectID]) == 0 {
+					delete(s.projectReservations, projectID)
+				}
+				return 0, fmt.Errorf("reserve XFS project ID: %w", err)
+			}
 			return projectID, nil
 		}
 		offset = (offset + 1) % s.projectIDCount
@@ -715,26 +1236,35 @@ func (s *Store) hasGenerationLeases(meta Metadata, generation string) bool {
 }
 
 func (s *Store) findLease(leaseID string) (string, Metadata, bool, error) {
-	entries, err := s.readDir(s.root)
-	if err != nil {
-		return "", Metadata{}, false, err
+	identity, exists := s.leaseIndex[leaseID]
+	if !exists {
+		return "", Metadata{}, false, nil
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		meta, err := s.readMetadata(filepath.Join(s.root, entry.Name()))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return "", Metadata{}, false, fmt.Errorf("read cache metadata while finding lease: %w", err)
-		}
-		if slices.ContainsFunc(meta.Leases, func(lease Lease) bool { return lease.ID == leaseID }) {
-			return entry.Name(), meta, true, nil
-		}
+	meta, err := s.readObjectMetadata(identity)
+	if err != nil {
+		return "", Metadata{}, false, fmt.Errorf("read cache metadata while finding lease: %w", err)
+	}
+	if slices.ContainsFunc(meta.Leases, func(lease Lease) bool { return lease.ID == leaseID }) {
+		return identity, meta, true, nil
 	}
 	return "", Metadata{}, false, nil
+}
+
+func (s *Store) readObjectMetadata(identity string) (Metadata, error) {
+	if err := s.degraded[identity]; err != nil {
+		return Metadata{}, err
+	}
+	meta, err := s.readMetadata(filepath.Join(s.root, identity))
+	if err != nil {
+		s.markDegraded(identity, err)
+		return Metadata{}, fmt.Errorf("read cache metadata: %w", err)
+	}
+	if err := validateMetadata(identity, meta); err != nil {
+		s.markDegraded(identity, err)
+		return Metadata{}, err
+	}
+	s.indexObjectMetadata(meta)
+	return meta, nil
 }
 
 func (s *Store) ReleaseTarget(leaseID string) (string, bool, error) {
@@ -752,142 +1282,264 @@ func (s *Store) ReleaseTarget(leaseID string) (string, bool, error) {
 	return "", false, nil
 }
 
-func (s *Store) RecoverLeases(isMounted func(string) (bool, error)) error {
+func (s *Store) RecoverLeases(verifyMount func(source string, lease Lease, policy Policy) (bool, error)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if verifyMount == nil {
+		return errors.New("mount verifier is not configured")
+	}
 	entries, err := s.readDir(s.root)
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		path := filepath.Join(s.root, entry.Name())
-		meta, err := s.readMetadata(path)
-		if errors.Is(err, os.ErrNotExist) {
-			if err := s.discardUntrackedGenerations(path); err != nil {
-				return fmt.Errorf("discard incomplete cache generations during recovery: %w", err)
-			}
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("read cache metadata during recovery: %w", err)
-		}
-		wasDirty := meta.Dirty
-		active := make([]Lease, 0, len(meta.Leases))
-		for _, lease := range meta.Leases {
-			mounted, err := isMounted(lease.Target)
-			if err != nil {
+		if entry.IsDir() && entry.Name() != trashDirectoryName {
+			if err := s.recoverObjectLeases(filepath.Join(s.root, entry.Name()), entry.Name(), verifyMount); err != nil {
 				return err
 			}
-			if mounted {
-				active = append(active, lease)
-			}
-		}
-		allLeasesActive := len(active) == len(meta.Leases)
-		discardDirtyGeneration := len(active) == 0 && wasDirty && !meta.Policy.CrashRecoveryReuse
-		if allLeasesActive && !discardDirtyGeneration {
-			continue
-		}
-		if len(active) == 0 && wasDirty && !meta.Policy.CrashRecoveryReuse {
-			if err := s.detachToTrash(path); err != nil {
-				return fmt.Errorf("discard cache object after unclean stop: %w", err)
-			}
-			if err := s.ensureDirectory(path); err != nil {
-				return fmt.Errorf("create cache object after recovery: %w", err)
-			}
-			meta = Metadata{
-				Identity:   entry.Name(),
-				Generation: uuid.NewV7().String(),
-				CreatedAt:  time.Now().UTC(),
-				LastUsed:   time.Now().UTC(),
-				Policy:     meta.Policy,
-			}
-			if err := s.writeMetadata(path, meta); err != nil {
-				return err
-			}
-			continue
-		}
-		meta.Leases = active
-		for index := 0; index < len(meta.Retired); {
-			retired := meta.Retired[index]
-			if slices.ContainsFunc(active, func(lease Lease) bool { return lease.Generation == retired.Generation }) {
-				index++
-				continue
-			}
-			if err := s.detachGenerationToTrash(filepath.Join(path, "generations", retired.Generation), entry.Name(), retired); err != nil {
-				return fmt.Errorf("detach retired cache generation without active leases: %w", err)
-			}
-			meta.Retired = slices.Delete(meta.Retired, index, index+1)
-		}
-		generationPath := filepath.Join(path, "generations", meta.Generation)
-		if statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
-			meta.Leases = slices.DeleteFunc(meta.Leases, func(lease Lease) bool { return lease.Generation == "" || lease.Generation == meta.Generation })
-			meta.Generation = uuid.NewV7().String()
-			meta.CreatedAt = time.Now().UTC()
-			meta.ProjectAssigned = false
-			meta.QuotaBytes = 0
-		} else if statErr != nil {
-			return fmt.Errorf("inspect cache generation during recovery: %w", statErr)
-		}
-		meta.Dirty = len(active) > 0
-		if err := s.writeMetadata(path, meta); err != nil {
-			return err
 		}
 	}
 	return nil
 }
 
+func (s *Store) recoverObjectLeases(path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
+	meta, err := s.readMetadata(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := s.discardUntrackedGenerations(path); err != nil {
+			s.markDegraded(identity, err)
+		}
+		return nil
+	}
+	if err == nil {
+		err = validateMetadata(identity, meta)
+	}
+	if err != nil {
+		s.markDegraded(identity, err)
+		s.quarantineDegradedObject(path, identity, verifyMount)
+		return nil
+	}
+	return s.recoverValidObjectLeases(path, identity, meta, verifyMount)
+}
+
+func (s *Store) recoverValidObjectLeases(path, identity string, meta Metadata, verifyMount func(string, Lease, Policy) (bool, error)) error {
+	wasDirty := meta.Dirty
+	active, uncertain := s.verifyRecoveredLeases(path, identity, meta, verifyMount)
+	if uncertain {
+		return nil
+	}
+	allLeasesActive := len(active) == len(meta.Leases)
+	if allLeasesActive && (len(active) > 0 || !wasDirty || meta.Policy.CrashRecoveryReuse) {
+		s.indexObjectMetadata(meta)
+		return nil
+	}
+	if len(active) == 0 && wasDirty && !meta.Policy.CrashRecoveryReuse {
+		return s.recoverDirtyObject(path, identity, meta)
+	}
+	meta.Leases = active
+	if s.recoverRetiredGenerations(path, identity, &meta, active) {
+		return nil
+	}
+	generationPath := filepath.Join(path, "generations", meta.Generation)
+	if statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
+		meta.Leases = slices.DeleteFunc(meta.Leases, func(lease Lease) bool { return lease.Generation == "" || lease.Generation == meta.Generation })
+		meta.Generation = uuid.NewV7().String()
+		meta.CreatedAt = time.Now().UTC()
+		meta.ProjectAssigned = false
+		meta.QuotaBytes = 0
+	} else if statErr != nil {
+		s.markDegraded(identity, statErr)
+		return nil
+	}
+	meta.Dirty = len(active) > 0
+	if err := s.writeMetadata(path, meta); err != nil {
+		s.markDegraded(identity, err)
+	}
+	return nil
+}
+
+func (s *Store) verifyRecoveredLeases(path, identity string, meta Metadata, verifyMount func(string, Lease, Policy) (bool, error)) ([]Lease, bool) {
+	active := make([]Lease, 0, len(meta.Leases))
+	for _, lease := range meta.Leases {
+		generation, policy, err := leaseGenerationAndPolicy(meta, lease)
+		if err != nil {
+			s.markDegraded(identity, err)
+			return nil, true
+		}
+		mounted, err := verifyMount(filepath.Join(path, "generations", generation), lease, policy)
+		if err != nil {
+			s.markDegraded(identity, err)
+			return nil, true
+		}
+		if mounted {
+			active = append(active, lease)
+		}
+	}
+	return active, false
+}
+
+func (s *Store) recoverDirtyObject(path, identity string, meta Metadata) error {
+	if err := s.detachToTrash(path); err != nil {
+		s.markDegraded(identity, err)
+		return nil
+	}
+	if err := s.ensureDirectory(path); err != nil {
+		return fmt.Errorf("create cache object after recovery: %w", err)
+	}
+	meta = Metadata{
+		Identity:   identity,
+		Generation: uuid.NewV7().String(),
+		CreatedAt:  time.Now().UTC(),
+		LastUsed:   time.Now().UTC(),
+		Policy:     meta.Policy,
+	}
+	if err := s.writeMetadata(path, meta); err != nil {
+		s.markDegraded(identity, err)
+	}
+	return nil
+}
+
+func (s *Store) recoverRetiredGenerations(path, identity string, meta *Metadata, active []Lease) bool {
+	for index := 0; index < len(meta.Retired); {
+		retired := meta.Retired[index]
+		if slices.ContainsFunc(active, func(lease Lease) bool { return lease.Generation == retired.Generation }) {
+			index++
+			continue
+		}
+		if err := s.detachGenerationToTrash(filepath.Join(path, "generations", retired.Generation), identity, retired); err != nil {
+			s.markDegraded(identity, err)
+			return true
+		}
+		meta.Retired = slices.Delete(meta.Retired, index, index+1)
+	}
+	return false
+}
+
+func (s *Store) quarantineDegradedObject(path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) {
+	generationsPath := filepath.Join(path, "generations")
+	generations, err := s.readDir(generationsPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.markDegraded(identity, err)
+		return
+	}
+	for _, generation := range generations {
+		if !generation.IsDir() {
+			continue
+		}
+		source := filepath.Join(generationsPath, generation.Name())
+		mounted, err := verifyMount(source, Lease{}, Policy{})
+		if err != nil {
+			s.markDegraded(identity, err)
+			return
+		}
+		if mounted {
+			s.markDegraded(identity, errors.New("cache generation remains mounted with unreadable metadata"))
+			return
+		}
+	}
+	if err := s.detachToTrash(path); err != nil {
+		s.markDegraded(identity, err)
+	}
+}
+
 func (s *Store) Collect(now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entries, err := s.readDir(s.root)
-	if err != nil {
-		return err
+	identities := make([]string, 0, len(s.metadataByIdentity))
+	for identity := range s.metadataByIdentity {
+		identities = append(identities, identity)
 	}
 	type candidate struct {
-		path string
-		meta Metadata
+		identity string
+		path     string
+		meta     Metadata
 	}
 	var candidates []candidate
-	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == trashDirectoryName {
+	for _, identity := range identities {
+		indexed := s.metadataByIdentity[identity]
+		if len(indexed.Leases) != 0 || indexed.Policy.Retention <= 0 || now.Sub(indexed.LastUsed) < indexed.Policy.Retention {
 			continue
 		}
-		path := filepath.Join(s.root, entry.Name())
-		meta, err := s.readMetadata(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
+		meta, err := s.readObjectMetadata(identity)
 		if err != nil {
-			return fmt.Errorf("read cache metadata during collection: %w", err)
+			continue
 		}
-		if len(meta.Leases) == 0 {
-			candidates = append(candidates, candidate{path, meta})
+		if len(meta.Leases) == 0 && meta.Policy.Retention > 0 && now.Sub(meta.LastUsed) >= meta.Policy.Retention {
+			candidates = append(candidates, candidate{identity: identity, path: filepath.Join(s.root, identity), meta: meta})
 		}
 	}
-	fs, err := filesystemUsage(s.root)
-	if err != nil {
-		return err
-	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].meta.LastUsed.Before(candidates[j].meta.LastUsed) })
-	pressure := s.updatePressure(fs)
-	removed := 0
-	for _, item := range candidates {
-		expired := item.meta.Policy.Retention > 0 && now.Sub(item.meta.LastUsed) >= item.meta.Policy.Retention
-		if !expired && !pressure {
+	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
+	for _, item := range candidates[:min(len(candidates), trashBatchSize)] {
+		meta, err := s.readObjectMetadata(item.identity)
+		if err != nil || len(meta.Leases) != 0 || meta.Policy.Retention <= 0 || now.Sub(meta.LastUsed) < meta.Policy.Retention {
 			continue
 		}
 		if err := s.detachToTrash(item.path); err != nil {
 			return fmt.Errorf("remove cache object: %w", err)
 		}
-		removed++
-		if removed >= trashBatchSize {
-			break
-		}
 	}
 	return nil
+}
+
+func (s *Store) ReclaimPressure(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		usage, err := filesystemUsage(s.root)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if !s.updatePressure(usage) {
+			s.mu.Unlock()
+			return nil
+		}
+		trash, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if len(trash) > 0 {
+			s.mu.Unlock()
+			if err := s.cleanupTrashFully(ctx); err != nil {
+				return fmt.Errorf("delete pending cache trash during pressure reclaim: %w", err)
+			}
+			continue
+		}
+
+		identities := make([]string, 0, len(s.metadataByIdentity))
+		for identity := range s.metadataByIdentity {
+			identities = append(identities, identity)
+		}
+		type candidate struct {
+			identity string
+			path     string
+			lastUsed time.Time
+		}
+		var candidates []candidate
+		for _, identity := range identities {
+			meta, err := s.readObjectMetadata(identity)
+			if err != nil || len(meta.Leases) != 0 {
+				continue
+			}
+			candidates = append(candidates, candidate{identity: identity, path: filepath.Join(s.root, identity), lastUsed: meta.LastUsed})
+		}
+		slices.SortFunc(candidates, func(left, right candidate) int { return left.lastUsed.Compare(right.lastUsed) })
+		if len(candidates) == 0 {
+			s.mu.Unlock()
+			return nil
+		}
+		item := candidates[0]
+		if err := s.detachToTrash(item.path); err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("detach unused cache during pressure reclaim: %w", err)
+		}
+		s.mu.Unlock()
+		if err := s.cleanupTrashFully(ctx); err != nil {
+			return fmt.Errorf("delete unused cache during pressure reclaim: %w", err)
+		}
+	}
 }
 
 func (s *Store) underLowWatermark(fs unix.Statfs_t) bool {
@@ -910,17 +1562,8 @@ func (s *Store) updatePressure(fs unix.Statfs_t) bool {
 func (s *Store) MetadataError() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entries, err := s.readDir(s.root)
-	if err != nil {
+	for _, err := range s.degraded {
 		return err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == trashDirectoryName {
-			continue
-		}
-		if _, err := s.readMetadata(filepath.Join(s.root, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("cache metadata is unreadable")
-		}
 	}
 	return nil
 }
@@ -935,36 +1578,34 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 	if len(trash) > 0 {
 		return nil, nil
 	}
-	entries, err := s.readDir(s.root)
-	if err != nil {
-		return nil, err
-	}
 	fs, err := filesystemUsage(s.root)
 	if err != nil {
 		return nil, err
 	}
 	type candidate struct {
-		meta Metadata
-		path string
+		identity string
+		meta     Metadata
+		path     string
 	}
 	var candidates []candidate
 	underPressure := s.updatePressure(fs)
-	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == trashDirectoryName {
-			continue
-		}
-		meta, err := s.readMetadata(filepath.Join(s.root, entry.Name()))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
+	identities := make([]string, 0, len(s.metadataByIdentity))
+	for identity := range s.metadataByIdentity {
+		identities = append(identities, identity)
+	}
+	for _, identity := range identities {
+		meta, err := s.readObjectMetadata(identity)
 		if err != nil {
-			return nil, fmt.Errorf("read cache metadata while listing pressure victims: %w", err)
+			continue
+		}
+		if underPressure && len(meta.Leases) == 0 {
+			return nil, nil
 		}
 		if meta.Policy.EvictRunning && s.activeLeaseCount(meta) > 0 {
-			candidates = append(candidates, candidate{meta, filepath.Join(s.root, entry.Name())})
+			candidates = append(candidates, candidate{identity: identity, meta: meta, path: filepath.Join(s.root, identity)})
 		}
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].meta.LastUsed.Before(candidates[j].meta.LastUsed) })
+	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
 	if underPressure {
 		for _, candidate := range candidates {
 			leases := make([]Lease, 0, len(candidate.meta.Leases))
@@ -1000,16 +1641,10 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 			}
 			return leases, nil
 		}
-		for _, entry := range entries {
-			if !entry.IsDir() || entry.Name() == trashDirectoryName {
-				continue
-			}
-			meta, err := s.readMetadata(filepath.Join(s.root, entry.Name()))
+		for _, identity := range identities {
+			meta, err := s.readObjectMetadata(identity)
 			if err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					continue
-				}
-				return nil, fmt.Errorf("read cache metadata while listing retired pressure victims: %w", err)
+				continue
 			}
 			for _, retired := range meta.Retired {
 				if !retired.Policy.EvictRunning {
@@ -1098,8 +1733,29 @@ func (s *Store) writeMetadata(entry string, meta Metadata) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = dir.Close() }()
-	return dir.Sync()
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	switch {
+	case filepath.Dir(relative) == "." && filepath.Base(relative) != trashDirectoryName:
+		if filepath.Base(relative) != meta.Identity || meta.Generation == "" {
+			return errors.New("cache metadata identity or generation is inconsistent")
+		}
+		s.indexObjectMetadata(meta)
+	case filepath.Dir(relative) == trashDirectoryName:
+		trashID := filepath.Base(relative)
+		s.trashMetadata[trashID] = meta
+		s.addMetadataReservations(meta, trashID)
+	}
+	if err := s.persistProjectReservations(); err != nil {
+		return fmt.Errorf("persist project ID registry after metadata update: %w", err)
+	}
+	return nil
 }
 
 func stableIdentity(value string) string {
