@@ -12,9 +12,6 @@ func (spec CacheClassSpec) Validate() error {
 	if err := spec.validateQuota(); err != nil {
 		return err
 	}
-	if err := spec.validatePressure(); err != nil {
-		return err
-	}
 	if spec.Retention.Duration < 0 {
 		return fmt.Errorf("retention must not be negative")
 	}
@@ -56,37 +53,6 @@ func (spec CacheClassSpec) validateQuota() error {
 	}
 	if spec.Quota.Enabled && !spec.MaxBytes.IsZero() && spec.Quota.DefaultMaxBytes.Cmp(spec.MaxBytes) > 0 {
 		return fmt.Errorf("quota.defaultMaxBytes must not exceed the maxBytes ceiling")
-	}
-	return nil
-}
-
-func (spec CacheClassSpec) validatePressure() error {
-	pressure := spec.Pressure
-	for _, threshold := range []struct {
-		name  string
-		value int32
-	}{
-		{name: "highFreePercent", value: pressure.HighFreePercent},
-		{name: "lowFreePercent", value: pressure.LowFreePercent},
-		{name: "highInodeFreePercent", value: pressure.HighInodeFreePercent},
-		{name: "lowInodeFreePercent", value: pressure.LowInodeFreePercent},
-	} {
-		if threshold.value < 0 || threshold.value > 100 {
-			return fmt.Errorf("%s must be between 0 and 100", threshold.name)
-		}
-	}
-	if err := validateWatermarks("FreeBytes", pressure.HighFreePercent, pressure.LowFreePercent); err != nil {
-		return err
-	}
-	return validateWatermarks("FreeInodes", pressure.HighInodeFreePercent, pressure.LowInodeFreePercent)
-}
-
-func validateWatermarks(name string, high, low int32) error {
-	if (high == 0) != (low == 0) {
-		return fmt.Errorf("high and low %s percentages must be configured together", name)
-	}
-	if high > 0 && high <= low {
-		return fmt.Errorf("high %s percentage must be greater than the low percentage", name)
 	}
 	return nil
 }

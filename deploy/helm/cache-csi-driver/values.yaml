@@ -12,6 +12,11 @@ cacheRootDir: /var/lib/cache-csi
 fallbackRootDir: /run/cache-csi/fallback
 kubeletRootDir: /var/lib/kubelet
 gcInterval: 30s
+pressure:
+  highFreePercent: 25
+  lowFreePercent: 20
+  highInodeFreePercent: 15
+  lowInodeFreePercent: 10
 
 csiDriver:
   preventPodSchedulingIfMissing: true

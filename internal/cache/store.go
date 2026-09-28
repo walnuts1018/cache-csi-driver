@@ -19,6 +19,15 @@ import (
 )
 
 const metadataName = ".cache-csi.json"
+const trashDirectoryName = ".trash"
+const trashBatchSize = 16
+
+type PressureConfig struct {
+	HighFreePercent      int
+	LowFreePercent       int
+	HighInodeFreePercent int
+	LowInodeFreePercent  int
+}
 
 type Lease struct {
 	ID        string `json:"id"`
@@ -40,10 +49,6 @@ type Policy struct {
 	QuotaEnabled         bool          `json:"quotaEnabled"`
 	MaxBytes             int64         `json:"maxBytes"`
 	Retention            time.Duration `json:"retention"`
-	HighFreePercent      int           `json:"highFreePercent"`
-	LowFreePercent       int           `json:"lowFreePercent"`
-	HighInodeFreePercent int           `json:"highInodeFreePercent"`
-	LowInodeFreePercent  int           `json:"lowInodeFreePercent"`
 }
 
 type Metadata struct {
@@ -66,13 +71,15 @@ type AcquireOptions struct {
 }
 
 type Store struct {
-	root string
-	mu   sync.Mutex
+	root           string
+	pressure       PressureConfig
+	pressureActive bool
+	mu             sync.Mutex
 }
 
 func (s *Store) Root() string { return s.root }
 
-func NewStore(root string) (*Store, error) {
+func NewStore(root string, pressure PressureConfig) (*Store, error) {
 	if !filepath.IsAbs(root) {
 		return nil, errors.New("cache root must be absolute")
 	}
@@ -80,7 +87,61 @@ func NewStore(root string) (*Store, error) {
 	if err := ensureDirectory(root, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache root: %w", err)
 	}
-	return &Store{root: root}, nil
+	if err := validatePressure(pressure); err != nil {
+		return nil, err
+	}
+	if err := ensureDirectory(filepath.Join(root, trashDirectoryName), 0o700); err != nil {
+		return nil, fmt.Errorf("create cache trash directory: %w", err)
+	}
+	store := &Store{root: root, pressure: pressure}
+	go store.runTrashCollector()
+	return store, nil
+}
+
+func validatePressure(pressure PressureConfig) error {
+	for _, threshold := range []int{pressure.HighFreePercent, pressure.LowFreePercent, pressure.HighInodeFreePercent, pressure.LowInodeFreePercent} {
+		if threshold < 0 || threshold > 100 {
+			return errors.New("pressure percentages must be between 0 and 100")
+		}
+	}
+	if !validWatermarks(pressure.HighFreePercent, pressure.LowFreePercent) || !validWatermarks(pressure.HighInodeFreePercent, pressure.LowInodeFreePercent) {
+		return errors.New("pressure high watermarks must be greater than paired low watermarks")
+	}
+	return nil
+}
+
+func validWatermarks(high, low int) bool {
+	return (high == 0 && low == 0) || high > low
+}
+
+func (s *Store) runTrashCollector() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		s.cleanupTrash()
+		<-ticker.C
+	}
+}
+
+func (s *Store) cleanupTrash() {
+	entries, err := os.ReadDir(filepath.Join(s.root, trashDirectoryName))
+	if err != nil {
+		return
+	}
+	for _, entry := range entries[:min(len(entries), trashBatchSize)] {
+		_ = os.RemoveAll(filepath.Join(s.root, trashDirectoryName, entry.Name()))
+	}
+}
+
+func (s *Store) detachToTrash(path string) error {
+	trashPath := filepath.Join(s.root, trashDirectoryName, uuid.NewV7().String())
+	if err := os.Rename(path, trashPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func Identity(namespaceUID, cacheClass, cacheClassUID, cacheKey, schema string) (string, error) {
@@ -118,6 +179,17 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 		if meta.Identity != options.Identity || meta.Generation == "" {
 			return "", false, errors.New("cache metadata identity is inconsistent")
 		}
+		generationPath := filepath.Join(entry, "generations", meta.Generation)
+		if _, statErr := os.Stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
+			meta.Generation = uuid.NewV7().String()
+			meta.CreatedAt = time.Now().UTC()
+			meta.ProjectAssigned = false
+			meta.QuotaBytes = 0
+			meta.Leases = nil
+			meta.Dirty = false
+		} else if statErr != nil {
+			return "", false, fmt.Errorf("inspect cache generation: %w", statErr)
+		}
 		for _, lease := range meta.Leases {
 			if lease.ID == options.Lease.ID {
 				if lease.Target != options.Lease.Target {
@@ -133,7 +205,7 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 			}
 		}
 		if meta.Dirty && len(meta.Leases) == 0 && !meta.Policy.CrashRecoveryReuse {
-			if err := os.RemoveAll(filepath.Join(entry, "generations", meta.Generation)); err != nil {
+			if err := s.detachToTrash(filepath.Join(entry, "generations", meta.Generation)); err != nil {
 				return "", false, fmt.Errorf("discard dirty cache generation: %w", err)
 			}
 			meta.Generation = uuid.NewV7().String()
@@ -349,13 +421,22 @@ func (s *Store) RecoverLeases(isMounted func(string) (bool, error)) error {
 		}
 		meta.Leases = active
 		if len(active) == 0 && !meta.Policy.CrashRecoveryReuse && wasDirty {
-			if err := os.RemoveAll(filepath.Join(path, "generations", meta.Generation)); err != nil {
+			if err := s.detachToTrash(filepath.Join(path, "generations", meta.Generation)); err != nil {
 				return fmt.Errorf("discard cache generation after unclean stop: %w", err)
 			}
 			meta.Generation = uuid.NewV7().String()
 			meta.CreatedAt = time.Now().UTC()
 			meta.ProjectAssigned = false
 			meta.QuotaBytes = 0
+		}
+		generationPath := filepath.Join(path, "generations", meta.Generation)
+		if _, statErr := os.Stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
+			meta.Generation = uuid.NewV7().String()
+			meta.CreatedAt = time.Now().UTC()
+			meta.ProjectAssigned = false
+			meta.QuotaBytes = 0
+		} else if statErr != nil {
+			return fmt.Errorf("inspect cache generation during recovery: %w", statErr)
 		}
 		meta.Dirty = len(active) > 0
 		if err := writeMetadata(path, meta); err != nil {
@@ -378,7 +459,7 @@ func (s *Store) Collect(now time.Time) error {
 	}
 	var candidates []candidate
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || entry.Name() == trashDirectoryName {
 			continue
 		}
 		path := filepath.Join(s.root, entry.Name())
@@ -392,31 +473,39 @@ func (s *Store) Collect(now time.Time) error {
 		return err
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].meta.LastUsed.Before(candidates[j].meta.LastUsed) })
-	pressure := false
-	targetFree, targetInodes := 0, 0
-	for _, item := range candidates {
-		if below(fs.Bavail, fs.Blocks, item.meta.Policy.LowFreePercent) || below(fs.Ffree, fs.Files, item.meta.Policy.LowInodeFreePercent) {
-			pressure = true
-			targetFree = max(targetFree, item.meta.Policy.HighFreePercent)
-			targetInodes = max(targetInodes, item.meta.Policy.HighInodeFreePercent)
-		}
-	}
+	pressure := s.updatePressure(fs)
+	removed := 0
 	for _, item := range candidates {
 		expired := item.meta.Policy.Retention > 0 && now.Sub(item.meta.LastUsed) >= item.meta.Policy.Retention
 		if !expired && !pressure {
 			continue
 		}
-		if err := os.RemoveAll(item.path); err != nil {
+		if err := s.detachToTrash(item.path); err != nil {
 			return fmt.Errorf("remove cache object: %w", err)
 		}
-		if err := unix.Statfs(s.root, &fs); err != nil {
-			return err
-		}
-		if pressure && !below(fs.Bavail, fs.Blocks, targetFree) && !below(fs.Ffree, fs.Files, targetInodes) {
-			pressure = false
+		removed++
+		if removed >= trashBatchSize {
+			break
 		}
 	}
 	return nil
+}
+
+func (s *Store) underLowWatermark(fs unix.Statfs_t) bool {
+	return below(fs.Bavail, fs.Blocks, s.pressure.LowFreePercent) || below(fs.Ffree, fs.Files, s.pressure.LowInodeFreePercent)
+}
+
+func (s *Store) updatePressure(fs unix.Statfs_t) bool {
+	if !s.pressureActive {
+		s.pressureActive = s.underLowWatermark(fs)
+		return s.pressureActive
+	}
+	bytesRecovered := s.pressure.HighFreePercent == 0 || above(fs.Bavail, fs.Blocks, s.pressure.HighFreePercent)
+	inodesRecovered := s.pressure.HighInodeFreePercent == 0 || above(fs.Ffree, fs.Files, s.pressure.HighInodeFreePercent)
+	if bytesRecovered && inodesRecovered {
+		s.pressureActive = false
+	}
+	return s.pressureActive
 }
 
 func (s *Store) MetadataError() error {
@@ -427,7 +516,7 @@ func (s *Store) MetadataError() error {
 		return err
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || entry.Name() == trashDirectoryName {
 			continue
 		}
 		if _, err := readMetadata(filepath.Join(s.root, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -453,8 +542,9 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 		path string
 	}
 	var candidates []candidate
+	underPressure := s.updatePressure(fs)
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || entry.Name() == trashDirectoryName {
 			continue
 		}
 		meta, err := readMetadata(filepath.Join(s.root, entry.Name()))
@@ -463,13 +553,14 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 		}
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].meta.LastUsed.Before(candidates[j].meta.LastUsed) })
-	for _, candidate := range candidates {
-		low := below(fs.Bavail, fs.Blocks, candidate.meta.Policy.LowFreePercent) || below(fs.Ffree, fs.Files, candidate.meta.Policy.LowInodeFreePercent)
-		if !low {
-			continue
-		}
+	if underPressure {
+		for _, candidate := range candidates {
+			if !candidate.meta.Policy.EvictRunning {
+				continue
+			}
 		leases := slices.Clone(candidate.meta.Leases)
 		return leases, nil
+		}
 	}
 	return nil, nil
 }
@@ -484,6 +575,10 @@ func filesystemUsage(path string) (unix.Statfs_t, error) {
 
 func below(available, total uint64, percent int) bool {
 	return percent > 0 && total > 0 && available*100/total < uint64(percent)
+}
+
+func above(available, total uint64, percent int) bool {
+	return percent > 0 && total > 0 && available*100/total >= uint64(percent)
 }
 
 func readMetadata(entry string) (Metadata, error) {

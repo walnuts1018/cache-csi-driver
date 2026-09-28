@@ -21,17 +21,9 @@ type CacheClassSpec struct {
 	Retention     metav1.Duration     `json:"retention,omitzero"`
 	SchemaVersion string              `json:"schemaVersion,omitempty"`
 	CrashRecovery CrashRecoveryPolicy `json:"crashRecovery,omitempty"`
-	Pressure      PressurePolicy      `json:"pressure,omitzero"`
 	Quota         QuotaPolicy         `json:"quota,omitzero"`
 	EvictRunning  bool                `json:"evictRunning,omitempty"`
 	NoExec        bool                `json:"noExec,omitempty"`
-}
-
-type PressurePolicy struct {
-	HighFreePercent      int32 `json:"highFreePercent,omitempty"`
-	LowFreePercent       int32 `json:"lowFreePercent,omitempty"`
-	HighInodeFreePercent int32 `json:"highInodeFreePercent,omitempty"`
-	LowInodeFreePercent  int32 `json:"lowInodeFreePercent,omitempty"`
 }
 
 type QuotaPolicy struct {

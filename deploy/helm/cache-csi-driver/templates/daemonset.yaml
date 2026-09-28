@@ -40,6 +40,10 @@ spec:
             - --node-id=$(NODE_NAME)
             - --kubelet-root={{ .Values.kubeletRootDir }}
             - --gc-interval={{ .Values.gcInterval }}
+            - --pressure-high-free-percent={{ .Values.pressure.highFreePercent }}
+            - --pressure-low-free-percent={{ .Values.pressure.lowFreePercent }}
+            - --pressure-high-inode-free-percent={{ .Values.pressure.highInodeFreePercent }}
+            - --pressure-low-inode-free-percent={{ .Values.pressure.lowInodeFreePercent }}
             {{- with .Values.driver.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

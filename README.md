@@ -71,15 +71,19 @@ spec:
 | `fallbackRootDir` | `/run/cache-csi/fallback` | Node上のfallback専用volume directory。tmpfsを使う場合はtmpfs内のNode pathを指定 |
 | `kubeletRootDir` | `/var/lib/kubelet` | kubeletのroot directory |
 | `gcInterval` | `30s` | Node-local cache GC interval |
+| `pressure.highFreePercent` | `25` | cache filesystemの空き容量GC終了水位 |
+| `pressure.lowFreePercent` | `20` | cache filesystemの空き容量GC開始水位 |
+| `pressure.highInodeFreePercent` | `15` | cache filesystemの空きinode GC終了水位 |
+| `pressure.lowInodeFreePercent` | `10` | cache filesystemの空きinode GC開始水位 |
 | `csiDriver.preventPodSchedulingIfMissing` | `true` | CSI pluginが未登録のNodeへの配置を防止 |
 | `rbac.createPodEvictions` | `true` | `evictRunning`用のPod Eviction権限 |
 | `nodeSelector` | `kubernetes.io/os: linux` | DaemonSetを配置するNode |
 
 `CacheClass.spec.maxBytes`は、各cache identityに対してvolume側が要求できるquota上限です。`quota.enabled`と`backend: xfs-project`が必要で、volume attributeの`maxBytes`がこの上限を超える場合はmount要求を拒否します。volume attributeに`maxBytes`がない場合は`quota.defaultMaxBytes`を設定していればその値を使い、未設定なら`spec.maxBytes`を使います。quotaを有効にするCacheClassには`spec.maxBytes`または`quota.defaultMaxBytes`を設定してください。`examples/cacheclass-xfs-project.yaml`と`examples/pod-inline-cache-xfs-project.yaml`に設定例があります。
 
-現在、class全体の集約byte上限はありません。`pressure`はNode-local cache filesystemの空き容量とinodeに対するGC水位を設定し、実際のfilesystem使用量に応じてcacheを回収します。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
+現在、class全体の集約byte上限はありません。pressure watermarksはCacheClassごとではなく、`cacheRootDir`が属する単一filesystem全体に適用します。設定した開始水位を下回ると未使用cacheを優先して回収し、終了水位まで回復させます。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
 
-`evictRunning`を有効にしたCacheClassでは、pressure GCが未使用cacheだけで不足すると、そのcacheを利用中のPodへKubernetes Eviction APIを要求します。PodDisruptionBudgetにより要求が拒否される場合は、Podとactive cacheを維持します。Node pluginのClusterRoleは全namespaceの`pods/eviction`作成だけを追加し、Podの直接削除権限は持ちません。active Pod evictionを使わない場合は`rbac.createPodEvictions=false`にできます。
+`evictRunning`を有効にしたCacheClassでは、未使用cacheを回収した後もglobal pressureが続く場合、そのcacheを利用中のPodへKubernetes Eviction APIでbest-effortの退去要求を出します。PodDisruptionBudgetにより拒否される場合やPodが退去しない場合があり、cacheの回収は保証されません。driverはPodを強制削除しません。Node pluginのClusterRoleは全namespaceの`pods/eviction`作成だけを追加し、Podの直接削除権限は持ちません。active Pod evictionを使わない場合は`rbac.createPodEvictions=false`にできます。
 
 `quota.enabled`を使うCacheClassでは`backend: xfs-project`を指定し、`cacheRootDir`がproject quota有効のXFS filesystem上にあることを確認してください。Node imageには`xfs_quota`を含めていますが、host filesystemのmount optionやquota設定は管理者が行います。
 

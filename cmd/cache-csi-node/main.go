@@ -45,6 +45,10 @@ func run(logger *slog.Logger) error {
 	nodeID := flag.String("node-id", os.Getenv("NODE_NAME"), "Kubernetes node name")
 	kubeletRoot := flag.String("kubelet-root", "/var/lib/kubelet", "kubelet root directory")
 	gcInterval := flag.Duration("gc-interval", 30*time.Second, "cache garbage collection interval")
+	highFreePercent := flag.Int("pressure-high-free-percent", 25, "free-byte percentage at which cache pressure collection stops")
+	lowFreePercent := flag.Int("pressure-low-free-percent", 20, "free-byte percentage at which cache pressure collection starts")
+	highInodeFreePercent := flag.Int("pressure-high-inode-free-percent", 15, "free-inode percentage at which cache pressure collection stops")
+	lowInodeFreePercent := flag.Int("pressure-low-inode-free-percent", 10, "free-inode percentage at which cache pressure collection starts")
 	flag.Parse()
 
 	if *gcInterval <= 0 {
@@ -67,7 +71,12 @@ func run(logger *slog.Logger) error {
 		}
 	}
 
-	store, err := cache.NewStore(*cacheRoot)
+	store, err := cache.NewStore(*cacheRoot, cache.PressureConfig{
+		HighFreePercent:      *highFreePercent,
+		LowFreePercent:       *lowFreePercent,
+		HighInodeFreePercent: *highInodeFreePercent,
+		LowInodeFreePercent:  *lowInodeFreePercent,
+	})
 	if err != nil {
 		return fmt.Errorf("initialize cache store: %w", err)
 	}
@@ -89,6 +98,7 @@ func run(logger *slog.Logger) error {
 		NodeID:       *nodeID,
 		KubeletRoot:  *kubeletRoot,
 		FallbackRoot: *fallbackRoot,
+		VendorVersion: version,
 	})
 	grpcServer := grpc.NewServer()
 	csi.RegisterIdentityServer(grpcServer, service)

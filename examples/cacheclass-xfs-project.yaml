@@ -8,11 +8,6 @@ spec:
   retention: 72h
   schemaVersion: v1
   crashRecovery: discard
-  pressure:
-    highFreePercent: 25
-    lowFreePercent: 20
-    highInodeFreePercent: 15
-    lowInodeFreePercent: 10
   quota:
     enabled: true
     defaultMaxBytes: 16Gi
