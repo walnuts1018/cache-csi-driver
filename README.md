@@ -17,6 +17,8 @@ helm install cache-csi-driver \
 
 このchartは`CacheClass` CRD、`CSIDriver`、read-onlyのClusterRole、ServiceAccount、Node DaemonSetをインストールします。Node pluginはmount system callを使うためprivileged containerとして動作します。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
+fallback専用volumeのデータはNode上の`/run/cache-csi/fallback`に配置します。標準的なLinuxでは`/run`はtmpfsですが、すべてのNode構成で保証されるわけではありません。fallbackデータをメモリ上に保つ場合は、`fallbackRootDir`をNode上のtmpfs内のパスに設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
+
 `preventPodSchedulingIfMissing`を有効にしているため、CSI pluginが登録されていないNodeへのPod配置を防ぎます。Cluster Autoscalerを使う場合は、CSI node-aware schedulingを有効にしてください。
 
 ## CacheClassとPod volume
@@ -66,6 +68,7 @@ spec:
 | `image.tag` | ChartのappVersion | Node plugin image tag |
 | `driverName` | `cache.csi.walnuts.dev` | CSI driver name |
 | `cacheRootDir` | `/var/lib/cache-csi` | Node上のcache directory |
+| `fallbackRootDir` | `/run/cache-csi/fallback` | Node上のfallback専用volume directory。tmpfsを使う場合はtmpfs内のNode pathを指定 |
 | `kubeletRootDir` | `/var/lib/kubelet` | kubeletのroot directory |
 | `gcInterval` | `30s` | Node-local cache GC interval |
 | `csiDriver.preventPodSchedulingIfMissing` | `true` | CSI pluginが未登録のNodeへの配置を防止 |
