@@ -66,16 +66,17 @@ type RetiredGeneration struct {
 }
 
 type Policy struct {
-	ClassName          string        `json:"className"`
-	ClassUID           string        `json:"classUID"`
-	SharingPolicy      string        `json:"sharingPolicy,omitempty"`
-	NoExec             bool          `json:"noExec"`
-	SchemaVersion      string        `json:"schemaVersion"`
-	CrashRecoveryReuse bool          `json:"crashRecoveryReuse"`
-	EvictRunning       bool          `json:"evictRunning"`
-	QuotaEnabled       bool          `json:"quotaEnabled"`
-	MaxBytes           int64         `json:"maxBytes"`
-	Retention          time.Duration `json:"retention"`
+	ClassName            string        `json:"className"`
+	ClassUID             string        `json:"classUID"`
+	SharingPolicy        string        `json:"sharingPolicy,omitempty"`
+	DiscardOnLastRelease bool          `json:"discardOnLastRelease,omitempty"`
+	NoExec               bool          `json:"noExec"`
+	SchemaVersion        string        `json:"schemaVersion"`
+	CrashRecoveryReuse   bool          `json:"crashRecoveryReuse"`
+	EvictRunning         bool          `json:"evictRunning"`
+	QuotaEnabled         bool          `json:"quotaEnabled"`
+	MaxBytes             int64         `json:"maxBytes"`
+	Retention            time.Duration `json:"retention"`
 }
 
 type projectReservation struct {
@@ -389,6 +390,12 @@ func (s *Store) loadProjectRegistry() bool {
 
 func hasGenerationDirectory(entries []os.DirEntry) bool {
 	return slices.ContainsFunc(entries, func(entry os.DirEntry) bool { return entry.IsDir() })
+}
+
+func hasUntrackedObjectPayload(entries []os.DirEntry) bool {
+	return slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+		return entry.Name() != "generations" && !strings.HasPrefix(entry.Name(), ".metadata-")
+	})
 }
 
 func (s *Store) reconcileProjectReservations(entries, trashEntries []os.DirEntry) error {
@@ -983,6 +990,13 @@ func Identity(namespaceUID, cacheClass, cacheClassUID, cacheKey, schema string) 
 	return stableIdentity(namespaceUID + "\x00" + cacheClass + "\x00" + cacheClassUID + "\x00" + cacheKey + "\x00" + schema), nil
 }
 
+func FallbackIdentity(volumeID string) (string, error) {
+	if volumeID == "" || strings.ContainsRune(volumeID, '\x00') {
+		return "", errors.New("valid volume ID is required")
+	}
+	return stableIdentity("fallback\x00" + volumeID), nil
+}
+
 func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1372,6 +1386,12 @@ func (s *Store) Release(leaseID, target string) error {
 		}
 		meta.Retired = slices.Delete(meta.Retired, retiredIndex, retiredIndex+1)
 	}
+	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) == 0 {
+		if err := s.detachToTrash(entry); err != nil {
+			return fmt.Errorf("discard released cache object: %w", err)
+		}
+		return nil
+	}
 	return s.writeMetadata(entry, meta)
 }
 
@@ -1574,6 +1594,16 @@ func (s *Store) recoverObjectLeases(path, identity string, verifyMount func(stri
 func (s *Store) recoverMissingMetadataObject(path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
 	generations, err := s.readDir(filepath.Join(path, "generations"))
 	if errors.Is(err, os.ErrNotExist) || err == nil && !hasGenerationDirectory(generations) {
+		contents, readErr := s.readDir(path)
+		if readErr != nil {
+			s.markDegraded(identity, readErr)
+			return nil
+		}
+		if hasUntrackedObjectPayload(contents) {
+			s.markDegraded(identity, errors.New("cache metadata is missing while object data remains"))
+			s.quarantineDegradedObject(path, identity, verifyMount)
+			return nil
+		}
 		if err := s.discardUntrackedGenerations(path); err != nil {
 			s.markDegraded(identity, err)
 		}
@@ -1592,6 +1622,20 @@ func (s *Store) recoverValidObjectLeases(path, identity string, meta Metadata, v
 	wasDirty := meta.Dirty
 	active, uncertain := s.verifyRecoveredLeases(path, identity, meta, verifyMount)
 	if uncertain {
+		return nil
+	}
+	if meta.Policy.DiscardOnLastRelease {
+		if len(active) == 0 {
+			if err := s.detachToTrash(path); err != nil {
+				s.markDegraded(identity, err)
+			}
+			return nil
+		}
+		meta.Leases = active
+		meta.Dirty = true
+		if err := s.writeMetadata(path, meta); err != nil {
+			s.markDegraded(identity, err)
+		}
 		return nil
 	}
 	allLeasesActive := len(active) == len(meta.Leases)

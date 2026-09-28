@@ -3,6 +3,7 @@ go = "1.27.1"
 golangci-lint = "2.14.0"
 helm = "4.3.0"
 "go:sigs.k8s.io/controller-tools/cmd/controller-gen" = "v0.22.0"
+"go:github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity" = "v5.6.0"
 
 [tasks.build]
 description = "Build the CSI node plugin"
@@ -15,6 +16,60 @@ go build -trimpath -o dist/cache-csi-node ./cmd/cache-csi-node
 [tasks.test]
 description = "Run Go tests"
 run = "go test ./..."
+
+[tasks."test:csi-sanity"]
+description = "Node-only CSI capability checks with csi-sanity"
+run = """
+set -euo pipefail
+tmp_dir="$(mktemp -d)"
+driver_pid=""
+cleanup() {
+  if [ -n "$driver_pid" ]; then
+    kill "$driver_pid" 2>/dev/null || true
+    wait "$driver_pid" 2>/dev/null || true
+  fi
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+
+go build -trimpath -o "$tmp_dir/cache-csi-node" ./cmd/cache-csi-node
+endpoint="unix://$tmp_dir/csi.sock"
+"$tmp_dir/cache-csi-node" \
+  -endpoint "$endpoint" \
+  -cache-root "$tmp_dir/cache" \
+  -fallback-root "$tmp_dir/fallback" \
+  -kubelet-root "$tmp_dir/kubelet" \
+  -node-id csi-sanity-test >"$tmp_dir/driver.log" 2>&1 &
+driver_pid=$!
+
+socket_path="$tmp_dir/csi.sock"
+for _ in $(seq 1 100); do
+  if [ -S "$socket_path" ]; then
+    break
+  fi
+  if ! kill -0 "$driver_pid" 2>/dev/null; then
+    cat "$tmp_dir/driver.log"
+    exit 1
+  fi
+  sleep 0.1
+done
+if [ ! -S "$socket_path" ]; then
+  cat "$tmp_dir/driver.log"
+  echo "CSI node plugin did not create its socket" >&2
+  exit 1
+fi
+
+csi-sanity \
+  --csi.endpoint="$endpoint" \
+  --csi.mountdir="$tmp_dir/mount" \
+  --csi.stagingdir="$tmp_dir/staging" \
+  --ginkgo.focus='NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo' \
+  --ginkgo.v
+"""
+
+[tasks."test:mount-api"]
+description = "Linux mount API integration coverage when CAP_SYS_ADMIN is available"
+run = "go test -v -count=1 -run '^TestMountUsesOpenTreeMountSetattrMoveMount$' ./internal/driver"
 
 [tasks.manifests]
 description = "Generate CacheClass API code and CRD manifests"

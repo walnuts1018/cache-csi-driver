@@ -36,6 +36,12 @@ jobs:
       - name: Run Go tests
         run: mise run test
 
+      - name: Run CSI conformance checks for node capabilities
+        run: mise run test:csi-sanity
+
+      - name: Run Linux mount API integration test
+        run: mise run test:mount-api
+
       - name: Verify generated API manifests
         run: |
           mise run manifests
