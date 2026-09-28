@@ -33,8 +33,7 @@ type ProjectQuota interface {
 }
 
 type mounter interface {
-	bindMount(string, string) error
-	remountOptions(string, bool, bool) error
+	mount(string, string, bool, bool) error
 	unmount(string) error
 	mountedAt(string) (bool, error)
 	sameCacheMount(string, string, bool, bool) (bool, error)
@@ -393,14 +392,15 @@ func (s *Server) mount(req *csi.NodePublishVolumeRequest, source string, noExec 
 	if err := makeTargetDirectory(target); err != nil {
 		return status.Errorf(codes.Internal, "prepare mount target: %v", err)
 	}
-	if err := s.mounter.bindMount(source, target); err != nil {
-		return status.Errorf(codes.Internal, "bind cache: %v", err)
-	}
-	if err := s.mounter.remountOptions(target, req.GetReadonly(), noExec); err != nil {
-		if unmountErr := s.mounter.unmount(target); unmountErr != nil && !errors.Is(unmountErr, errNotMounted) && !errors.Is(unmountErr, os.ErrNotExist) {
-			return status.Errorf(codes.Internal, "apply cache mount options: %v; unmount failed: %v", err, unmountErr)
+	if err := s.mounter.mount(source, target, req.GetReadonly(), noExec); err != nil {
+		mounted, inspectErr := s.mounter.mountedAt(target)
+		if inspectErr != nil {
+			return status.Errorf(codes.Internal, "mount cache: %v; inspect target mount: %v", err, inspectErr)
 		}
-		return status.Errorf(codes.Internal, "apply cache mount options: %v", err)
+		if mounted {
+			return status.Errorf(codes.Internal, "mount cache: %v; cache mount remains and its lease was retained", err)
+		}
+		return status.Errorf(codes.Internal, "mount cache: %v", err)
 	}
 	return nil
 }
@@ -431,14 +431,8 @@ func (s *Server) publishFallback(req *csi.NodePublishVolumeRequest) error {
 	if err := makeTargetDirectory(req.GetTargetPath()); err != nil {
 		return status.Errorf(codes.Internal, "prepare fallback target: %v", err)
 	}
-	if err := s.mounter.bindMount(source, req.GetTargetPath()); err != nil {
-		return status.Errorf(codes.Internal, "bind fallback cache: %v", err)
-	}
-	if err := s.mounter.remountOptions(req.GetTargetPath(), req.GetReadonly(), true); err != nil {
-		if unmountErr := s.mounter.unmount(req.GetTargetPath()); unmountErr != nil {
-			return status.Errorf(codes.Internal, "apply fallback mount options: %v; unmount failed: %v", err, unmountErr)
-		}
-		return status.Errorf(codes.Internal, "apply fallback mount options: %v", err)
+	if err := s.mounter.mount(source, req.GetTargetPath(), req.GetReadonly(), true); err != nil {
+		return status.Errorf(codes.Internal, "mount fallback cache: %v", err)
 	}
 	return nil
 }

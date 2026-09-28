@@ -21,7 +21,7 @@ helm install cache-csi-driver \
 kubectl label namespace default cache.csi.walnuts.dev/allow-use=true
 ```
 
-Helm valuesの`admissionPolicy.enabled=false`でpolicyを無効化する場合は、同等の利用制限を別のAdmission設定で行ってください。ClusterRoleはNamespaceとCacheClassの読み取り権限に加え、既定で`pods/eviction`の作成権限を持ちます。Node pluginはmount system callを使うためprivileged containerとして動作します。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
+Helm valuesの`admissionPolicy.enabled=false`でpolicyを無効化する場合は、同等の利用制限を別のAdmission設定で行ってください。ClusterRoleはNamespaceとCacheClassの読み取り権限に加え、既定で`pods/eviction`の作成権限を持ちます。Node pluginはmount system callを使うためprivileged containerとして動作し、mount属性付きmountの伝播にLinux kernel 5.12以降が必要です。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
 Kubernetes API resolverが一時的な障害になり、volume attributeに`maxBytes`がない場合は、volume固有で共有されないfallback directoryを使います。`maxBytes`を指定した要求や、通常cacheのmount・quota設定に失敗した要求ではfallbackに切り替えません。fallbackは`noexec`でmountします。データはNode上の`/run/cache-csi/fallback`に配置します。標準的なLinuxでは`/run`はtmpfsですが、すべてのNode構成で保証されるわけではありません。fallbackデータをメモリ上に保つ場合は、`fallbackRootDir`をNode上のtmpfs内のパスに設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 

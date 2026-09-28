@@ -4,6 +4,7 @@ package driver
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -18,12 +19,8 @@ type systemMounter struct{}
 
 func newMounter() mounter { return systemMounter{} }
 
-func (systemMounter) bindMount(source, target string) error {
-	return bindMount(source, target)
-}
-
-func (systemMounter) remountOptions(target string, readOnly, noExec bool) error {
-	return remountOptions(target, readOnly, noExec)
+func (systemMounter) mount(source, target string, readOnly, noExec bool) error {
+	return mount(source, target, readOnly, noExec)
 }
 
 func (systemMounter) unmount(target string) error { return unmount(target) }
@@ -44,19 +41,37 @@ func (systemMounter) filesystemReadOnly(path string) (bool, error) {
 	return filesystemReadOnly(path)
 }
 
-func bindMount(source, target string) error {
-	return unix.Mount(source, target, "", unix.MS_BIND, "")
-}
-
-func remountOptions(target string, readOnly, noExec bool) error {
-	flags := uintptr(unix.MS_BIND | unix.MS_REMOUNT | unix.MS_NODEV | unix.MS_NOSUID)
+func mount(source, target string, readOnly, noExec bool) error {
+	detachedMount, err := unix.OpenTree(unix.AT_FDCWD, source, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("clone cache mount tree: %w", err)
+	}
+	attributes := unix.MountAttr{Attr_set: unix.MOUNT_ATTR_NODEV | unix.MOUNT_ATTR_NOSUID}
 	if readOnly {
-		flags |= unix.MS_RDONLY
+		attributes.Attr_set |= unix.MOUNT_ATTR_RDONLY
 	}
 	if noExec {
-		flags |= unix.MS_NOEXEC
+		attributes.Attr_set |= unix.MOUNT_ATTR_NOEXEC
 	}
-	return unix.Mount("", target, "", flags, "")
+	if err := unix.MountSetattr(detachedMount, "", uint(unix.AT_EMPTY_PATH), &attributes); err != nil {
+		closeErr := unix.Close(detachedMount)
+		return errors.Join(fmt.Errorf("set cache mount attributes: %w", err), wrapMountCloseError(closeErr))
+	}
+	if err := unix.MoveMount(detachedMount, "", unix.AT_FDCWD, target, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
+		closeErr := unix.Close(detachedMount)
+		return errors.Join(fmt.Errorf("attach cache mount: %w", err), wrapMountCloseError(closeErr))
+	}
+	if err := unix.Close(detachedMount); err != nil {
+		return fmt.Errorf("close attached cache mount: %w", err)
+	}
+	return nil
+}
+
+func wrapMountCloseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close detached cache mount: %w", err)
 }
 
 func unmount(target string) error { return unix.Unmount(target, 0) }
