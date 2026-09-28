@@ -21,13 +21,7 @@ import (
 
 const DriverName = "cache.csi.walnuts.dev"
 
-const (
-	defaultRetention        = 72 * time.Hour
-	defaultHighFreePercent  = 25
-	defaultLowFreePercent   = 20
-	defaultHighInodePercent = 15
-	defaultLowInodePercent  = 10
-)
+const defaultRetention = 72 * time.Hour
 
 type ClassResolver interface {
 	Resolve(context.Context, string, string) (string, kube.ResolvedClass, error)
@@ -39,9 +33,10 @@ type ProjectQuota interface {
 }
 
 type Options struct {
-	NodeID       string
-	KubeletRoot  string
-	FallbackRoot string
+	NodeID        string
+	KubeletRoot   string
+	FallbackRoot  string
+	VendorVersion string
 }
 
 type Server struct {
@@ -55,11 +50,14 @@ type Server struct {
 }
 
 func New(store *cache.Store, resolver ClassResolver, quotaManager ProjectQuota, options Options) *Server {
+	if options.VendorVersion == "" {
+		options.VendorVersion = "dev"
+	}
 	return &Server{store: store, resolver: resolver, quota: quotaManager, options: options}
 }
 
-func (*Server) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
-	return &csi.GetPluginInfoResponse{Name: DriverName, VendorVersion: "0.1.0"}, nil
+func (s *Server) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
+	return &csi.GetPluginInfoResponse{Name: DriverName, VendorVersion: s.options.VendorVersion}, nil
 }
 
 func (*Server) GetPluginCapabilities(context.Context, *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
@@ -79,6 +77,7 @@ func (s *Server) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.Nod
 
 func (*Server) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	types := []csi.NodeServiceCapability_RPC_Type{
+		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
 		csi.NodeServiceCapability_RPC_GET_VOLUME_HEALTH,
 		csi.NodeServiceCapability_RPC_GET_STORAGE_HEALTH,
 	}
@@ -124,7 +123,7 @@ func (s *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			return nil, status.Error(codes.AlreadyExists, "target is mounted from a different source or with different options")
 		}
 		fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
-		if same, err := sameCacheMount(fallback, req.GetTargetPath(), req.GetReadonly(), false); err != nil {
+		if same, err := sameCacheMount(fallback, req.GetTargetPath(), req.GetReadonly(), true); err != nil {
 			return nil, status.Errorf(codes.Internal, "verify fallback mount: %v", err)
 		} else if same {
 			return &csi.NodePublishVolumeResponse{}, nil
@@ -220,24 +219,12 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 		EvictRunning:         spec.EvictRunning,
 		QuotaEnabled:         spec.Quota.Enabled,
 		Retention:            spec.Retention.Duration,
-		HighFreePercent:      int(spec.Pressure.HighFreePercent),
-		LowFreePercent:       int(spec.Pressure.LowFreePercent),
-		HighInodeFreePercent: int(spec.Pressure.HighInodeFreePercent),
-		LowInodeFreePercent:  int(spec.Pressure.LowInodeFreePercent),
 	}
 	if policy.SchemaVersion == "" {
 		policy.SchemaVersion = "v1"
 	}
 	if policy.Retention <= 0 {
 		policy.Retention = defaultRetention
-	}
-	if policy.HighFreePercent == 0 {
-		policy.HighFreePercent = defaultHighFreePercent
-		policy.LowFreePercent = defaultLowFreePercent
-	}
-	if policy.HighInodeFreePercent == 0 {
-		policy.HighInodeFreePercent = defaultHighInodePercent
-		policy.LowInodeFreePercent = defaultLowInodePercent
 	}
 	classMaxBytes := spec.MaxBytes.Value()
 	if requestedMaxBytes != "" {
@@ -325,7 +312,7 @@ func (s *Server) publishFallback(req *csi.NodePublishVolumeRequest) error {
 	if err := bindMount(source, req.GetTargetPath()); err != nil {
 		return status.Errorf(codes.Internal, "bind fallback cache: %v", err)
 	}
-	if err := remountOptions(req.GetTargetPath(), req.GetReadonly(), false); err != nil {
+	if err := remountOptions(req.GetTargetPath(), req.GetReadonly(), true); err != nil {
 		if unmountErr := unmount(req.GetTargetPath()); unmountErr != nil {
 			return status.Errorf(codes.Internal, "apply fallback mount options: %v; unmount failed: %v", err, unmountErr)
 		}
@@ -472,6 +459,11 @@ func isSingleNodeAccessMode(mode *csi.VolumeCapability_AccessMode) bool {
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER:
 		return true
+	case csi.VolumeCapability_AccessMode_UNKNOWN,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER:
+		return false
 	default:
 		return false
 	}
