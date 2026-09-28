@@ -9,6 +9,7 @@ import (
 )
 
 func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
+	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +76,7 @@ func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 }
 
 func TestAcquireRejectsQuotaChangeWhileGenerationIsActive(t *testing.T) {
+	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +105,7 @@ func TestAcquireRejectsQuotaChangeWhileGenerationIsActive(t *testing.T) {
 }
 
 func TestQuotaModeChangeCreatesFreshGenerationAndReservesOldProjectID(t *testing.T) {
+	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -173,6 +176,7 @@ func TestQuotaModeChangeCreatesFreshGenerationAndReservesOldProjectID(t *testing
 }
 
 func TestValidatePressureWatermarks(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		pressure PressureConfig
@@ -206,6 +210,7 @@ func TestValidatePressureWatermarks(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			err := validatePressure(test.pressure)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("validatePressure() error = %v, wantErr %v", err, test.wantErr)
@@ -215,6 +220,7 @@ func TestValidatePressureWatermarks(t *testing.T) {
 }
 
 func TestProjectIDAllocationStaysInsideConfiguredRange(t *testing.T) {
+	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -248,6 +254,7 @@ func TestProjectIDAllocationStaysInsideConfiguredRange(t *testing.T) {
 }
 
 func TestMetadataReadFailuresStopCollectionEvictionAndQuotaAllocation(t *testing.T) {
+	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)

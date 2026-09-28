@@ -142,20 +142,21 @@ func (s *Store) readDir(path string) ([]os.DirEntry, error) {
 	return fs.ReadDir(s.rootFS.FS(), relative)
 }
 
-func (s *Store) stat(path string) (os.FileInfo, error) {
-	relative, err := s.relative(path)
-	if err != nil {
-		return nil, err
-	}
-	return s.rootFS.Stat(relative)
-}
-
-func (s *Store) ensureDirectory(path string, mode os.FileMode) error {
+func (s *Store) stat(path string) error {
 	relative, err := s.relative(path)
 	if err != nil {
 		return err
 	}
-	if err := s.rootFS.MkdirAll(relative, mode); err != nil {
+	_, err = s.rootFS.Stat(relative)
+	return err
+}
+
+func (s *Store) ensureDirectory(path string) error {
+	relative, err := s.relative(path)
+	if err != nil {
+		return err
+	}
+	if err := s.rootFS.MkdirAll(relative, 0o700); err != nil {
 		return err
 	}
 	info, err := s.rootFS.Lstat(relative)
@@ -193,7 +194,7 @@ func NewStore(root string, options StoreOptions) (*Store, error) {
 		return nil, errors.New("cache root must be absolute")
 	}
 	root = filepath.Clean(root)
-	if err := ensureDirectory(root, 0o700); err != nil {
+	if err := ensureDirectory(root); err != nil {
 		return nil, fmt.Errorf("create cache root: %w", err)
 	}
 	rootFS, err := os.OpenRoot(root)
@@ -338,7 +339,7 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 		return "", false, errors.New("cache lease ID is already in use")
 	}
 	entry := filepath.Join(s.root, options.Identity)
-	if err := s.ensureDirectory(entry, 0o700); err != nil {
+	if err := s.ensureDirectory(entry); err != nil {
 		return "", false, fmt.Errorf("create cache entry: %w", err)
 	}
 	meta, err := s.readMetadata(entry)
@@ -361,7 +362,7 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 			if err := s.detachToTrash(entry); err != nil {
 				return "", false, fmt.Errorf("discard cache before generation transition: %w", err)
 			}
-			if err := s.ensureDirectory(entry, 0o700); err != nil {
+			if err := s.ensureDirectory(entry); err != nil {
 				return "", false, fmt.Errorf("create cache entry after generation transition: %w", err)
 			}
 			meta = Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
@@ -374,7 +375,7 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 
 func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
 	generationPath := filepath.Join(entry, "generations", meta.Generation)
-	if _, statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
+	if statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
 		meta.Generation = uuid.NewV7().String()
 		meta.CreatedAt = time.Now().UTC()
 		meta.ProjectAssigned = false
@@ -404,7 +405,7 @@ func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metad
 
 func (s *Store) createLease(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
 	generationPath := filepath.Join(entry, "generations", meta.Generation)
-	if err := s.ensureDirectory(generationPath, 0o700); err != nil {
+	if err := s.ensureDirectory(generationPath); err != nil {
 		return "", false, fmt.Errorf("create cache generation: %w", err)
 	}
 	if len(meta.Leases) == 0 {
@@ -599,8 +600,8 @@ func (s *Store) projectIDLocked(identity string) (uint32, error) {
 	return 0, errors.New("no XFS project IDs are available")
 }
 
-func ensureDirectory(path string, mode os.FileMode) error {
-	if err := os.MkdirAll(path, mode); err != nil {
+func ensureDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
 		return err
 	}
 	info, err := os.Lstat(path)
@@ -700,14 +701,16 @@ func (s *Store) RecoverLeases(isMounted func(string) (bool, error)) error {
 				active = append(active, lease)
 			}
 		}
-		if len(active) == len(meta.Leases) && !(len(active) == 0 && wasDirty && !meta.Policy.CrashRecoveryReuse) {
+		allLeasesActive := len(active) == len(meta.Leases)
+		discardDirtyGeneration := len(active) == 0 && wasDirty && !meta.Policy.CrashRecoveryReuse
+		if allLeasesActive && !discardDirtyGeneration {
 			continue
 		}
 		if len(active) == 0 && wasDirty && !meta.Policy.CrashRecoveryReuse {
 			if err := s.detachToTrash(path); err != nil {
 				return fmt.Errorf("discard cache object after unclean stop: %w", err)
 			}
-			if err := s.ensureDirectory(path, 0o700); err != nil {
+			if err := s.ensureDirectory(path); err != nil {
 				return fmt.Errorf("create cache object after recovery: %w", err)
 			}
 			meta = Metadata{
@@ -724,7 +727,7 @@ func (s *Store) RecoverLeases(isMounted func(string) (bool, error)) error {
 		}
 		meta.Leases = active
 		generationPath := filepath.Join(path, "generations", meta.Generation)
-		if _, statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
+		if statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
 			meta.Generation = uuid.NewV7().String()
 			meta.CreatedAt = time.Now().UTC()
 			meta.ProjectAssigned = false

@@ -104,7 +104,7 @@ func run(logger *slog.Logger) error {
 		logger.Warn("Pod pressure eviction is unavailable because the in-cluster Kubernetes client could not be created")
 	}
 
-	service := driver.New(store, resolver, quota.XFS{}, driver.Options{
+	service := driver.New(store, resolver, quota.XFS{Binary: "xfs_quota"}, driver.Options{
 		NodeID:        *nodeID,
 		KubeletRoot:   *kubeletRoot,
 		FallbackRoot:  *fallbackRoot,
@@ -203,7 +203,7 @@ func listenUnixSocket(path string) (net.Listener, func(), error) {
 		if existing.Mode()&os.ModeSocket == 0 {
 			return nil, nil, fmt.Errorf("CSI socket path exists and is not a socket")
 		}
-		connection, dialErr := net.DialTimeout("unix", path, time.Second)
+		connection, dialErr := (&net.Dialer{Timeout: time.Second}).DialContext(context.Background(), "unix", path)
 		if dialErr == nil {
 			_ = connection.Close()
 			return nil, nil, fmt.Errorf("CSI socket is already in use")
@@ -223,7 +223,8 @@ func listenUnixSocket(path string) (net.Listener, func(), error) {
 		return nil, nil, fmt.Errorf("inspect CSI socket path: %w", err)
 	}
 
-	listener, err := net.Listen("unix", path)
+	listenConfig := net.ListenConfig{}
+	listener, err := listenConfig.Listen(context.Background(), "unix", path)
 	if err != nil {
 		return nil, nil, err
 	}
