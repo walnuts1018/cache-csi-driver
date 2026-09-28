@@ -8,14 +8,21 @@ import (
 type CacheBackend string
 type CrashRecoveryPolicy string
 
+const (
+	BackendDirectory  CacheBackend = "directory"
+	BackendXFSProject CacheBackend = "xfs-project"
+	CrashRecoveryDiscard CrashRecoveryPolicy = "discard"
+	CrashRecoveryReuse   CrashRecoveryPolicy = "reuse"
+)
+
 type CacheClassSpec struct {
 	Backend       CacheBackend        `json:"backend,omitempty"`
-	MaxBytes      resource.Quantity   `json:"maxBytes,omitempty"`
-	Retention     metav1.Duration     `json:"retention,omitempty"`
+	MaxBytes      resource.Quantity   `json:"maxBytes,omitzero"`
+	Retention     metav1.Duration     `json:"retention,omitzero"`
 	SchemaVersion string              `json:"schemaVersion,omitempty"`
 	CrashRecovery CrashRecoveryPolicy `json:"crashRecovery,omitempty"`
-	Pressure      PressurePolicy      `json:"pressure,omitempty"`
-	Quota         QuotaPolicy         `json:"quota,omitempty"`
+	Pressure      PressurePolicy      `json:"pressure,omitzero"`
+	Quota         QuotaPolicy         `json:"quota,omitzero"`
 	EvictRunning  bool                `json:"evictRunning,omitempty"`
 	NoExec        bool                `json:"noExec,omitempty"`
 }
@@ -29,17 +36,17 @@ type PressurePolicy struct {
 
 type QuotaPolicy struct {
 	Enabled         bool              `json:"enabled,omitempty"`
-	DefaultMaxBytes resource.Quantity `json:"defaultMaxBytes,omitempty"`
+	DefaultMaxBytes resource.Quantity `json:"defaultMaxBytes,omitzero"`
 }
 
 type CacheClass struct {
 	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              CacheClassSpec `json:"spec,omitempty"`
+	metav1.ObjectMeta `json:"metadata,omitzero"`
+	Spec              CacheClassSpec `json:"spec,omitzero"`
 }
 
 type CacheClassList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
+	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []CacheClass `json:"items"`
 }
