@@ -260,6 +260,28 @@ func TestNodeUnpublishRejectsForeignMountBesideDegradedGeneration(t *testing.T) 
 	}
 }
 
+func TestNodeUnpublishRejectsWrongVolumeIDForDegradedMount(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request, identity, _ := prepareDamagedMountedCache(t, server, mounts, store, "damaged-volume")
+	wrongVolumeID := inlineVolumeID(testPodUID, "other-volume")
+
+	_, err := server.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   wrongVolumeID,
+		TargetPath: request.GetTargetPath(),
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("unpublish error = %v, want FailedPrecondition", err)
+	}
+	if mounts.unmountCalls != 0 {
+		t.Fatalf("unmount calls = %d, want 0 for a mismatched volume ID", mounts.unmountCalls)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); err != nil {
+		t.Fatalf("degraded cache object was removed: %v", err)
+	}
+}
+
 func TestNodeUnpublishPreservesLeaseForForeignMount(t *testing.T) {
 	t.Parallel()
 
@@ -305,13 +327,14 @@ func TestNodeUnpublishPreservesLeaseForForeignMount(t *testing.T) {
 func TestNodeGetVolumeHealthReportsUnreadableMetadataAsInaccessible(t *testing.T) {
 	t.Parallel()
 
-	server, _, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 	request := newPublishRequest(t, server.options.KubeletRoot, "unreadable-metadata-volume")
+	request.VolumeId = inlineVolumeID(testPodUID, "unreadable-metadata-volume")
 	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.Acquire(cache.AcquireOptions{
+	source, _, err := store.Acquire(cache.AcquireOptions{
 		Identity: identity,
 		Lease: cache.Lease{
 			ID:        request.GetVolumeId(),
@@ -320,20 +343,25 @@ func TestNodeGetVolumeHealthReportsUnreadableMetadataAsInaccessible(t *testing.T
 			PodName:   testPodName,
 			PodUID:    testPodUID,
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	mounts.mounts[request.GetTargetPath()] = testMount{source: source}
 	if err := os.WriteFile(filepath.Join(store.Root(), identity, ".cache-csi.json"), []byte("{broken"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	response, err := server.NodeGetVolumeHealth(t.Context(), &csi.NodeGetVolumeHealthRequest{VolumeId: request.GetVolumeId()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	statuses := response.GetVolumeHealth().GetHealthStatuses()
-	if len(statuses) != 1 || statuses[0].GetStatus() != csi.VolumeHealthErrorType_INACCESSIBLE || statuses[0].GetReason() != "VolumeMetadataUnreadable" {
-		t.Fatalf("volume health statuses = %+v, want inaccessible unreadable-metadata status", statuses)
+	healthRequest := &csi.NodeGetVolumeHealthRequest{VolumeId: request.GetVolumeId(), VolumePublishPath: request.GetTargetPath()}
+	for poll := range 2 {
+		response, err := server.NodeGetVolumeHealth(t.Context(), healthRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		statuses := response.GetVolumeHealth().GetHealthStatuses()
+		if len(statuses) != 1 || statuses[0].GetStatus() != csi.VolumeHealthErrorType_INACCESSIBLE || statuses[0].GetReason() != "VolumeMetadataUnreadable" {
+			t.Fatalf("poll %d volume health statuses = %+v, want inaccessible unreadable-metadata status", poll+1, statuses)
+		}
 	}
 
 	storageResponse, err := server.NodeGetStorageHealth(t.Context(), &csi.NodeGetStorageHealthRequest{})
@@ -544,6 +572,7 @@ func newPublishRequest(t *testing.T, kubeletRoot, volumeID string) *csi.NodePubl
 func prepareDamagedMountedCache(t *testing.T, server *Server, mounts *testMounter, store *cache.Store, volumeID string) (*csi.NodeUnpublishVolumeRequest, string, string) {
 	t.Helper()
 	request := newPublishRequest(t, server.options.KubeletRoot, volumeID)
+	request.VolumeId = inlineVolumeID(testPodUID, volumeID)
 	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)

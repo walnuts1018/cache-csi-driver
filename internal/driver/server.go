@@ -469,7 +469,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 	if mounted {
-		handled, err := s.unpublishDegradedMount(req.GetTargetPath())
+		handled, err := s.unpublishDegradedMount(req.GetVolumeId(), req.GetTargetPath())
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "unpublish degraded cache: %v", err)
 		}
@@ -508,7 +508,10 @@ func (s *Server) unpublishCacheLease(req *csi.NodeUnpublishVolumeRequest, lease 
 	return nil
 }
 
-func (s *Server) unpublishDegradedMount(target string) (bool, error) {
+func (s *Server) unpublishDegradedMount(volumeID, target string) (bool, error) {
+	if !matchesInlineVolumeIDTarget(volumeID, s.options.KubeletRoot, target) {
+		return false, nil
+	}
 	identity, _, found, err := s.store.FindDegradedGenerationForTarget(target, s.mounter.sameCacheSource)
 	if err != nil {
 		return false, fmt.Errorf("inspect degraded cache mount: %w", err)
@@ -579,6 +582,15 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if found {
 		same, err = s.mounter.sameCacheMount(source, lease.Target, lease.ReadOnly, lease.NoExec)
 	} else {
+		if matchesInlineVolumeIDTarget(req.GetVolumeId(), s.options.KubeletRoot, lease.Target) {
+			_, _, degraded, err := s.store.FindDegradedGenerationForTarget(lease.Target, s.mounter.sameCacheSource)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "inspect degraded cache mount: %v", err)
+			}
+			if degraded {
+				return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
+			}
+		}
 		same, err = s.mounter.sameCacheSource(source, lease.Target)
 	}
 	if err != nil {
@@ -678,6 +690,28 @@ func removeTargetDirectory(path string) error {
 func fallbackPath(root, volumeID string) string {
 	hash := sha256.Sum256([]byte(volumeID))
 	return filepath.Join(root, hex.EncodeToString(hash[:]))
+}
+
+func matchesInlineVolumeIDTarget(volumeID, kubeletRoot, target string) bool {
+	if !filepath.IsAbs(kubeletRoot) || !filepath.IsAbs(target) || filepath.Clean(target) != target {
+		return false
+	}
+	podsRoot := filepath.Join(filepath.Clean(kubeletRoot), "pods")
+	relative, err := filepath.Rel(podsRoot, target)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return false
+	}
+	parts := strings.Split(relative, string(filepath.Separator))
+	if len(parts) != 5 || parts[0] == "" || parts[1] != "volumes" || parts[2] != "kubernetes.io~csi" || parts[3] == "" || parts[4] != "mount" {
+		return false
+	}
+	return volumeID == inlineVolumeID(parts[0], parts[3])
+}
+
+// inlineVolumeIDはKubeletがPod UIDとvolume nameから作るinline CSI volume IDを再現する。
+func inlineVolumeID(podUID, volumeName string) string {
+	hash := sha256.Sum256([]byte(podUID + volumeName))
+	return "csi-" + hex.EncodeToString(hash[:])
 }
 
 func ensureFallbackDirectory(path string) error {
