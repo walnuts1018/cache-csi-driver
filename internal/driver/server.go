@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -452,7 +453,9 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	unlock := s.locks.Lock(req.GetTargetPath())
 	defer unlock()
 	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
-	if err != nil {
+	if errors.Is(err, cache.ErrDegradedMetadata) {
+		found = false
+	} else if err != nil {
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
 	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
@@ -460,47 +463,91 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 		return nil, status.Errorf(codes.Internal, "inspect target mount: %v", err)
 	}
 	if found {
-		if lease.Target != req.GetTargetPath() {
-			return nil, status.Error(codes.FailedPrecondition, "volume lease target does not match")
-		}
-		if mounted {
-			same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), lease.ReadOnly, lease.NoExec)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "verify cache mount: %v", err)
-			}
-			if !same {
-				return nil, status.Error(codes.FailedPrecondition, "target mount does not belong to this cache volume")
-			}
-			if err := s.mounter.unmount(req.GetTargetPath()); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
-				return nil, status.Errorf(codes.Internal, "unmount cache: %v", err)
-			}
-		}
-		if err := removeTargetDirectory(req.GetTargetPath()); err != nil {
-			return nil, status.Errorf(codes.Internal, "remove cache mount target: %v", err)
-		}
-		if err := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); err != nil {
-			return nil, status.Errorf(codes.Internal, "release cache lease: %v", err)
+		if err := s.unpublishCacheLease(req, lease, source, mounted); err != nil {
+			return nil, err
 		}
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
-	fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
 	if mounted {
-		if same, err := s.mounter.sameCacheSource(fallback, req.GetTargetPath()); err != nil {
-			return nil, status.Errorf(codes.Internal, "verify fallback mount: %v", err)
-		} else if !same {
-			return nil, status.Error(codes.FailedPrecondition, "target mount has no matching cache lease")
+		handled, err := s.unpublishDegradedMount(req.GetTargetPath())
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "unpublish degraded cache: %v", err)
+		}
+		if handled {
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
+	}
+	if err := s.unpublishFallback(req, mounted); err != nil {
+		return nil, err
+	}
+	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+func (s *Server) unpublishCacheLease(req *csi.NodeUnpublishVolumeRequest, lease cache.Lease, source string, mounted bool) error {
+	if lease.Target != req.GetTargetPath() {
+		return status.Error(codes.FailedPrecondition, "volume lease target does not match")
+	}
+	if mounted {
+		same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), lease.ReadOnly, lease.NoExec)
+		if err != nil {
+			return status.Errorf(codes.Internal, "verify cache mount: %v", err)
+		}
+		if !same {
+			return status.Error(codes.FailedPrecondition, "target mount does not belong to this cache volume")
 		}
 		if err := s.mounter.unmount(req.GetTargetPath()); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
-			return nil, status.Errorf(codes.Internal, "unmount fallback cache: %v", err)
+			return status.Errorf(codes.Internal, "unmount cache: %v", err)
 		}
 	}
 	if err := removeTargetDirectory(req.GetTargetPath()); err != nil {
-		return nil, status.Errorf(codes.Internal, "remove fallback target: %v", err)
+		return status.Errorf(codes.Internal, "remove cache mount target: %v", err)
+	}
+	if err := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); err != nil {
+		return status.Errorf(codes.Internal, "release cache lease: %v", err)
+	}
+	return nil
+}
+
+func (s *Server) unpublishDegradedMount(target string) (bool, error) {
+	identity, _, found, err := s.store.FindDegradedGenerationForTarget(target, s.mounter.sameCacheSource)
+	if err != nil {
+		return false, fmt.Errorf("inspect degraded cache mount: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+	if err := s.mounter.unmount(target); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("unmount degraded cache: %w", err)
+	}
+	if err := removeTargetDirectory(target); err != nil {
+		return false, fmt.Errorf("remove degraded cache mount target: %w", err)
+	}
+	// CSIのunpublishはunmountで完了しているため、cacheの隔離失敗でkubeletへ不要な再試行を要求しない。
+	_ = s.store.CleanupDegradedObject(identity, s.mounter.sourceMounted)
+	return true, nil
+}
+
+func (s *Server) unpublishFallback(req *csi.NodeUnpublishVolumeRequest, mounted bool) error {
+	fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
+	if mounted {
+		same, err := s.mounter.sameCacheSource(fallback, req.GetTargetPath())
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return status.Errorf(codes.Internal, "verify fallback mount: %v", err)
+		}
+		if !same {
+			return status.Error(codes.FailedPrecondition, "target mount has no matching cache lease")
+		}
+		if err := s.mounter.unmount(req.GetTargetPath()); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
+			return status.Errorf(codes.Internal, "unmount fallback cache: %v", err)
+		}
+	}
+	if err := removeTargetDirectory(req.GetTargetPath()); err != nil {
+		return status.Errorf(codes.Internal, "remove fallback target: %v", err)
 	}
 	if err := os.RemoveAll(fallback); err != nil {
-		return nil, status.Errorf(codes.Internal, "remove fallback cache: %v", err)
+		return status.Errorf(codes.Internal, "remove fallback cache: %v", err)
 	}
-	return &csi.NodeUnpublishVolumeResponse{}, nil
+	return nil
 }
 
 func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHealthRequest) (*csi.NodeGetVolumeHealthResponse, error) {

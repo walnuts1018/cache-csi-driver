@@ -186,6 +186,80 @@ func TestNodeUnpublishUnmountsAndReleasesCacheLease(t *testing.T) {
 	}
 }
 
+func TestResolverUnavailablePublishesRestrictedFallbackAndUnpublishes(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	server.resolver = nil
+	request := newPublishRequest(t, server.options.KubeletRoot, "api-unavailable-volume")
+	request.Readonly = true
+
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	state, mounted := mounts.mounts[request.GetTargetPath()]
+	if !mounted || !state.readOnly || !state.noExec {
+		t.Fatalf("published mount = %+v, present=%t; want readonly and noexec", state, mounted)
+	}
+
+	if _, err := server.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   request.GetVolumeId(),
+		TargetPath: request.GetTargetPath(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, mounted := mounts.mounts[request.GetTargetPath()]; mounted {
+		t.Fatal("mount remains after cleanup")
+	}
+}
+
+func TestNodeUnpublishCleansMountedDegradedGeneration(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request, identity, source := prepareDamagedMountedCache(t, server, mounts, store, "damaged-volume")
+
+	if _, err := server.NodeUnpublishVolume(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if mounts.unmountCalls != 1 {
+		t.Fatalf("unmount calls = %d, want one verified cache unmount", mounts.unmountCalls)
+	}
+	if _, mounted := mounts.mounts[request.GetTargetPath()]; mounted {
+		t.Fatal("degraded mount remains after unpublish")
+	}
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("degraded cache object remains after its last mount was removed: %v", err)
+	}
+	if _, err := os.Stat(source); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("degraded generation remains after cleanup: %v", err)
+	}
+}
+
+func TestNodeUnpublishRejectsForeignMountBesideDegradedGeneration(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request, identity, source := prepareDamagedMountedCache(t, server, mounts, store, "foreign-damaged-volume")
+	otherTarget := filepath.Join(server.options.KubeletRoot, "pods", "other-pod", "volumes", "kubernetes.io~csi", "other-volume", "mount")
+	if err := os.MkdirAll(otherTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mounts.mounts[request.GetTargetPath()] = testMount{source: filepath.Join(t.TempDir(), "foreign")}
+	mounts.mounts[otherTarget] = testMount{source: source}
+
+	_, err := server.NodeUnpublishVolume(t.Context(), request)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("unpublish error = %v, want FailedPrecondition", err)
+	}
+	if mounts.unmountCalls != 0 {
+		t.Fatalf("unmount calls = %d, want 0 for a foreign mount", mounts.unmountCalls)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); err != nil {
+		t.Fatalf("active degraded cache object was removed: %v", err)
+	}
+}
+
 func TestNodeUnpublishPreservesLeaseForForeignMount(t *testing.T) {
 	t.Parallel()
 
@@ -360,16 +434,17 @@ type mountVerification struct {
 }
 
 type testMounter struct {
-	mounts              map[string]testMount
-	bindCalls           int
-	unmountCalls        int
-	remountErr          error
-	unmountErr          error
-	lastVerification    mountVerification
-	sourceMountedCalls  int
-	sourceMountedResult bool
-	sourceMountedErr    error
-	lastSource          string
+	mounts                   map[string]testMount
+	bindCalls                int
+	unmountCalls             int
+	remountErr               error
+	unmountErr               error
+	lastVerification         mountVerification
+	sourceMountedCalls       int
+	sourceMountedResult      bool
+	sourceMountedErr         error
+	lastSource               string
+	sourceMountedFromTargets bool
 }
 
 func newTestServer(t *testing.T, spec cachev1alpha1.CacheClassSpec, quotaError error) (*Server, *testMounter, *cache.Store) {
@@ -420,6 +495,40 @@ func newPublishRequest(t *testing.T, kubeletRoot, volumeID string) *csi.NodePubl
 			"cacheKey":                         "cache-key",
 		},
 	}
+}
+
+func prepareDamagedMountedCache(t *testing.T, server *Server, mounts *testMounter, store *cache.Store, volumeID string) (*csi.NodeUnpublishVolumeRequest, string, string) {
+	t.Helper()
+	request := newPublishRequest(t, server.options.KubeletRoot, volumeID)
+	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, _, err := store.Acquire(cache.AcquireOptions{
+		Identity: identity,
+		Lease: cache.Lease{
+			ID:        request.GetVolumeId(),
+			Target:    request.GetTargetPath(),
+			Namespace: testDefault,
+			PodName:   testPodName,
+			PodUID:    testPodUID,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.Root(), identity, ".cache-csi.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(request.GetTargetPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mounts.sourceMountedFromTargets = true
+	mounts.mounts[request.GetTargetPath()] = testMount{source: source}
+	if err := recoverCacheLeases(store, mounts); err != nil {
+		t.Fatal(err)
+	}
+	return &csi.NodeUnpublishVolumeRequest{VolumeId: request.GetVolumeId(), TargetPath: request.GetTargetPath()}, identity, source
 }
 
 func (mounts *testMounter) bindMount(source, target string) error {
@@ -473,7 +582,18 @@ func (mounts *testMounter) sameCacheSource(source, target string) (bool, error) 
 func (mounts *testMounter) sourceMounted(source string) (bool, error) {
 	mounts.sourceMountedCalls++
 	mounts.lastSource = source
-	return mounts.sourceMountedResult, mounts.sourceMountedErr
+	if mounts.sourceMountedErr != nil {
+		return false, mounts.sourceMountedErr
+	}
+	if mounts.sourceMountedFromTargets {
+		for _, mount := range mounts.mounts {
+			if mount.source == source {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return mounts.sourceMountedResult, nil
 }
 
 func (*testMounter) filesystemReadOnly(string) (bool, error) { return false, nil }
