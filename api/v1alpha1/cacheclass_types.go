@@ -9,8 +9,8 @@ type CacheBackend string
 type CrashRecoveryPolicy string
 
 const (
-	BackendDirectory  CacheBackend = "directory"
-	BackendXFSProject CacheBackend = "xfs-project"
+	BackendDirectory     CacheBackend        = "directory"
+	BackendXFSProject    CacheBackend        = "xfs-project"
 	CrashRecoveryDiscard CrashRecoveryPolicy = "discard"
 	CrashRecoveryReuse   CrashRecoveryPolicy = "reuse"
 )
