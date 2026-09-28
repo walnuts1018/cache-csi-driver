@@ -106,8 +106,12 @@ func (m *Manager) pressure(ctx context.Context) {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
-		m.logger.ErrorContext(ctx, "cache pressure reclaim failed", "error", err)
-		return
+		if errors.Is(err, cache.ErrPressureReclaimIncomplete) {
+			m.logger.WarnContext(ctx, "cache pressure reclaim was incomplete", "error", err)
+		} else {
+			m.logger.ErrorContext(ctx, "cache pressure reclaim failed", "error", err)
+			return
+		}
 	}
 	if m.client == nil {
 		return
