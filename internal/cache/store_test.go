@@ -257,6 +257,13 @@ func TestMetadataReadFailuresStopCollectionEvictionAndQuotaAllocation(t *testing
 			t.Error(err)
 		}
 	})
+	identity := stableIdentity("healthy-cache")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "healthy", Target: filepath.Join(t.TempDir(), "healthy")},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	brokenIdentity := stableIdentity("broken-metadata")
 	brokenEntry := filepath.Join(store.Root(), brokenIdentity)
@@ -272,17 +279,10 @@ func TestMetadataReadFailuresStopCollectionEvictionAndQuotaAllocation(t *testing
 	if _, err := store.PressureVictims(); err == nil {
 		t.Fatal("pressure eviction ignored unreadable cache metadata")
 	}
-	if _, _, _, err := store.LeaseDetails("unknown"); err == nil {
+	if _, _, _, _, _, err := store.LeaseDetails("unknown"); err == nil {
 		t.Fatal("lease lookup ignored unreadable cache metadata")
 	}
 
-	identity := stableIdentity("healthy-cache")
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "healthy", Target: filepath.Join(t.TempDir(), "healthy")},
-	}); err != nil {
-		t.Fatal(err)
-	}
 	if _, _, _, err := store.QuotaState(identity, 1024); err == nil {
 		t.Fatal("project ID allocation ignored unreadable cache metadata")
 	}
