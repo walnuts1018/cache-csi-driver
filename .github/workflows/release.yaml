@@ -113,6 +113,7 @@ jobs:
           mise run build
           mise run test
           go vet ./...
+          mise run lint:go
           mise run lint:chart
           cmp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml
 

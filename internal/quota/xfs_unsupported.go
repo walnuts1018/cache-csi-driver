@@ -9,6 +9,10 @@ import (
 
 type XFS struct{ Binary string }
 
+func (XFS) Configure(context.Context, string, string, uint32, int64) error {
+	return errors.New("XFS project quota requires Linux")
+}
+
 func (XFS) AssignProject(context.Context, string, string, uint32) error {
 	return errors.New("XFS project quota requires Linux")
 }

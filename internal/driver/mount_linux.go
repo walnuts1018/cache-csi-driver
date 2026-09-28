@@ -3,10 +3,11 @@
 package driver
 
 import (
-	"bufio"
 	"os"
+	"slices"
 	"strings"
 
+	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sys/unix"
 )
 
@@ -76,29 +77,20 @@ type mountInfo struct {
 }
 
 func readMountInfo(target string) (mountInfo, bool, error) {
-	file, err := os.Open("/proc/self/mountinfo")
+	mounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(target))
 	if err != nil {
 		return mountInfo{}, false, err
 	}
-	defer func() { _ = file.Close() }()
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 10 || unescapeMountPath(fields[4]) != target {
-			continue
-		}
-		options := strings.Split(fields[5], ",")
-		return mountInfo{
-			readOnly: containsString(options, "ro"),
-			noExec:   containsString(options, "noexec"),
-			nodev:    containsString(options, "nodev"),
-			nosuid:   containsString(options, "nosuid"),
-		}, true, nil
+	if len(mounts) == 0 {
+		return mountInfo{}, false, nil
 	}
-	if err := scanner.Err(); err != nil {
-		return mountInfo{}, false, err
-	}
-	return mountInfo{}, false, nil
+	options := strings.Split(mounts[0].Options, ",")
+	return mountInfo{
+		readOnly: slices.Contains(options, "ro"),
+		noExec:   slices.Contains(options, "noexec"),
+		nodev:    slices.Contains(options, "nodev"),
+		nosuid:   slices.Contains(options, "nosuid"),
+	}, true, nil
 }
 
 func filesystemReadOnly(path string) (bool, error) {
@@ -107,20 +99,4 @@ func filesystemReadOnly(path string) (bool, error) {
 		return false, err
 	}
 	return stat.Flags&unix.ST_RDONLY != 0, nil
-}
-
-func unescapeMountPath(path string) string {
-	for _, item := range [][2]string{{"\\040", " "}, {"\\011", "\t"}, {"\\012", "\n"}, {"\\134", "\\"}} {
-		path = strings.ReplaceAll(path, item[0], item[1])
-	}
-	return path
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }

@@ -21,4 +21,3 @@ func sameCacheSource(string, string) (bool, error) {
 func filesystemReadOnly(string) (bool, error) {
 	return false, errors.New("filesystem inspection requires Linux")
 }
-func unescapeMountPath(path string) string { return path }

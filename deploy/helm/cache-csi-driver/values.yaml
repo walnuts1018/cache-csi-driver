@@ -17,6 +17,9 @@ pressure:
   lowFreePercent: 20
   highInodeFreePercent: 15
   lowInodeFreePercent: 10
+projectIDRange:
+  start: 2000000000
+  count: 1000000
 
 csiDriver:
   preventPodSchedulingIfMissing: true

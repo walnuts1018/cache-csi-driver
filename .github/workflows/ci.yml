@@ -39,6 +39,9 @@ jobs:
       - name: Run Go vet
         run: go vet ./...
 
+      - name: Lint Go code
+        run: mise run lint:go
+
       - name: Validate Helm chart
         run: mise run lint:chart
 

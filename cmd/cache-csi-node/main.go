@@ -49,10 +49,15 @@ func run(logger *slog.Logger) error {
 	lowFreePercent := flag.Int("pressure-low-free-percent", 20, "free-byte percentage at which cache pressure collection starts")
 	highInodeFreePercent := flag.Int("pressure-high-inode-free-percent", 15, "free-inode percentage at which cache pressure collection stops")
 	lowInodeFreePercent := flag.Int("pressure-low-inode-free-percent", 10, "free-inode percentage at which cache pressure collection starts")
+	projectIDStart := flag.Uint("project-id-start", 2_000_000_000, "first project ID reserved for cache identities")
+	projectIDCount := flag.Uint("project-id-count", 1_000_000, "number of project IDs reserved for cache identities")
 	flag.Parse()
 
 	if *gcInterval <= 0 {
 		return fmt.Errorf("gc interval must be greater than zero")
+	}
+	if uint64(*projectIDStart) > uint64(^uint32(0)) || uint64(*projectIDCount) > uint64(^uint32(0)) {
+		return fmt.Errorf("project ID range values must fit within uint32")
 	}
 	if *nodeID == "" {
 		return fmt.Errorf("node ID must be configured")
@@ -71,15 +76,20 @@ func run(logger *slog.Logger) error {
 		}
 	}
 
-	store, err := cache.NewStore(*cacheRoot, cache.PressureConfig{
-		HighFreePercent:      *highFreePercent,
-		LowFreePercent:       *lowFreePercent,
-		HighInodeFreePercent: *highInodeFreePercent,
-		LowInodeFreePercent:  *lowInodeFreePercent,
+	store, err := cache.NewStore(*cacheRoot, cache.StoreOptions{
+		Pressure: cache.PressureConfig{
+			HighFreePercent:      *highFreePercent,
+			LowFreePercent:       *lowFreePercent,
+			HighInodeFreePercent: *highInodeFreePercent,
+			LowInodeFreePercent:  *lowInodeFreePercent,
+		},
+		ProjectIDStart: uint32(*projectIDStart),
+		ProjectIDCount: uint32(*projectIDCount),
 	})
 	if err != nil {
 		return fmt.Errorf("initialize cache store: %w", err)
 	}
+	defer func() { _ = store.Close() }()
 	client, resolver := kubernetesClients(logger)
 	cacheManager := manager.New(store, manager.Options{
 		Interval:     *gcInterval,
@@ -95,9 +105,9 @@ func run(logger *slog.Logger) error {
 	}
 
 	service := driver.New(store, resolver, quota.XFS{}, driver.Options{
-		NodeID:       *nodeID,
-		KubeletRoot:  *kubeletRoot,
-		FallbackRoot: *fallbackRoot,
+		NodeID:        *nodeID,
+		KubeletRoot:   *kubeletRoot,
+		FallbackRoot:  *fallbackRoot,
 		VendorVersion: version,
 	})
 	grpcServer := grpc.NewServer()

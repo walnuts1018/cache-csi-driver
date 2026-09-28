@@ -44,6 +44,8 @@ spec:
             - --pressure-low-free-percent={{ .Values.pressure.lowFreePercent }}
             - --pressure-high-inode-free-percent={{ .Values.pressure.highInodeFreePercent }}
             - --pressure-low-inode-free-percent={{ .Values.pressure.lowInodeFreePercent }}
+            - --project-id-start={{ .Values.projectIDRange.start }}
+            - --project-id-count={{ .Values.projectIDRange.count }}
             {{- with .Values.driver.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

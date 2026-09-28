@@ -17,7 +17,7 @@ helm install cache-csi-driver \
 
 このchartは`CacheClass` CRD、`CSIDriver`、read-onlyのClusterRole、ServiceAccount、Node DaemonSetをインストールします。Node pluginはmount system callを使うためprivileged containerとして動作します。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
-Kubernetes APIからPod namespaceやCacheClassを解決できない場合、または通常cacheのmountに失敗した場合は、volume固有で共有されないfallback directoryを使います。fallbackデータはNode上の`/run/cache-csi/fallback`に配置します。標準的なLinuxでは`/run`はtmpfsですが、すべてのNode構成で保証されるわけではありません。fallbackデータをメモリ上に保つ場合は、`fallbackRootDir`をNode上のtmpfs内のパスに設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
+Kubernetes API resolverが一時的な障害になり、volume attributeに`maxBytes`がない場合は、volume固有で共有されないfallback directoryを使います。`maxBytes`を指定した要求や、通常cacheのmount・quota設定に失敗した要求ではfallbackに切り替えません。fallbackは`noexec`でmountします。データはNode上の`/run/cache-csi/fallback`に配置します。標準的なLinuxでは`/run`はtmpfsですが、すべてのNode構成で保証されるわけではありません。fallbackデータをメモリ上に保つ場合は、`fallbackRootDir`をNode上のtmpfs内のパスに設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
 `preventPodSchedulingIfMissing`を有効にしているため、CSI pluginが登録されていないNodeへのPod配置を防ぎます。Cluster Autoscalerを使う場合は、CSI node-aware schedulingを有効にしてください。
 
@@ -75,6 +75,8 @@ spec:
 | `pressure.lowFreePercent` | `20` | cache filesystemの空き容量GC開始水位 |
 | `pressure.highInodeFreePercent` | `15` | cache filesystemの空きinode GC終了水位 |
 | `pressure.lowInodeFreePercent` | `10` | cache filesystemの空きinode GC開始水位 |
+| `projectIDRange.start` | `2000000000` | XFS project quota用に予約するproject ID範囲の開始値 |
+| `projectIDRange.count` | `1000000` | XFS project quota用に予約するproject IDの個数 |
 | `csiDriver.preventPodSchedulingIfMissing` | `true` | CSI pluginが未登録のNodeへの配置を防止 |
 | `rbac.createPodEvictions` | `true` | `evictRunning`用のPod Eviction権限 |
 | `nodeSelector` | `kubernetes.io/os: linux` | DaemonSetを配置するNode |
@@ -85,7 +87,7 @@ spec:
 
 `evictRunning`を有効にしたCacheClassでは、未使用cacheを回収した後もglobal pressureが続く場合、そのcacheを利用中のPodへKubernetes Eviction APIでbest-effortの退去要求を出します。PodDisruptionBudgetにより拒否される場合やPodが退去しない場合があり、cacheの回収は保証されません。driverはPodを強制削除しません。Node pluginのClusterRoleは全namespaceの`pods/eviction`作成だけを追加し、Podの直接削除権限は持ちません。active Pod evictionを使わない場合は`rbac.createPodEvictions=false`にできます。
 
-`quota.enabled`を使うCacheClassでは`backend: xfs-project`を指定し、`cacheRootDir`がproject quota有効のXFS filesystem上にあることを確認してください。Node imageには`xfs_quota`を含めていますが、host filesystemのmount optionやquota設定は管理者が行います。
+`quota.enabled`を使うCacheClassでは`backend: xfs-project`を指定し、`cacheRootDir`がproject quota有効のXFS filesystem上にあることを確認してください。Node imageには`xfs_quota`を含めていますが、host filesystemのmount optionやquota設定は管理者が行います。`projectIDRange`はこのNode plugin専用に予約した範囲へ変更し、同じfilesystem上の他用途のproject IDと重複しないようにしてください。
 
 ## 開発とリリース
 

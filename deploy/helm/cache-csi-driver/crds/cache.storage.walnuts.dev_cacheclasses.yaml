@@ -49,10 +49,6 @@ spec:
                   message: quota requires maxBytes or quota.defaultMaxBytes
                 - rule: "!has(self.maxBytes) || quantity(string(self.maxBytes)).sign() <= 0 || !has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))"
                   message: quota.defaultMaxBytes must not exceed maxBytes
-                - rule: "!has(self.pressure) || ((!has(self.pressure.highFreePercent) && !has(self.pressure.lowFreePercent)) || (has(self.pressure.highFreePercent) && has(self.pressure.lowFreePercent) && ((self.pressure.highFreePercent == 0 && self.pressure.lowFreePercent == 0) || self.pressure.highFreePercent > self.pressure.lowFreePercent)))"
-                  message: highFreePercent and lowFreePercent must be configured together, with the high value greater than the low value
-                - rule: "!has(self.pressure) || ((!has(self.pressure.highInodeFreePercent) && !has(self.pressure.lowInodeFreePercent)) || (has(self.pressure.highInodeFreePercent) && has(self.pressure.lowInodeFreePercent) && ((self.pressure.highInodeFreePercent == 0 && self.pressure.lowInodeFreePercent == 0) || self.pressure.highInodeFreePercent > self.pressure.lowInodeFreePercent)))"
-                  message: highInodeFreePercent and lowInodeFreePercent must be configured together, with the high value greater than the low value
               properties:
                 backend:
                   type: string
@@ -81,37 +77,10 @@ spec:
                   description: Policy for generations left active after an unclean node shutdown.
                 evictRunning:
                   type: boolean
-                  description: Allows pressure garbage collection to request graceful eviction of Pods using active cache generations. Eviction requests respect PodDisruptionBudgets.
+                  description: Allows best-effort pressure handling to request graceful eviction of Pods using active cache generations. Eviction requests respect PodDisruptionBudgets and do not guarantee cache reclamation.
                 noExec:
                   type: boolean
                   description: Mounts cache generations with execution disabled.
-                pressure:
-                  type: object
-                  properties:
-                    highFreePercent:
-                      type: integer
-                      format: int32
-                      minimum: 0
-                      maximum: 100
-                      description: Free-byte percentage at which pressure garbage collection begins.
-                    lowFreePercent:
-                      type: integer
-                      format: int32
-                      minimum: 0
-                      maximum: 100
-                      description: Free-byte percentage at which pressure garbage collection stops.
-                    highInodeFreePercent:
-                      type: integer
-                      format: int32
-                      minimum: 0
-                      maximum: 100
-                      description: Free-inode percentage at which pressure garbage collection begins.
-                    lowInodeFreePercent:
-                      type: integer
-                      format: int32
-                      minimum: 0
-                      maximum: 100
-                      description: Free-inode percentage at which pressure garbage collection stops.
                 quota:
                   type: object
                   properties:
@@ -125,47 +94,3 @@ spec:
                         - type: string
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([eEinumkKMGTP]+)|(([KMGTPE]i)))?$
                       description: Per-cache hard limit used when the CSI volume context omits maxBytes. If maxBytes is set, this default must not exceed the class ceiling.
-            status:
-              type: object
-              properties:
-                observedGeneration:
-                  type: integer
-                  format: int64
-                  description: Generation of the CacheClass most recently observed by the driver.
-                conditions:
-                  type: array
-                  x-kubernetes-list-type: map
-                  x-kubernetes-list-map-keys:
-                    - type
-                  items:
-                    type: object
-                    required:
-                      - type
-                      - status
-                      - lastTransitionTime
-                      - reason
-                      - message
-                    properties:
-                      type:
-                        type: string
-                      status:
-                        type: string
-                        enum:
-                          - "True"
-                          - "False"
-                          - Unknown
-                      observedGeneration:
-                        type: integer
-                        format: int64
-                      lastTransitionTime:
-                        type: string
-                        format: date-time
-                      reason:
-                        type: string
-                        minLength: 1
-                        maxLength: 1024
-                      message:
-                        type: string
-                        maxLength: 32768
-      subresources:
-        status: {}

@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"syscall"
 
 	cachev1alpha1 "github.com/walnuts1018/cache-csi-driver/api/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -20,7 +21,7 @@ import (
 
 var cacheClassGVR = schema.GroupVersionResource{Group: cachev1alpha1.GroupVersion.Group, Version: cachev1alpha1.GroupVersion.Version, Resource: "cacheclasses"}
 
-var ErrAPIResolverUnavailable = errors.New("Kubernetes API resolver is unavailable")
+var ErrAPIResolverUnavailable = errors.New("the Kubernetes API resolver is unavailable")
 
 func IsTemporaryAPIError(err error) bool {
 	if err == nil {
@@ -33,8 +34,10 @@ func IsTemporaryAPIError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	var networkError net.Error
-	return errors.As(err, &networkError)
+	if networkError, ok := errors.AsType[net.Error](err); ok && networkError.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH)
 }
 
 type Resolver struct {

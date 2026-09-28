@@ -81,6 +81,10 @@ func (m *Manager) collect(ctx context.Context, now time.Time) {
 		m.logger.ErrorContext(ctx, "cache collection failed", "error", err)
 		return
 	}
+	if err := m.store.CleanupTrash(); err != nil {
+		m.logger.ErrorContext(ctx, "cache trash cleanup failed", "error", err)
+		return
+	}
 	if m.client == nil {
 		return
 	}

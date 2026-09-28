@@ -28,8 +28,7 @@ type ClassResolver interface {
 }
 
 type ProjectQuota interface {
-	AssignProject(context.Context, string, string, uint32) error
-	SetLimit(context.Context, string, uint32, int64) error
+	Configure(context.Context, string, string, uint32, int64) error
 }
 
 type Options struct {
@@ -42,11 +41,21 @@ type Options struct {
 type Server struct {
 	csi.UnimplementedIdentityServer
 	csi.UnimplementedNodeServer
-	store    *cache.Store
-	resolver ClassResolver
-	quota    ProjectQuota
-	options  Options
-	locks    operationLocks
+	store         *cache.Store
+	resolver      ClassResolver
+	quota         ProjectQuota
+	options       Options
+	locks         operationLocks
+	identityLocks operationLocks
+}
+
+type podVolumeContext struct {
+	namespace  string
+	name       string
+	uid        string
+	cacheClass string
+	cacheKey   string
+	maxBytes   string
 }
 
 func New(store *cache.Store, resolver ClassResolver, quotaManager ProjectQuota, options Options) *Server {
@@ -77,8 +86,6 @@ func (s *Server) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.Nod
 
 func (*Server) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	types := []csi.NodeServiceCapability_RPC_Type{
-		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
-		csi.NodeServiceCapability_RPC_GET_VOLUME_HEALTH,
 		csi.NodeServiceCapability_RPC_GET_STORAGE_HEALTH,
 	}
 	capabilities := make([]*csi.NodeServiceCapability, 0, len(types))
@@ -89,120 +96,187 @@ func (*Server) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequ
 }
 
 func (s *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	if req.GetVolumeId() == "" || req.GetVolumeCapability() == nil || !filepath.IsAbs(req.GetTargetPath()) {
-		return nil, status.Error(codes.InvalidArgument, "volume ID, volume capability, and absolute target path are required")
-	}
-	if req.GetVolumeCapability().GetMount() == nil {
-		return nil, status.Error(codes.InvalidArgument, "only mount volumes are supported")
-	}
-	if !isSingleNodeAccessMode(req.GetVolumeCapability().GetAccessMode()) {
-		return nil, status.Error(codes.InvalidArgument, "a single-node access mode is required")
-	}
-	if err := s.validateTarget(req.GetTargetPath()); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	volumeContext, err := s.validatePublishRequest(req)
+	if err != nil {
+		return nil, err
 	}
 	unlock := s.locks.Lock(req.GetTargetPath())
 	defer unlock()
 
-	mounted, err := mountedAt(req.GetTargetPath())
+	handled, err := s.handleExistingPublish(req)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "inspect target mount: %v", err)
+		return nil, err
 	}
-	if mounted {
-		if _, lease, source, policy, found, err := s.store.LeaseDetails(req.GetVolumeId()); err != nil {
-			return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
-		} else if found {
-			if lease.Target != req.GetTargetPath() {
-				return nil, status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
-			}
-			if same, err := sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), policy.NoExec); err != nil {
-				return nil, status.Errorf(codes.Internal, "verify existing cache mount: %v", err)
-			} else if same {
-				return &csi.NodePublishVolumeResponse{}, nil
-			}
-			return nil, status.Error(codes.AlreadyExists, "target is mounted from a different source or with different options")
-		}
-		fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
-		if same, err := sameCacheMount(fallback, req.GetTargetPath(), req.GetReadonly(), true); err != nil {
-			return nil, status.Errorf(codes.Internal, "verify fallback mount: %v", err)
-		} else if same {
-			return &csi.NodePublishVolumeResponse{}, nil
-		}
-		return nil, status.Error(codes.AlreadyExists, "target is already mounted by another volume")
-	}
-
-	attributes := req.GetVolumeContext()
-	podNamespace := attributes["csi.storage.k8s.io/pod.namespace"]
-	podName := attributes["csi.storage.k8s.io/pod.name"]
-	podUID := attributes["csi.storage.k8s.io/pod.uid"]
-	cacheClassName := attributes["cacheClass"]
-	cacheKey := attributes["cacheKey"]
-	if podNamespace == "" || podName == "" || podUID == "" || cacheClassName == "" || cacheKey == "" {
-		return nil, status.Error(codes.InvalidArgument, "pod information, cacheClass, and cacheKey are required")
-	}
-	if attributes["csi.storage.k8s.io/ephemeral"] != "true" {
-		return nil, status.Error(codes.InvalidArgument, "only inline ephemeral CSI volumes are supported")
-	}
-	if len(cacheKey) > 1024 || strings.ContainsRune(cacheKey, '\x00') {
-		return nil, status.Error(codes.InvalidArgument, "cacheKey is invalid or exceeds 1024 bytes")
-	}
-
-	identity, policy, resolveErr := s.resolve(ctx, attributes, cacheClassName)
-	if resolveErr != nil {
-		if !errors.Is(resolveErr, kube.ErrAPIResolverUnavailable) && !kube.IsTemporaryAPIError(resolveErr) {
-			return nil, status.Errorf(codes.FailedPrecondition, "resolve CacheClass %q: %v", cacheClassName, resolveErr)
-		}
-		oldIdentity, oldLease, source, oldPolicy, found, err := s.store.LeaseDetails(req.GetVolumeId())
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
-		}
-		if found {
-			if oldLease.Target != req.GetTargetPath() {
-				return nil, status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
-			}
-			if err := s.publishCache(ctx, req, oldIdentity, source, oldPolicy); err != nil {
-				return nil, err
-			}
-			return &csi.NodePublishVolumeResponse{}, nil
-		}
-		if err := s.publishFallback(req); err != nil {
-			return nil, err
-		}
+	if handled {
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
-	if oldIdentity, oldLease, _, _, found, err := s.store.LeaseDetails(req.GetVolumeId()); err != nil {
-		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
-	} else if found {
-		if oldLease.Target != req.GetTargetPath() {
-			return nil, status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
-		}
-		if oldIdentity != identity {
-			if err := s.store.Release(req.GetVolumeId(), oldLease.Target); err != nil {
-				return nil, status.Errorf(codes.Internal, "release cache lease after CacheClass change: %v", err)
-			}
-		}
-	}
-	lease := cache.Lease{ID: req.GetVolumeId(), Target: req.GetTargetPath(), Namespace: podNamespace, PodName: podName, PodUID: podUID, ReadOnly: req.GetReadonly(), NoExec: policy.NoExec}
-	if err := s.publishNewCache(ctx, req, identity, lease, policy); err != nil {
-		_ = s.store.Release(req.GetVolumeId(), req.GetTargetPath())
+	if err := s.publish(ctx, req, volumeContext); err != nil {
 		return nil, err
 	}
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (s *Server) resolve(ctx context.Context, attributes map[string]string, className string) (string, cache.Policy, error) {
+func (s *Server) validatePublishRequest(req *csi.NodePublishVolumeRequest) (podVolumeContext, error) {
+	if req.GetVolumeId() == "" || req.GetVolumeCapability() == nil || !filepath.IsAbs(req.GetTargetPath()) {
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, "volume ID, volume capability, and absolute target path are required")
+	}
+	if req.GetVolumeCapability().GetMount() == nil {
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, "only mount volumes are supported")
+	}
+	if !isSingleNodeAccessMode(req.GetVolumeCapability().GetAccessMode()) {
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, "a single-node access mode is required")
+	}
+	if err := s.validateTarget(req.GetTargetPath()); err != nil {
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, err.Error())
+	}
+	attributes := req.GetVolumeContext()
+	volumeContext := podVolumeContext{
+		namespace:  attributes["csi.storage.k8s.io/pod.namespace"],
+		name:       attributes["csi.storage.k8s.io/pod.name"],
+		uid:        attributes["csi.storage.k8s.io/pod.uid"],
+		cacheClass: attributes["cacheClass"],
+		cacheKey:   attributes["cacheKey"],
+		maxBytes:   attributes["maxBytes"],
+	}
+	if attributes["csi.storage.k8s.io/ephemeral"] != "true" {
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, "only inline ephemeral CSI volumes are supported")
+	}
+	if volumeContext.namespace == "" || volumeContext.name == "" || volumeContext.uid == "" || volumeContext.cacheClass == "" || volumeContext.cacheKey == "" {
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, "pod information, cacheClass, and cacheKey are required")
+	}
+	if len(volumeContext.cacheKey) > 1024 || strings.ContainsRune(volumeContext.cacheKey, '\x00') {
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, "cacheKey is invalid or exceeds 1024 bytes")
+	}
+	if volumeContext.maxBytes != "" {
+		maxBytes, err := resource.ParseQuantity(volumeContext.maxBytes)
+		if err != nil || maxBytes.Sign() <= 0 {
+			return podVolumeContext{}, status.Error(codes.InvalidArgument, "maxBytes must be a positive Kubernetes quantity")
+		}
+	}
+	return volumeContext, nil
+}
+
+func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (bool, error) {
+	mounted, err := mountedAt(req.GetTargetPath())
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "inspect target mount: %v", err)
+	}
+	if !mounted {
+		return false, nil
+	}
+	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "read cache lease: %v", err)
+	}
+	if found {
+		if lease.Target != req.GetTargetPath() {
+			return false, status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
+		}
+		same, err := sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), lease.NoExec)
+		if err != nil {
+			return false, status.Errorf(codes.Internal, "verify existing cache mount: %v", err)
+		}
+		if same {
+			return true, nil
+		}
+		return false, status.Error(codes.AlreadyExists, "target is mounted from a different source or with different options")
+	}
+	fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
+	same, err := sameCacheMount(fallback, req.GetTargetPath(), req.GetReadonly(), true)
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "verify fallback mount: %v", err)
+	}
+	if same {
+		return true, nil
+	}
+	return false, status.Error(codes.AlreadyExists, "target is already mounted by another volume")
+}
+
+func (s *Server) publish(ctx context.Context, req *csi.NodePublishVolumeRequest, volumeContext podVolumeContext) error {
+	identity, policy, err := s.resolve(ctx, volumeContext)
+	if err != nil {
+		return s.publishAfterResolutionFailure(ctx, req, volumeContext, err)
+	}
+	unlockIdentity := s.identityLocks.Lock(identity)
+	defer unlockIdentity()
+
+	if err := s.prepareLease(req, identity, policy.NoExec); err != nil {
+		return err
+	}
+	lease := cache.Lease{ID: req.GetVolumeId(), Target: req.GetTargetPath(), Namespace: volumeContext.namespace, PodName: volumeContext.name, PodUID: volumeContext.uid, ReadOnly: req.GetReadonly(), NoExec: policy.NoExec}
+	if err := s.publishNewCache(ctx, req, identity, lease, policy); err != nil {
+		if releaseErr := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
+			return status.Errorf(codes.Internal, "publish cache failed: %v; release lease failed: %v", err, releaseErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Server) prepareLease(req *csi.NodePublishVolumeRequest, identity string, noExec bool) error {
+	oldIdentity, oldLease, _, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	if err != nil {
+		return status.Errorf(codes.Internal, "read cache lease: %v", err)
+	}
+	if !found {
+		return nil
+	}
+	if oldLease.Target != req.GetTargetPath() {
+		return status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
+	}
+	if oldLease.ReadOnly != req.GetReadonly() {
+		return status.Error(codes.AlreadyExists, "volume ID is already published with a different readonly flag")
+	}
+	if oldLease.NoExec != noExec {
+		return status.Error(codes.AlreadyExists, "volume ID is already published with different mount options")
+	}
+	if oldIdentity != identity {
+		if err := s.store.Release(req.GetVolumeId(), oldLease.Target); err != nil {
+			return status.Errorf(codes.Internal, "release cache lease after CacheClass change: %v", err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) publishAfterResolutionFailure(ctx context.Context, req *csi.NodePublishVolumeRequest, volumeContext podVolumeContext, resolveErr error) error {
+	if !errors.Is(resolveErr, kube.ErrAPIResolverUnavailable) && !kube.IsTemporaryAPIError(resolveErr) {
+		return status.Errorf(codes.FailedPrecondition, "resolve CacheClass %q: %v", volumeContext.cacheClass, resolveErr)
+	}
+	identity, lease, source, policy, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	if err != nil {
+		return status.Errorf(codes.Internal, "read cache lease: %v", err)
+	}
+	if !found {
+		if volumeContext.maxBytes != "" {
+			return status.Error(codes.FailedPrecondition, "cannot use fallback cache while maxBytes is requested and CacheClass cannot be resolved")
+		}
+		return s.publishFallback(req)
+	}
+	if lease.Target != req.GetTargetPath() {
+		return status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
+	}
+	if lease.ReadOnly != req.GetReadonly() {
+		return status.Error(codes.AlreadyExists, "volume ID is already published with a different readonly flag")
+	}
+	unlockIdentity := s.identityLocks.Lock(identity)
+	defer unlockIdentity()
+
+	return s.publishCache(ctx, req, identity, source, policy)
+}
+
+func (s *Server) resolve(ctx context.Context, volumeContext podVolumeContext) (string, cache.Policy, error) {
 	if s.resolver == nil {
 		return "", cache.Policy{}, kube.ErrAPIResolverUnavailable
 	}
-	namespaceUID, class, err := s.resolver.Resolve(ctx, attributes["csi.storage.k8s.io/pod.namespace"], className)
+	namespaceUID, class, err := s.resolver.Resolve(ctx, volumeContext.namespace, volumeContext.cacheClass)
 	if err != nil {
 		return "", cache.Policy{}, err
 	}
-	policy, err := policyFor(class.Object.Spec, className, class.UID, attributes["maxBytes"])
+	policy, err := policyFor(class.Object.Spec, volumeContext.cacheClass, class.UID, volumeContext.maxBytes)
 	if err != nil {
 		return "", cache.Policy{}, err
 	}
-	identity, err := cache.Identity(namespaceUID, className, class.UID, attributes["cacheKey"], policy.SchemaVersion)
+	identity, err := cache.Identity(namespaceUID, volumeContext.cacheClass, class.UID, volumeContext.cacheKey, policy.SchemaVersion)
 	return identity, policy, err
 }
 
@@ -211,14 +285,14 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 		return cache.Policy{}, err
 	}
 	policy := cache.Policy{
-		ClassName:            className,
-		ClassUID:             classUID,
-		NoExec:               spec.NoExec,
-		SchemaVersion:        spec.SchemaVersion,
-		CrashRecoveryReuse:   spec.CrashRecovery == "reuse",
-		EvictRunning:         spec.EvictRunning,
-		QuotaEnabled:         spec.Quota.Enabled,
-		Retention:            spec.Retention.Duration,
+		ClassName:          className,
+		ClassUID:           classUID,
+		NoExec:             spec.NoExec,
+		SchemaVersion:      spec.SchemaVersion,
+		CrashRecoveryReuse: spec.CrashRecovery == "reuse",
+		EvictRunning:       spec.EvictRunning,
+		QuotaEnabled:       spec.Quota.Enabled,
+		Retention:          spec.Retention.Duration,
 	}
 	if policy.SchemaVersion == "" {
 		policy.SchemaVersion = "v1"
@@ -253,10 +327,18 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolumeRequest, identity string, lease cache.Lease, policy cache.Policy) error {
 	source, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 	if err != nil {
-		return status.Errorf(codes.Internal, "acquire cache: %v", err)
+		code := codes.Internal
+		if errors.Is(err, cache.ErrQuotaPolicyConflict) {
+			code = codes.FailedPrecondition
+		}
+		return status.Errorf(code, "acquire cache: %v", err)
 	}
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "apply cache quota: %v", err)
+	}
+	source, err = s.store.Expose(identity)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "expose cache generation: %v", err)
 	}
 	return s.mount(req, source, policy.NoExec)
 }
@@ -264,6 +346,10 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 func (s *Server) publishCache(ctx context.Context, req *csi.NodePublishVolumeRequest, identity, source string, policy cache.Policy) error {
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "apply cache quota: %v", err)
+	}
+	source, err := s.store.Expose(identity)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "expose cache generation: %v", err)
 	}
 	return s.mount(req, source, policy.NoExec)
 }
@@ -299,7 +385,7 @@ func (s *Server) publishFallback(req *csi.NodePublishVolumeRequest) error {
 		return status.Errorf(codes.Internal, "inspect fallback target: %v", err)
 	}
 	if mounted {
-		if same, err := sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), false); err != nil {
+		if same, err := sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), true); err != nil {
 			return status.Errorf(codes.Internal, "verify fallback target: %v", err)
 		} else if same {
 			return nil
@@ -455,11 +541,11 @@ func isSingleNodeAccessMode(mode *csi.VolumeCapability_AccessMode) bool {
 	}
 	switch mode.GetMode() {
 	case csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER:
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY:
 		return true
 	case csi.VolumeCapability_AccessMode_UNKNOWN,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER:
@@ -534,18 +620,17 @@ func ApplyQuota(ctx context.Context, store *cache.Store, quotaManager ProjectQuo
 	if err != nil {
 		return err
 	}
-	if assignProject {
-		if err := quotaManager.AssignProject(ctx, store.Root(), source, projectID); err != nil {
+	if assignProject || setLimit {
+		if err := quotaManager.Configure(ctx, store.Root(), source, projectID, policy.MaxBytes); err != nil {
 			return err
 		}
+	}
+	if assignProject {
 		if err := store.MarkProjectAssigned(identity); err != nil {
 			return err
 		}
 	}
 	if setLimit {
-		if err := quotaManager.SetLimit(ctx, store.Root(), projectID, policy.MaxBytes); err != nil {
-			return err
-		}
 		if err := store.MarkQuotaApplied(identity, policy.MaxBytes); err != nil {
 			return err
 		}
