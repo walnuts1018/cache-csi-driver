@@ -21,12 +21,12 @@ const (
 // CacheClassSpec defines storage and reuse behavior for node-local cache generations.
 // +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || (has(self.backend) && self.backend == 'xfs-project')",message="quota requires the xfs-project backend"
 // +kubebuilder:validation:XValidation:rule="!has(self.backend) || self.backend != 'xfs-project' || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled)",message="xfs-project backend requires quota to be enabled"
-// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || quantity(string(self.maxBytes)).sign() >= 0",message="maxBytes must not be negative"
-// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.defaultMaxBytes) || quantity(string(self.quota.defaultMaxBytes)).sign() >= 0",message="quota.defaultMaxBytes must not be negative"
-// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || quantity(string(self.maxBytes)).sign() <= 0 || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')",message="maxBytes requires quota to be enabled with the xfs-project backend"
-// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.defaultMaxBytes) || quantity(string(self.quota.defaultMaxBytes)).sign() <= 0 || (has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')",message="quota.defaultMaxBytes requires quota to be enabled with the xfs-project backend"
-// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || ((has(self.maxBytes) && quantity(string(self.maxBytes)).sign() > 0) || (has(self.quota.defaultMaxBytes) && quantity(string(self.quota.defaultMaxBytes)).sign() > 0))",message="quota requires maxBytes or quota.defaultMaxBytes"
-// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || quantity(string(self.maxBytes)).sign() <= 0 || !has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))",message="quota.defaultMaxBytes must not exceed maxBytes"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !quantity(string(self.maxBytes)).isLessThan(quantity('0'))",message="maxBytes must not be negative"
+// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isLessThan(quantity('0'))",message="quota.defaultMaxBytes must not be negative"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !quantity(string(self.maxBytes)).isGreaterThan(quantity('0')) || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')",message="maxBytes requires quota to be enabled with the xfs-project backend"
+// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity('0')) || (has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')",message="quota.defaultMaxBytes requires quota to be enabled with the xfs-project backend"
+// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || ((has(self.maxBytes) && quantity(string(self.maxBytes)).isGreaterThan(quantity('0'))) || (has(self.quota.defaultMaxBytes) && quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity('0'))))",message="quota requires maxBytes or quota.defaultMaxBytes"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !quantity(string(self.maxBytes)).isGreaterThan(quantity('0')) || !has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))",message="quota.defaultMaxBytes must not exceed maxBytes"
 type CacheClassSpec struct {
 	// Storage backend used for cache generations.
 	// +kubebuilder:default=directory
@@ -76,7 +76,7 @@ type QuotaPolicy struct {
 type CacheClass struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitzero"`
-	Spec              CacheClassSpec `json:"spec,omitzero"`
+	Spec              CacheClassSpec `json:"spec"`
 }
 
 // CacheClassList contains a list of CacheClass.
