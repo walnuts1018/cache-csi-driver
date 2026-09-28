@@ -150,11 +150,21 @@ func (s *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 
 	identity, policy, resolveErr := s.resolve(ctx, attributes, cacheClassName)
 	if resolveErr != nil {
-		if oldIdentity, oldLease, source, oldPolicy, found, err := s.store.LeaseDetails(req.GetVolumeId()); err == nil && found && oldLease.Target == req.GetTargetPath() {
-			if err := s.publishCache(ctx, req, oldIdentity, source, oldPolicy); err == nil {
-				return &csi.NodePublishVolumeResponse{}, nil
+		if !errors.Is(resolveErr, kube.ErrAPIResolverUnavailable) && !kube.IsTemporaryAPIError(resolveErr) {
+			return nil, status.Errorf(codes.FailedPrecondition, "resolve CacheClass %q: %v", cacheClassName, resolveErr)
+		}
+		oldIdentity, oldLease, source, oldPolicy, found, err := s.store.LeaseDetails(req.GetVolumeId())
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
+		}
+		if found {
+			if oldLease.Target != req.GetTargetPath() {
+				return nil, status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
 			}
-			_ = s.store.Release(req.GetVolumeId(), req.GetTargetPath())
+			if err := s.publishCache(ctx, req, oldIdentity, source, oldPolicy); err != nil {
+				return nil, err
+			}
+			return &csi.NodePublishVolumeResponse{}, nil
 		}
 		if err := s.publishFallback(req); err != nil {
 			return nil, err
@@ -176,9 +186,6 @@ func (s *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	lease := cache.Lease{ID: req.GetVolumeId(), Target: req.GetTargetPath(), Namespace: podNamespace, PodName: podName, PodUID: podUID, ReadOnly: req.GetReadonly(), NoExec: policy.NoExec}
 	if err := s.publishNewCache(ctx, req, identity, lease, policy); err != nil {
 		_ = s.store.Release(req.GetVolumeId(), req.GetTargetPath())
-		if fallbackErr := s.publishFallback(req); fallbackErr == nil {
-			return &csi.NodePublishVolumeResponse{}, nil
-		}
 		return nil, err
 	}
 	return &csi.NodePublishVolumeResponse{}, nil
@@ -186,7 +193,7 @@ func (s *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 
 func (s *Server) resolve(ctx context.Context, attributes map[string]string, className string) (string, cache.Policy, error) {
 	if s.resolver == nil {
-		return "", cache.Policy{}, errors.New("Kubernetes API resolver is unavailable")
+		return "", cache.Policy{}, kube.ErrAPIResolverUnavailable
 	}
 	namespaceUID, class, err := s.resolver.Resolve(ctx, attributes["csi.storage.k8s.io/pod.namespace"], className)
 	if err != nil {

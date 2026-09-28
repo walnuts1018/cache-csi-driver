@@ -2,11 +2,15 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 
 	cachev1alpha1 "github.com/walnuts1018/cache-csi-driver/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -15,6 +19,23 @@ import (
 )
 
 var cacheClassGVR = schema.GroupVersionResource{Group: cachev1alpha1.GroupVersion.Group, Version: cachev1alpha1.GroupVersion.Version, Resource: "cacheclasses"}
+
+var ErrAPIResolverUnavailable = errors.New("Kubernetes API resolver is unavailable")
+
+func IsTemporaryAPIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch apierrors.ReasonForError(err) {
+	case metav1.StatusReasonTimeout, metav1.StatusReasonServerTimeout, metav1.StatusReasonServiceUnavailable, metav1.StatusReasonTooManyRequests, metav1.StatusReasonInternalError:
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
+}
 
 type Resolver struct {
 	kubernetes kubernetes.Interface

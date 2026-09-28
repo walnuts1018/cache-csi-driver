@@ -6,22 +6,46 @@ import (
 )
 
 func (spec CacheClassSpec) Validate() error {
-	if spec.Backend != "" && spec.Backend != "directory" && spec.Backend != "xfs-project" {
-		return fmt.Errorf("unsupported backend %q", spec.Backend)
+	if err := spec.validateBackend(); err != nil {
+		return err
 	}
-	if spec.CrashRecovery != "" && spec.CrashRecovery != "discard" && spec.CrashRecovery != "reuse" {
-		return fmt.Errorf("unsupported crashRecovery policy %q", spec.CrashRecovery)
+	if err := spec.validateQuota(); err != nil {
+		return err
+	}
+	if err := spec.validatePressure(); err != nil {
+		return err
+	}
+	if spec.Retention.Duration < 0 {
+		return fmt.Errorf("retention must not be negative")
 	}
 	if spec.SchemaVersion != "" && strings.ContainsAny(spec.SchemaVersion, "\x00/\\") {
 		return fmt.Errorf("schemaVersion contains an invalid character")
 	}
+	return nil
+}
+
+func (spec CacheClassSpec) validateBackend() error {
+	switch spec.Backend {
+	case "", BackendDirectory, BackendXFSProject:
+	default:
+		return fmt.Errorf("unsupported backend %q", spec.Backend)
+	}
+	switch spec.CrashRecovery {
+	case "", CrashRecoveryDiscard, CrashRecoveryReuse:
+		return nil
+	default:
+		return fmt.Errorf("unsupported crashRecovery policy %q", spec.CrashRecovery)
+	}
+}
+
+func (spec CacheClassSpec) validateQuota() error {
 	if spec.MaxBytes.Sign() < 0 || spec.Quota.DefaultMaxBytes.Sign() < 0 {
 		return fmt.Errorf("cache size limits must not be negative")
 	}
-	if spec.Quota.Enabled && spec.Backend != "xfs-project" {
+	if spec.Quota.Enabled && spec.Backend != BackendXFSProject {
 		return fmt.Errorf("quota requires the xfs-project backend")
 	}
-	if spec.Backend == "xfs-project" && !spec.Quota.Enabled {
+	if spec.Backend == BackendXFSProject && !spec.Quota.Enabled {
 		return fmt.Errorf("xfs-project backend requires quota to be enabled")
 	}
 	if !spec.Quota.Enabled && (!spec.MaxBytes.IsZero() || !spec.Quota.DefaultMaxBytes.IsZero()) {
@@ -33,23 +57,36 @@ func (spec CacheClassSpec) Validate() error {
 	if spec.Quota.Enabled && !spec.MaxBytes.IsZero() && spec.Quota.DefaultMaxBytes.Cmp(spec.MaxBytes) > 0 {
 		return fmt.Errorf("quota.defaultMaxBytes must not exceed the maxBytes ceiling")
 	}
-	p := spec.Pressure
-	for name, value := range map[string]int32{"highFreePercent": p.HighFreePercent, "lowFreePercent": p.LowFreePercent, "highInodeFreePercent": p.HighInodeFreePercent, "lowInodeFreePercent": p.LowInodeFreePercent} {
-		if value < 0 || value > 100 {
-			return fmt.Errorf("%s must be between 0 and 100", name)
+	return nil
+}
+
+func (spec CacheClassSpec) validatePressure() error {
+	pressure := spec.Pressure
+	for _, threshold := range []struct {
+		name  string
+		value int32
+	}{
+		{name: "highFreePercent", value: pressure.HighFreePercent},
+		{name: "lowFreePercent", value: pressure.LowFreePercent},
+		{name: "highInodeFreePercent", value: pressure.HighInodeFreePercent},
+		{name: "lowInodeFreePercent", value: pressure.LowInodeFreePercent},
+	} {
+		if threshold.value < 0 || threshold.value > 100 {
+			return fmt.Errorf("%s must be between 0 and 100", threshold.name)
 		}
 	}
-	if p.LowFreePercent > 0 && p.HighFreePercent > 0 && p.HighFreePercent <= p.LowFreePercent {
-		return fmt.Errorf("highFreePercent must be greater than lowFreePercent")
+	if err := validateWatermarks("FreeBytes", pressure.HighFreePercent, pressure.LowFreePercent); err != nil {
+		return err
 	}
-	if (p.LowFreePercent == 0) != (p.HighFreePercent == 0) {
-		return fmt.Errorf("lowFreePercent and highFreePercent must be configured together")
+	return validateWatermarks("FreeInodes", pressure.HighInodeFreePercent, pressure.LowInodeFreePercent)
+}
+
+func validateWatermarks(name string, high, low int32) error {
+	if (high == 0) != (low == 0) {
+		return fmt.Errorf("high and low %s percentages must be configured together", name)
 	}
-	if p.LowInodeFreePercent > 0 && p.HighInodeFreePercent > 0 && p.HighInodeFreePercent <= p.LowInodeFreePercent {
-		return fmt.Errorf("highInodeFreePercent must be greater than lowInodeFreePercent")
-	}
-	if (p.LowInodeFreePercent == 0) != (p.HighInodeFreePercent == 0) {
-		return fmt.Errorf("lowInodeFreePercent and highInodeFreePercent must be configured together")
+	if high > 0 && high <= low {
+		return fmt.Errorf("high %s percentage must be greater than the low percentage", name)
 	}
 	return nil
 }
