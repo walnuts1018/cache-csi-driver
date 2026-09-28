@@ -1,6 +1,6 @@
 [tools]
 go = "1.27.1"
-golangci-lint = "2.13.2"
+golangci-lint = "2.14.0"
 helm = "4.2.4"
 "go:sigs.k8s.io/controller-tools/cmd/controller-gen" = "v0.22.0"
 
