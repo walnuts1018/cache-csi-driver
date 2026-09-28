@@ -102,6 +102,20 @@ func (m *Manager) pressure(ctx context.Context) {
 	if err := ctx.Err(); err != nil {
 		return
 	}
+	if m.inspectMount != nil {
+		if err := m.store.RecoverDegraded(ctx, m.inspectMount); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			m.logger.WarnContext(ctx, "degraded cache recovery was incomplete", "error", err)
+		}
+	}
+	if err := m.store.CleanupTrash(ctx); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		m.logger.WarnContext(ctx, "cache trash cleanup failed during pressure check", "error", err)
+	}
 	if err := m.store.ReclaimPressure(ctx); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return

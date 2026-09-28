@@ -1504,6 +1504,37 @@ func (s *Store) CleanupDegradedObject(identity string, sourceMounted func(source
 	return nil
 }
 
+func (s *Store) RecoverDegraded(ctx context.Context, verifyMount func(source string, lease Lease, policy Policy) (bool, error)) error {
+	if verifyMount == nil {
+		return errors.New("mount verifier is not configured")
+	}
+	s.mu.Lock()
+	identities := make([]string, 0, len(s.degraded))
+	for identity := range s.degraded {
+		if validIdentity(identity) {
+			identities = append(identities, identity)
+		}
+	}
+	s.mu.Unlock()
+	slices.Sort(identities)
+
+	var recoveryErr error
+	for _, identity := range identities {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(recoveryErr, err)
+		}
+		s.mu.Lock()
+		if _, degraded := s.degraded[identity]; degraded {
+			path := filepath.Join(s.root, identity)
+			if err := s.quarantineDegradedObjectChecked(ctx, path, identity, verifyMount); err != nil {
+				recoveryErr = errors.Join(recoveryErr, fmt.Errorf("recover degraded cache %s: %w", identity, err))
+			}
+		}
+		s.mu.Unlock()
+	}
+	return recoveryErr
+}
+
 func (s *Store) RecoverLeases(verifyMount func(source string, lease Lease, policy Policy) (bool, error)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1651,30 +1682,50 @@ func (s *Store) recoverRetiredGenerations(path, identity string, meta *Metadata,
 }
 
 func (s *Store) quarantineDegradedObject(path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) {
+	_ = s.quarantineDegradedObjectChecked(context.Background(), path, identity, verifyMount)
+}
+
+func (s *Store) quarantineDegradedObjectChecked(ctx context.Context, path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
+	if err := s.stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			delete(s.degraded, identity)
+			return nil
+		}
+		s.markDegraded(identity, err)
+		return fmt.Errorf("inspect degraded cache object: %w", err)
+	}
 	generationsPath := filepath.Join(path, "generations")
 	generations, err := s.readDir(generationsPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.markDegraded(identity, err)
-		return
+		return fmt.Errorf("inspect degraded cache generations: %w", err)
 	}
 	for _, generation := range generations {
 		if !generation.IsDir() {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		source := filepath.Join(generationsPath, generation.Name())
 		mounted, err := verifyMount(source, Lease{}, Policy{})
 		if err != nil {
 			s.markDegraded(identity, err)
-			return
+			return fmt.Errorf("verify degraded cache generation mount: %w", err)
 		}
 		if mounted {
 			s.markDegraded(identity, errors.New("cache generation remains mounted with unreadable metadata"))
-			return
+			return nil
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := s.detachToTrash(path); err != nil {
 		s.markDegraded(identity, err)
+		return fmt.Errorf("quarantine unmounted degraded cache: %w", err)
 	}
+	return nil
 }
 
 func (s *Store) Collect(now time.Time) error {
@@ -1824,6 +1875,9 @@ func (s *Store) MetadataError() error {
 	defer s.mu.Unlock()
 	for _, err := range s.degraded {
 		return err
+	}
+	if s.projectRegistryDamaged {
+		return fmt.Errorf("%w: project ID reservation registry is damaged", ErrDegradedMetadata)
 	}
 	return nil
 }

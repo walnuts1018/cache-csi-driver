@@ -629,6 +629,9 @@ func TestDamagedProjectRegistryDisablesOnlyQuotaAllocation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("open store with damaged project registry: %v", err)
 			}
+			if !errors.Is(store.MetadataError(), ErrDegradedMetadata) {
+				t.Fatalf("storage health error = %v, want degraded metadata", store.MetadataError())
+			}
 			t.Cleanup(func() {
 				if err := store.Close(); err != nil {
 					t.Error(err)
