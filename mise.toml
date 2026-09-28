@@ -1,5 +1,6 @@
 [tools]
 go = "1.27.1"
+golangci-lint = "2.13.2"
 helm = "4.2.4"
 
 [tasks.build]
@@ -17,6 +18,10 @@ run = "go test ./..."
 [tasks.manifests]
 description = "Copy the authoritative CacheClass CRD into the Helm chart"
 run = "cp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml"
+
+[tasks."lint:backend"]
+description = "lint the Go code"
+run = "golangci-lint run"
 
 [tasks."lint:chart"]
 description = "Lint and render the Helm chart"

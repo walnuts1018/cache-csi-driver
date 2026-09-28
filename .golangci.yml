@@ -1,0 +1,117 @@
+# yaml-language-server: $schema=https://golangci-lint.run/jsonschema/golangci.jsonschema.json
+version: "2"
+run:
+  allow-parallel-runners: true
+linters:
+  default: none
+  enable:
+    - asasalint
+    - containedctx
+    - contextcheck
+    - copyloopvar
+    - dupl
+    - durationcheck
+    - errcheck
+    - exhaustive
+    - exhaustruct_v5
+    - fatcontext
+    - forbidigo
+    - ginkgolinter
+    - gocheckcompilerdirectives
+    - goconst
+    - gocyclo
+    - govet
+    - ineffassign
+    - intrange
+    - loggercheck
+    - makezero
+    - mirror
+    - misspell
+    - modernize
+    - nakedret
+    - nilerr
+    - noctx
+    - nolintlint
+    - paralleltest
+    - prealloc
+    - predeclared
+    - reassign
+    - revive
+    - rowserrcheck
+    - sloglint
+    - sqlclosecheck
+    - staticcheck
+    - testableexamples
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - usetesting
+  settings:
+    revive:
+      rules:
+        - name: comment-spacings
+    exhaustive:
+      check:
+        - switch
+        - map
+    usetesting:
+      os-chdir: true
+      context-background: true
+      context-todo: true
+    # graph/modelはgqlgenが生成するGraphQLスキーマ対応のGoの型で、フィールドの
+    # 過不足はGoコンパイラでは検出できずランタイムまで顕在化しない(例: 2026-08-24の
+    # ImageMediaContent.MediaID未設定によるcapabilities解決エラー)。このパッケージの
+    # 型に限り、フィールドを1つでも書き漏らした構造体リテラルをlintエラーにする。
+    exhaustruct_v5:
+      # explicit-modeにより、デフォルトでは何もチェックせず、enforce-patternsに
+      # マッチした型だけを対象にする(falseだとenforce-patternsが逆に「追加で
+      # チェック対象へ加える」意味になり、それ以外の全ての構造体もチェック対象に
+      # 入ってしまう)。
+      explicit-mode: true
+      enforce-patterns:
+        - '.*/graph/model\..*'
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - dupl
+        path: infrastructure/*
+      - linters:
+          - dupl
+        # errormap_*.goはADR0011のunion Result型のため、ミューテーションごとに
+        # MatchXErrorCases2でエラーの直和型をUserErrorCodeへ変換する関数を持つ。
+        # 現時点でケース名・戻り値が偶然一致していても、変換対象のドメインエラー型や
+        # GraphQLのUserErrorCode型はミューテーションごとに異なり、将来的に発散しうる
+        # 独立した変換ロジックのため、共通化はしない。
+        path: graph/errormap_.*\.go
+      - linters:
+          - contextcheck
+          - errcheck
+          - noctx
+          - dupl
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

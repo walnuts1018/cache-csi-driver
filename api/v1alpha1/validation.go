@@ -24,11 +24,14 @@ func (spec CacheClassSpec) Validate() error {
 	if spec.Backend == "xfs-project" && !spec.Quota.Enabled {
 		return fmt.Errorf("xfs-project backend requires quota to be enabled")
 	}
-	if !spec.Quota.Enabled && !spec.MaxBytes.IsZero() {
-		return fmt.Errorf("maxBytes requires quota to be enabled")
+	if !spec.Quota.Enabled && (!spec.MaxBytes.IsZero() || !spec.Quota.DefaultMaxBytes.IsZero()) {
+		return fmt.Errorf("maxBytes and quota.defaultMaxBytes require quota to be enabled")
 	}
 	if spec.Quota.Enabled && spec.MaxBytes.IsZero() && spec.Quota.DefaultMaxBytes.IsZero() {
 		return fmt.Errorf("quota requires maxBytes or quota.defaultMaxBytes")
+	}
+	if spec.Quota.Enabled && !spec.MaxBytes.IsZero() && spec.Quota.DefaultMaxBytes.Cmp(spec.MaxBytes) > 0 {
+		return fmt.Errorf("quota.defaultMaxBytes must not exceed the maxBytes ceiling")
 	}
 	p := spec.Pressure
 	for name, value := range map[string]int32{"highFreePercent": p.HighFreePercent, "lowFreePercent": p.LowFreePercent, "highInodeFreePercent": p.HighInodeFreePercent, "lowInodeFreePercent": p.LowInodeFreePercent} {

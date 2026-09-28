@@ -336,7 +336,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	}
 	unlock := s.locks.Lock(req.GetTargetPath())
 	defer unlock()
-	_, lease, source, policy, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
@@ -392,7 +392,7 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
-	_, lease, source, policy, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}

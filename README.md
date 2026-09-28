@@ -75,7 +75,9 @@ spec:
 | `rbac.createPodEvictions` | `true` | `evictRunning`用のPod Eviction権限 |
 | `nodeSelector` | `kubernetes.io/os: linux` | DaemonSetを配置するNode |
 
-`CacheClass`の`maxBytes`はcache全体の上限であり、schedulerによる容量予約ではありません。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`pressure`はNode-local cache filesystemの空き容量とinodeに対するGC水位です。`noExec`を有効にするとcache volumeを`noexec`でmountします。
+`CacheClass.spec.maxBytes`は、各cache identityに対してvolume側が要求できるquota上限です。`quota.enabled`と`backend: xfs-project`が必要で、volume attributeの`maxBytes`がこの上限を超える場合はmount要求を拒否します。volume attributeに`maxBytes`がない場合は`quota.defaultMaxBytes`をそのidentityのhard limitとして使います。`quota.defaultMaxBytes`を設定しない場合はvolume側の`maxBytes`が必要です。quotaを有効にするCacheClassには`spec.maxBytes`または`quota.defaultMaxBytes`を設定してください。`examples/cacheclass-xfs-project.yaml`と`examples/pod-inline-cache-xfs-project.yaml`に設定例があります。
+
+現在、class全体の集約byte上限はありません。`pressure`はNode-local cache filesystemの空き容量とinodeに対するGC水位を設定し、実際のfilesystem使用量に応じてcacheを回収します。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
 
 `evictRunning`を有効にしたCacheClassでは、pressure GCが未使用cacheだけで不足すると、そのcacheを利用中のPodへKubernetes Eviction APIを要求します。PodDisruptionBudgetにより要求が拒否される場合は、Podとactive cacheを維持します。Node pluginのClusterRoleは全namespaceの`pods/eviction`作成だけを追加し、Podの直接削除権限は持ちません。active Pod evictionを使わない場合は`rbac.createPodEvictions=false`にできます。
 

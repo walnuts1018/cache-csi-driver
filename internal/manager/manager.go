@@ -10,6 +10,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
@@ -59,6 +60,10 @@ func (m *Manager) Recover() error {
 }
 
 func (m *Manager) Run(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	m.collect(ctx, time.Now())
 	ticker := time.NewTicker(m.interval)
 	defer ticker.Stop()
 	for {
@@ -115,7 +120,7 @@ func (m *Manager) collect(ctx context.Context, now time.Time) {
 }
 
 func (m *Manager) evict(ctx context.Context, lease cache.Lease) error {
-	uid := lease.PodUID
+	uid := types.UID(lease.PodUID)
 	eviction := &policyv1.Eviction{
 		TypeMeta: metav1.TypeMeta{APIVersion: "policy/v1", Kind: "Eviction"},
 		ObjectMeta: metav1.ObjectMeta{

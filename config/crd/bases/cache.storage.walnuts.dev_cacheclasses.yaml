@@ -37,6 +37,14 @@ spec:
                   message: quota requires the xfs-project backend
                 - rule: "!has(self.backend) || self.backend != 'xfs-project' || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled)"
                   message: xfs-project backend requires quota to be enabled
+                - rule: "!has(self.maxBytes) || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')"
+                  message: maxBytes requires quota to be enabled with the xfs-project backend
+                - rule: "!has(self.quota) || !has(self.quota.defaultMaxBytes) || (has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')"
+                  message: quota.defaultMaxBytes requires quota to be enabled with the xfs-project backend
+                - rule: "!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || has(self.maxBytes) || (has(self.quota) && has(self.quota.defaultMaxBytes))"
+                  message: quota requires maxBytes or quota.defaultMaxBytes
+                - rule: "!has(self.maxBytes) || !has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))"
+                  message: quota.defaultMaxBytes must not exceed maxBytes
                 - rule: "!has(self.pressure) || ((!has(self.pressure.highFreePercent) && !has(self.pressure.lowFreePercent)) || (has(self.pressure.highFreePercent) && has(self.pressure.lowFreePercent) && ((self.pressure.highFreePercent == 0 && self.pressure.lowFreePercent == 0) || self.pressure.highFreePercent > self.pressure.lowFreePercent)))"
                   message: highFreePercent and lowFreePercent must be configured together, with the high value greater than the low value
                 - rule: "!has(self.pressure) || ((!has(self.pressure.highInodeFreePercent) && !has(self.pressure.lowInodeFreePercent)) || (has(self.pressure.highInodeFreePercent) && has(self.pressure.lowInodeFreePercent) && ((self.pressure.highInodeFreePercent == 0 && self.pressure.lowInodeFreePercent == 0) || self.pressure.highInodeFreePercent > self.pressure.lowInodeFreePercent)))"
@@ -54,7 +62,7 @@ spec:
                     - type: integer
                     - type: string
                   pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([eEinumkKMGTP]+)|(([KMGTPE]i)))?$
-                  description: Maximum total bytes retained for this cache class on a node.
+                  description: Maximum per-cache quota ceiling for volume-level maxBytes requests in this class. Requires quota.enabled and the xfs-project backend; requests above this limit are rejected.
                 retention:
                   type: string
                   description: Maximum age of an unused cache before it becomes eligible for garbage collection.
@@ -105,14 +113,14 @@ spec:
                   properties:
                     enabled:
                       type: boolean
-                      description: Enables per-cache quota enforcement when supported by the selected backend.
+                      description: Enables XFS project quota enforcement for each cache identity. Requires the xfs-project backend and a per-cache limit in maxBytes or defaultMaxBytes.
                     defaultMaxBytes:
                       x-kubernetes-int-or-string: true
                       anyOf:
                         - type: integer
                         - type: string
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([eEinumkKMGTP]+)|(([KMGTPE]i)))?$
-                      description: Default byte ceiling applied to each cache entry in this class.
+                      description: Per-cache hard limit used when the CSI volume context omits maxBytes. If maxBytes is set, this default must not exceed the class ceiling.
             status:
               type: object
               properties:

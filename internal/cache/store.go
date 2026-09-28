@@ -99,14 +99,14 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 	if !validIdentity(options.Identity) || options.Lease.ID == "" || len(options.Lease.ID) > 1024 || strings.ContainsRune(options.Lease.ID, '\x00') || !filepath.IsAbs(options.Lease.Target) {
 		return "", false, errors.New("invalid cache identity, lease ID, or target path")
 	}
-	entry := filepath.Join(s.root, options.Identity)
-	if err := ensureDirectory(entry, 0o700); err != nil {
-		return "", false, fmt.Errorf("create cache entry: %w", err)
-	}
 	if existingIdentity, existing, found, err := s.findLease(options.Lease.ID); err != nil {
 		return "", false, err
 	} else if found && (existingIdentity != options.Identity || !slices.ContainsFunc(existing.Leases, func(lease Lease) bool { return lease.ID == options.Lease.ID && lease.Target == options.Lease.Target })) {
 		return "", false, errors.New("cache lease ID is already in use")
+	}
+	entry := filepath.Join(s.root, options.Identity)
+	if err := ensureDirectory(entry, 0o700); err != nil {
+		return "", false, fmt.Errorf("create cache entry: %w", err)
 	}
 	meta, err := readMetadata(entry)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
