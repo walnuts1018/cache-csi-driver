@@ -668,20 +668,29 @@ func (s *Store) CleanupTrash(ctx context.Context) error {
 }
 
 func (s *Store) cleanupTrashBatch() error {
+	// detach処理と同じmutex下でsnapshotし、作成途中のtrash entryを削除対象に含めない。
+	s.mu.Lock()
 	entries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
-	var cleanupErr error
+	trashIDs := make([]string, 0, min(len(entries), trashBatchSize))
 	for _, entry := range entries[:min(len(entries), trashBatchSize)] {
-		if err := s.removeAll(filepath.Join(s.root, trashDirectoryName, entry.Name())); err != nil {
+		trashIDs = append(trashIDs, entry.Name())
+	}
+	s.mu.Unlock()
+
+	var cleanupErr error
+	for _, trashID := range trashIDs {
+		if err := s.removeAll(filepath.Join(s.root, trashDirectoryName, trashID)); err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue
 		}
 		s.mu.Lock()
 		for projectID, reservations := range s.projectReservations {
 			kept := slices.DeleteFunc(reservations, func(reservation projectReservation) bool {
-				return reservation.TrashID == entry.Name()
+				return reservation.TrashID == trashID
 			})
 			if len(kept) == 0 {
 				delete(s.projectReservations, projectID)
@@ -689,10 +698,10 @@ func (s *Store) cleanupTrashBatch() error {
 				s.projectReservations[projectID] = kept
 			}
 		}
-		delete(s.trashMetadata, entry.Name())
-		delete(s.degraded, filepath.Join(trashDirectoryName, entry.Name()))
-		for identity, trashID := range s.unknownProjectReservations {
-			if trashID == entry.Name() {
+		delete(s.trashMetadata, trashID)
+		delete(s.degraded, filepath.Join(trashDirectoryName, trashID))
+		for identity, reservedTrashID := range s.unknownProjectReservations {
+			if reservedTrashID == trashID {
 				delete(s.unknownProjectReservations, identity)
 			}
 		}
