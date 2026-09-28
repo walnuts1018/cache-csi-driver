@@ -76,7 +76,7 @@ spec:
 | `cacheRootDir` | `/var/lib/cache-csi` | Node上のcache directory |
 | `fallbackRootDir` | `/run/cache-csi/fallback` | Node上のfallback専用volume directory。tmpfsを使う場合はtmpfs内のNode pathを指定 |
 | `kubeletRootDir` | `/var/lib/kubelet` | kubeletのroot directory |
-| `gcInterval` | `30s` | Node-local cache GC interval |
+| `gcInterval` | `30s` | retention-based cache GC scan interval |
 | `pressure.highFreePercent` | `25` | cache filesystemの空き容量GC終了水位 |
 | `pressure.lowFreePercent` | `20` | cache filesystemの空き容量GC開始水位 |
 | `pressure.highInodeFreePercent` | `15` | cache filesystemの空きinode GC終了水位 |
@@ -90,7 +90,7 @@ spec:
 
 `CacheClass.spec.maxBytes`は、各cache identityに対してvolume側が要求できるquota上限です。`quota.enabled`と`backend: xfs-project`が必要で、volume attributeの`maxBytes`がこの上限を超える場合はmount要求を拒否します。volume attributeに`maxBytes`がない場合は`quota.defaultMaxBytes`を設定していればその値を使い、未設定なら`spec.maxBytes`を使います。quotaを有効にするCacheClassには`spec.maxBytes`または`quota.defaultMaxBytes`を設定してください。`examples/cacheclass-xfs-project.yaml`と`examples/pod-inline-cache-xfs-project.yaml`に設定例があります。
 
-現在、class全体の集約byte上限はありません。pressure watermarksはCacheClassごとではなく、`cacheRootDir`が属する単一filesystem全体に適用します。設定した開始水位を下回ると未使用cacheを優先して回収し、終了水位まで回復させます。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
+現在、class全体の集約byte上限はありません。pressure watermarksはCacheClassごとではなく、`cacheRootDir`が属する単一filesystem全体に適用します。Node pluginは`gcInterval`とは別に3秒ごとに空き容量とinodeを確認し、開始水位を下回ると未使用cacheを物理削除して終了水位までの回復を試みます。未使用cacheを回収してもpressureが続く場合に限り、`evictRunning`を有効にしたCacheClassのPodへEviction APIで退去を要求します。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
 
 `evictRunning`を有効にしたCacheClassでは、未使用cacheを回収した後もglobal pressureが続く場合、そのcacheを利用中のPodへKubernetes Eviction APIでbest-effortの退去要求を出します。PodDisruptionBudgetにより拒否される場合やPodが退去しない場合があり、cacheの回収は保証されません。driverはPodを強制削除しません。Node pluginのClusterRoleは全namespaceの`pods/eviction`作成だけを追加し、Podの直接削除権限は持ちません。active Pod evictionを使わない場合は`rbac.createPodEvictions=false`にできます。
 
