@@ -60,7 +60,7 @@ spec:
                   description: Policy for generations left active after an unclean node shutdown.
                 evictRunning:
                   type: boolean
-                  description: Allows pressure garbage collection to signal consumers of active cache generations for eviction.
+                  description: Allows pressure garbage collection to request graceful eviction of Pods using active cache generations. Eviction requests respect PodDisruptionBudgets.
                 noExec:
                   type: boolean
                   description: Mounts cache generations with execution disabled.

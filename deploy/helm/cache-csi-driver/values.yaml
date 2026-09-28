@@ -9,11 +9,15 @@ fullnameOverride: ""
 
 driverName: cache.csi.walnuts.dev
 cacheRootDir: /var/lib/cache-csi
+fallbackRootDir: /run/cache-csi/fallback
 kubeletRootDir: /var/lib/kubelet
 gcInterval: 30s
 
 csiDriver:
   preventPodSchedulingIfMissing: true
+
+rbac:
+  createPodEvictions: true
 
 serviceAccount:
   create: true

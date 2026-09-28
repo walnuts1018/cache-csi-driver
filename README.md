@@ -69,9 +69,14 @@ spec:
 | `kubeletRootDir` | `/var/lib/kubelet` | kubeletのroot directory |
 | `gcInterval` | `30s` | Node-local cache GC interval |
 | `csiDriver.preventPodSchedulingIfMissing` | `true` | CSI pluginが未登録のNodeへの配置を防止 |
+| `rbac.createPodEvictions` | `true` | `evictRunning`用のPod Eviction権限 |
 | `nodeSelector` | `kubernetes.io/os: linux` | DaemonSetを配置するNode |
 
-`CacheClass`の`maxBytes`はcache全体の上限であり、schedulerによる容量予約ではありません。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`pressure`はNode-local cache filesystemの空き容量とinodeに対するGC水位です。`quota`を利用する場合は対象filesystemとNodeのquota設定を事前に確認してください。
+`CacheClass`の`maxBytes`はcache全体の上限であり、schedulerによる容量予約ではありません。`retention`は未使用cacheの保持期間、`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`pressure`はNode-local cache filesystemの空き容量とinodeに対するGC水位です。`noExec`を有効にするとcache volumeを`noexec`でmountします。
+
+`evictRunning`を有効にしたCacheClassでは、pressure GCが未使用cacheだけで不足すると、そのcacheを利用中のPodへKubernetes Eviction APIを要求します。PodDisruptionBudgetにより要求が拒否される場合は、Podとactive cacheを維持します。Node pluginのClusterRoleは全namespaceの`pods/eviction`作成だけを追加し、Podの直接削除権限は持ちません。active Pod evictionを使わない場合は`rbac.createPodEvictions=false`にできます。
+
+`quota.enabled`を使うCacheClassでは`backend: xfs-project`を指定し、`cacheRootDir`がproject quota有効のXFS filesystem上にあることを確認してください。Node imageには`xfs_quota`を含めていますが、host filesystemのmount optionやquota設定は管理者が行います。
 
 ## 開発とリリース
 

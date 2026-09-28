@@ -36,6 +36,7 @@ spec:
           args:
             - --endpoint=unix:///csi/csi.sock
             - --cache-root={{ .Values.cacheRootDir }}
+            - --fallback-root={{ .Values.fallbackRootDir }}
             - --node-id=$(NODE_NAME)
             - --kubelet-root={{ .Values.kubeletRootDir }}
             - --gc-interval={{ .Values.gcInterval }}
@@ -81,6 +82,8 @@ spec:
               mountPropagation: Bidirectional
             - name: cache-root
               mountPath: {{ .Values.cacheRootDir }}
+            - name: fallback-root
+              mountPath: {{ .Values.fallbackRootDir }}
         - name: csi-node-driver-registrar
           image: "{{ .Values.registrar.image.repository }}:{{ .Values.registrar.image.tag }}"
           imagePullPolicy: {{ .Values.registrar.image.pullPolicy }}
@@ -138,6 +141,10 @@ spec:
         - name: cache-root
           hostPath:
             path: {{ .Values.cacheRootDir }}
+            type: DirectoryOrCreate
+        - name: fallback-root
+          hostPath:
+            path: {{ .Values.fallbackRootDir }}
             type: DirectoryOrCreate
       {{- with .Values.nodeSelector }}
       nodeSelector:

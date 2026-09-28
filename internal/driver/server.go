@@ -5,18 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	cachev1alpha1 "github.com/walnuts1018/cache-csi-driver/api/v1alpha1"
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 	"github.com/walnuts1018/cache-csi-driver/internal/kube"
-	"github.com/walnuts1018/cache-csi-driver/internal/quota"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -288,9 +285,7 @@ func (s *Server) mount(req *csi.NodePublishVolumeRequest, source string, noExec 
 		return status.Errorf(codes.Internal, "bind cache: %v", err)
 	}
 	if err := remountOptions(target, req.GetReadonly(), noExec); err != nil {
-		if unmountErr := unmount(target); unmountErr == nil && releaseOnError {
-			_ = s.store.Release(req.GetVolumeId(), target)
-		}
+		_ = unmount(target)
 		return status.Errorf(codes.Internal, "apply cache mount options: %v", err)
 	}
 	return nil
@@ -343,7 +338,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	}
 	unlock := s.locks.Lock(req.GetTargetPath())
 	defer unlock()
-	identity, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
@@ -399,7 +394,7 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
-	identity, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
@@ -422,7 +417,6 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	} else if !same {
 		return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeSourceMismatch", "cache volume source does not match its lease")}, nil
 	}
-	_ = identity
 	return &csi.NodeGetVolumeHealthResponse{VolumeHealth: &csi.VolumeHealth{VolumeId: req.GetVolumeId()}}, nil
 }
 
@@ -464,7 +458,6 @@ func isSingleNodeAccessMode(mode *csi.VolumeCapability_AccessMode) bool {
 	case csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER,
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER:
 		return true
 	default:

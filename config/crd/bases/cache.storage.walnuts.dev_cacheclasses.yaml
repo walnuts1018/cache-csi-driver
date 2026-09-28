@@ -32,6 +32,15 @@ spec:
           properties:
             spec:
               type: object
+              x-kubernetes-validations:
+                - rule: "!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || (has(self.backend) && self.backend == 'xfs-project')"
+                  message: quota requires the xfs-project backend
+                - rule: "!has(self.backend) || self.backend != 'xfs-project' || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled)"
+                  message: xfs-project backend requires quota to be enabled
+                - rule: "!has(self.pressure) || ((!has(self.pressure.highFreePercent) && !has(self.pressure.lowFreePercent)) || (has(self.pressure.highFreePercent) && has(self.pressure.lowFreePercent) && ((self.pressure.highFreePercent == 0 && self.pressure.lowFreePercent == 0) || self.pressure.highFreePercent > self.pressure.lowFreePercent)))"
+                  message: highFreePercent and lowFreePercent must be configured together, with the high value greater than the low value
+                - rule: "!has(self.pressure) || ((!has(self.pressure.highInodeFreePercent) && !has(self.pressure.lowInodeFreePercent)) || (has(self.pressure.highInodeFreePercent) && has(self.pressure.lowInodeFreePercent) && ((self.pressure.highInodeFreePercent == 0 && self.pressure.lowInodeFreePercent == 0) || self.pressure.highInodeFreePercent > self.pressure.lowInodeFreePercent)))"
+                  message: highInodeFreePercent and lowInodeFreePercent must be configured together, with the high value greater than the low value
               properties:
                 backend:
                   type: string
@@ -60,7 +69,7 @@ spec:
                   description: Policy for generations left active after an unclean node shutdown.
                 evictRunning:
                   type: boolean
-                  description: Allows pressure garbage collection to signal consumers of active cache generations for eviction.
+                  description: Allows pressure garbage collection to request graceful eviction of Pods using active cache generations. Eviction requests respect PodDisruptionBudgets.
                 noExec:
                   type: boolean
                   description: Mounts cache generations with execution disabled.
