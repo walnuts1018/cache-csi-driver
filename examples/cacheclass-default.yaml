@@ -1,0 +1,15 @@
+apiVersion: cache.storage.walnuts.dev/v1alpha1
+kind: CacheClass
+metadata:
+  name: default
+spec:
+  backend: directory
+  maxBytes: 500Gi
+  retention: 72h
+  schemaVersion: v1
+  crashRecovery: discard
+  pressure:
+    highFreePercent: 25
+    lowFreePercent: 20
+    highInodeFreePercent: 15
+    lowInodeFreePercent: 10

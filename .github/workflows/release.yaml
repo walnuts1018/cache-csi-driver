@@ -1,0 +1,223 @@
+name: Release
+run-name: Release ${{ inputs.release_tag || 'next patch' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag such as v1.2.3; empty selects the next stable patch version
+        required: false
+        type: string
+      release_channel:
+        description: Whether the GitHub Release is latest or a pre-release
+        required: true
+        default: latest
+        type: choice
+        options:
+          - latest
+          - pre-release
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: cache-csi-driver-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  validate:
+    name: Validate release target
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.release-target.outputs.release_tag }}
+    steps:
+      - name: Check out release tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and validate tag
+        id: release-target
+        shell: bash
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_RELEASE_CHANNEL: ${{ inputs.release_channel }}
+        run: |
+          set -euo pipefail
+
+          release_tag="$INPUT_RELEASE_TAG"
+          if [[ -z "$release_tag" ]]; then
+            latest_tag="$(git tag --list 'v*' | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -n 1 || true)"
+            if [[ -z "$latest_tag" ]]; then
+              release_tag="v0.1.0"
+            else
+              version="${latest_tag#v}"
+              IFS=. read -r major minor patch <<< "$version"
+              release_tag="v${major}.${minor}.$((patch + 1))"
+            fi
+            if [[ "$INPUT_RELEASE_CHANNEL" == "pre-release" ]]; then
+              release_tag="${release_tag}-rc.1"
+            fi
+          fi
+
+          if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::Release tag must be a SemVer version prefixed with v: ${release_tag}" >&2
+            exit 1
+          fi
+
+          if [[ "$INPUT_RELEASE_CHANNEL" == "latest" && "$release_tag" == *-* ]]; then
+            echo "::error::Stable releases must not have a pre-release suffix" >&2
+            exit 1
+          fi
+          if [[ "$INPUT_RELEASE_CHANNEL" == "pre-release" && "$release_tag" != *-* ]]; then
+            echo "::error::Pre-releases must have a pre-release suffix" >&2
+            exit 1
+          fi
+
+          git check-ref-format --allow-onelevel "refs/tags/${release_tag}"
+          if git rev-parse --verify --quiet "refs/tags/${release_tag}" >/dev/null; then
+            echo "::error::Release tag already exists: ${release_tag}" >&2
+            exit 1
+          fi
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and publish release artifacts
+    needs:
+      - validate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up mise tools
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          cache: true
+
+      - name: Run release validation
+        run: |
+          mise run build
+          mise run test
+          go vet ./...
+          mise run lint:chart
+          cmp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image tags
+        id: image-tags
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          RELEASE_CHANNEL: ${{ inputs.release_channel }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          {
+            echo 'tags<<EOF'
+            echo "${image}:${RELEASE_TAG}"
+            if [[ "$RELEASE_CHANNEL" == "latest" ]]; then
+              echo "${image}:latest"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push multi-architecture image
+        id: build-image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image-tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ needs.validate.outputs.release_tag }}
+            REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=cache-csi-driver
+          cache-to: type=gha,mode=max,scope=cache-csi-driver,ignore-error=true
+          provenance: false
+
+      - name: Attest node plugin image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository }}
+          subject-digest: ${{ steps.build-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Package and publish Helm chart
+        id: helm-chart
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          chart_version="${RELEASE_TAG#v}"
+          chart_dir="${GITHUB_WORKSPACE}/dist"
+          mkdir -p "$chart_dir"
+          helm package deploy/helm/cache-csi-driver \
+            --version "$chart_version" \
+            --app-version "$RELEASE_TAG" \
+            --destination "$chart_dir"
+
+          chart_package="${chart_dir}/cache-csi-driver-${chart_version}.tgz"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          push_output="$(helm push "$chart_package" "oci://${REGISTRY}/${owner}/charts")"
+          printf '%s\n' "$push_output"
+
+          chart_digest="$(sed -nE 's/^Digest: (sha256:[0-9a-f]{64})$/\1/p' <<< "$push_output" | tail -n 1)"
+          if [[ ! "$chart_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the Helm OCI chart digest" >&2
+            exit 1
+          fi
+
+          echo "package=${chart_package}" >> "$GITHUB_OUTPUT"
+          echo "name=${REGISTRY}/${owner}/charts/cache-csi-driver" >> "$GITHUB_OUTPUT"
+          echo "digest=${chart_digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest Helm OCI chart
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.helm-chart.outputs.name }}
+          subject-digest: ${{ steps.helm-chart.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest Helm chart archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.helm-chart.outputs.package }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.validate.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.release_channel == 'pre-release' }}
+          make_latest: ${{ inputs.release_channel == 'latest' }}
+          files: ${{ steps.helm-chart.outputs.package }}
+          fail_on_unmatched_files: true

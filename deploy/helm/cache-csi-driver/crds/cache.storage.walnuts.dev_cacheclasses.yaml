@@ -1,0 +1,150 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: cacheclasses.cache.storage.walnuts.dev
+spec:
+  group: cache.storage.walnuts.dev
+  scope: Cluster
+  names:
+    plural: cacheclasses
+    singular: cacheclass
+    kind: CacheClass
+    shortNames:
+      - cc
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Backend
+          type: string
+          jsonPath: .spec.backend
+        - name: MaxBytes
+          type: string
+          jsonPath: .spec.maxBytes
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: CacheClass defines a node-local cache policy used by CSI inline ephemeral volumes.
+          properties:
+            spec:
+              type: object
+              properties:
+                backend:
+                  type: string
+                  enum:
+                    - directory
+                    - xfs-project
+                  description: Storage backend used for cache generations.
+                maxBytes:
+                  x-kubernetes-int-or-string: true
+                  anyOf:
+                    - type: integer
+                    - type: string
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([eEinumkKMGTP]+)|(([KMGTPE]i)))?$
+                  description: Maximum total bytes retained for this cache class on a node.
+                retention:
+                  type: string
+                  description: Maximum age of an unused cache before it becomes eligible for garbage collection.
+                schemaVersion:
+                  type: string
+                  description: Application cache format version included in cache identity.
+                crashRecovery:
+                  type: string
+                  enum:
+                    - discard
+                    - reuse
+                  description: Policy for generations left active after an unclean node shutdown.
+                evictRunning:
+                  type: boolean
+                  description: Allows pressure garbage collection to signal consumers of active cache generations for eviction.
+                noExec:
+                  type: boolean
+                  description: Mounts cache generations with execution disabled.
+                pressure:
+                  type: object
+                  properties:
+                    highFreePercent:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 100
+                      description: Free-byte percentage at which pressure garbage collection begins.
+                    lowFreePercent:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 100
+                      description: Free-byte percentage at which pressure garbage collection stops.
+                    highInodeFreePercent:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 100
+                      description: Free-inode percentage at which pressure garbage collection begins.
+                    lowInodeFreePercent:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 100
+                      description: Free-inode percentage at which pressure garbage collection stops.
+                quota:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      description: Enables per-cache quota enforcement when supported by the selected backend.
+                    defaultMaxBytes:
+                      x-kubernetes-int-or-string: true
+                      anyOf:
+                        - type: integer
+                        - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([eEinumkKMGTP]+)|(([KMGTPE]i)))?$
+                      description: Default byte ceiling applied to each cache entry in this class.
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                  description: Generation of the CacheClass most recently observed by the driver.
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys:
+                    - type
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                        minLength: 1
+                        maxLength: 1024
+                      message:
+                        type: string
+                        maxLength: 32768
+      subresources:
+        status: {}

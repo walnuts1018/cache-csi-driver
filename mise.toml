@@ -1,0 +1,36 @@
+[tools]
+go = "1.27.1"
+helm = "4.2.4"
+
+[tasks.build]
+description = "Build the CSI node plugin"
+run = """
+set -euo pipefail
+mkdir -p dist
+go build -trimpath -o dist/cache-csi-node ./cmd/cache-csi-node
+"""
+
+[tasks.test]
+description = "Run Go tests"
+run = "go test ./..."
+
+[tasks.manifests]
+description = "Copy the authoritative CacheClass CRD into the Helm chart"
+run = "cp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml"
+
+[tasks."lint:chart"]
+description = "Lint and render the Helm chart"
+run = """
+set -euo pipefail
+helm lint deploy/helm/cache-csi-driver --kube-version 1.37.1
+helm template cache-csi-driver deploy/helm/cache-csi-driver --kube-version 1.37.1 > /dev/null
+"""
+
+[tasks."package:chart"]
+description = "Package the Helm chart into dist"
+depends = ["manifests"]
+run = """
+set -euo pipefail
+mkdir -p dist
+helm package deploy/helm/cache-csi-driver --destination dist
+"""
