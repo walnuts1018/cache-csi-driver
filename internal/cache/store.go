@@ -39,13 +39,22 @@ type StoreOptions struct {
 }
 
 type Lease struct {
-	ID        string `json:"id"`
-	Target    string `json:"target"`
-	Namespace string `json:"namespace"`
-	PodName   string `json:"podName"`
-	PodUID    string `json:"podUID"`
-	ReadOnly  bool   `json:"readOnly,omitempty"`
-	NoExec    bool   `json:"noExec,omitempty"`
+	ID         string `json:"id"`
+	Target     string `json:"target"`
+	Generation string `json:"generation,omitempty"`
+	Namespace  string `json:"namespace"`
+	PodName    string `json:"podName"`
+	PodUID     string `json:"podUID"`
+	ReadOnly   bool   `json:"readOnly,omitempty"`
+	NoExec     bool   `json:"noExec,omitempty"`
+}
+
+type RetiredGeneration struct {
+	Generation      string `json:"generation"`
+	ProjectID       uint32 `json:"projectID,omitempty"`
+	ProjectAssigned bool   `json:"projectAssigned,omitempty"`
+	QuotaBytes      int64  `json:"quotaBytes,omitempty"`
+	Policy          Policy `json:"policy"`
 }
 
 type Policy struct {
@@ -82,16 +91,17 @@ func (policy *Policy) UnmarshalJSON(data []byte) error {
 }
 
 type Metadata struct {
-	Identity        string    `json:"identity"`
-	Generation      string    `json:"generation"`
-	CreatedAt       time.Time `json:"createdAt"`
-	LastUsed        time.Time `json:"lastUsed"`
-	Leases          []Lease   `json:"leases,omitempty"`
-	Policy          Policy    `json:"policy"`
-	Dirty           bool      `json:"dirty"`
-	ProjectID       uint32    `json:"projectID,omitempty"`
-	ProjectAssigned bool      `json:"projectAssigned,omitempty"`
-	QuotaBytes      int64     `json:"quotaBytes,omitempty"`
+	Identity        string              `json:"identity"`
+	Generation      string              `json:"generation"`
+	CreatedAt       time.Time           `json:"createdAt"`
+	LastUsed        time.Time           `json:"lastUsed"`
+	Leases          []Lease             `json:"leases,omitempty"`
+	Policy          Policy              `json:"policy"`
+	Dirty           bool                `json:"dirty"`
+	ProjectID       uint32              `json:"projectID,omitempty"`
+	ProjectAssigned bool                `json:"projectAssigned,omitempty"`
+	QuotaBytes      int64               `json:"quotaBytes,omitempty"`
+	Retired         []RetiredGeneration `json:"retired,omitempty"`
 }
 
 type AcquireOptions struct {
@@ -317,6 +327,24 @@ func (s *Store) detachToTrash(path string) error {
 	return nil
 }
 
+func (s *Store) detachGenerationToTrash(path string, identity string, retired RetiredGeneration) error {
+	trashPath := filepath.Join(s.root, trashDirectoryName, uuid.NewV7().String())
+	if err := s.ensureDirectory(trashPath); err != nil {
+		return err
+	}
+	if err := s.rename(path, filepath.Join(trashPath, "generation")); err != nil {
+		_ = s.removeAll(trashPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if err := s.writeMetadata(trashPath, Metadata{Identity: identity, Generation: retired.Generation, ProjectID: retired.ProjectID, ProjectAssigned: retired.ProjectAssigned, QuotaBytes: retired.QuotaBytes, Policy: retired.Policy}); err != nil {
+		return err
+	}
+	return nil
+}
+
 func Identity(namespaceUID, cacheClass, cacheClassUID, cacheKey, schema string) (string, error) {
 	if namespaceUID == "" || cacheClass == "" || cacheClassUID == "" || cacheKey == "" {
 		return "", errors.New("namespace UID, cacheClass, cacheClass UID, and cacheKey are required")
@@ -355,10 +383,10 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 		if meta.Identity != options.Identity || meta.Generation == "" {
 			return "", false, errors.New("cache metadata identity is inconsistent")
 		}
-		if len(meta.Leases) > 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes) {
+		if s.activeLeaseCount(meta) > 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes) {
 			return "", false, ErrQuotaPolicyConflict
 		}
-		if len(meta.Leases) == 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
+		if len(meta.Retired) == 0 && s.activeLeaseCount(meta) == 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
 			if err := s.detachToTrash(entry); err != nil {
 				return "", false, fmt.Errorf("discard cache before generation transition: %w", err)
 			}
@@ -376,6 +404,9 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
 	generationPath := filepath.Join(entry, "generations", meta.Generation)
 	if statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
+		meta.Leases = slices.DeleteFunc(meta.Leases, func(lease Lease) bool {
+			return lease.Generation == "" || lease.Generation == meta.Generation
+		})
 		meta.Generation = uuid.NewV7().String()
 		meta.CreatedAt = time.Now().UTC()
 		meta.ProjectAssigned = false
@@ -386,7 +417,7 @@ func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metad
 		return "", false, fmt.Errorf("inspect cache generation: %w", statErr)
 	}
 	for _, lease := range meta.Leases {
-		if lease.ID == options.Lease.ID {
+		if lease.ID == options.Lease.ID && (lease.Generation == "" || lease.Generation == meta.Generation) {
 			if lease.Target != options.Lease.Target {
 				return "", false, errors.New("cache lease already exists for a different target")
 			}
@@ -401,6 +432,16 @@ func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metad
 	}
 	meta.Policy = options.Policy
 	return s.createLease(entry, options, meta)
+}
+
+func (s *Store) activeLeaseCount(meta Metadata) int {
+	count := 0
+	for _, lease := range meta.Leases {
+		if lease.Generation == "" || lease.Generation == meta.Generation {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *Store) createLease(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
@@ -418,6 +459,7 @@ func (s *Store) createLease(entry string, options AcquireOptions, meta Metadata)
 		}
 	}
 	meta.LastUsed = time.Now().UTC()
+	options.Lease.Generation = meta.Generation
 	meta.Leases = append(meta.Leases, options.Lease)
 	meta.Dirty = true
 	if err := s.writeMetadata(entry, meta); err != nil {
@@ -463,7 +505,18 @@ func (s *Store) LeaseDetails(leaseID string) (string, Lease, string, Policy, boo
 	}
 	for _, lease := range meta.Leases {
 		if lease.ID == leaseID {
-			return identity, lease, filepath.Join(s.root, identity, "generations", meta.Generation), meta.Policy, true, nil
+			generation := lease.Generation
+			if generation == "" {
+				generation = meta.Generation
+			}
+			policy := meta.Policy
+			for _, retired := range meta.Retired {
+				if retired.Generation == generation {
+					policy = retired.Policy
+					break
+				}
+			}
+			return identity, lease, filepath.Join(s.root, identity, "generations", generation), policy, true, nil
 		}
 	}
 	return "", Lease{}, "", Policy{}, false, nil
@@ -553,7 +606,7 @@ func (s *Store) projectIDLocked(identity string) (uint32, error) {
 		return 0, err
 	}
 	for _, current := range entries {
-		if !current.IsDir() || current.Name() == identity || current.Name() == trashDirectoryName {
+		if !current.IsDir() || current.Name() == trashDirectoryName {
 			continue
 		}
 		other, err := s.readMetadata(filepath.Join(s.root, current.Name()))
@@ -563,8 +616,13 @@ func (s *Store) projectIDLocked(identity string) (uint32, error) {
 		if err != nil {
 			return 0, fmt.Errorf("read cache metadata while allocating project ID: %w", err)
 		}
-		if other.ProjectID != 0 {
+		if current.Name() != identity && other.ProjectID != 0 {
 			used[other.ProjectID] = struct{}{}
+		}
+		for _, retired := range other.Retired {
+			if retired.ProjectID != 0 {
+				used[retired.ProjectID] = struct{}{}
+			}
 		}
 	}
 	trashEntries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
@@ -624,10 +682,36 @@ func (s *Store) Release(leaseID, target string) error {
 	if target != "" && !slices.ContainsFunc(meta.Leases, func(lease Lease) bool { return lease.ID == leaseID && lease.Target == target }) {
 		return errors.New("cache lease target does not match")
 	}
+	var generation string
+	for _, lease := range meta.Leases {
+		if lease.ID == leaseID {
+			generation = lease.Generation
+			if generation == "" {
+				generation = meta.Generation
+			}
+			break
+		}
+	}
 	meta.Leases = slices.DeleteFunc(meta.Leases, func(lease Lease) bool { return lease.ID == leaseID })
 	meta.LastUsed = time.Now().UTC()
-	meta.Dirty = len(meta.Leases) > 0
-	return s.writeMetadata(filepath.Join(s.root, identity), meta)
+	meta.Dirty = s.activeLeaseCount(meta) > 0
+	entry := filepath.Join(s.root, identity)
+	retiredIndex := slices.IndexFunc(meta.Retired, func(retired RetiredGeneration) bool { return retired.Generation == generation })
+	if retiredIndex >= 0 && !s.hasGenerationLeases(meta, generation) {
+		retired := meta.Retired[retiredIndex]
+		generationPath := filepath.Join(entry, "generations", generation)
+		if err := s.detachGenerationToTrash(generationPath, identity, retired); err != nil {
+			return fmt.Errorf("detach released cache generation: %w", err)
+		}
+		meta.Retired = slices.Delete(meta.Retired, retiredIndex, retiredIndex+1)
+	}
+	return s.writeMetadata(entry, meta)
+}
+
+func (s *Store) hasGenerationLeases(meta Metadata, generation string) bool {
+	return slices.ContainsFunc(meta.Leases, func(lease Lease) bool {
+		return lease.Generation == generation || lease.Generation == "" && generation == meta.Generation
+	})
 }
 
 func (s *Store) findLease(leaseID string) (string, Metadata, bool, error) {
@@ -726,8 +810,20 @@ func (s *Store) RecoverLeases(isMounted func(string) (bool, error)) error {
 			continue
 		}
 		meta.Leases = active
+		for index := 0; index < len(meta.Retired); {
+			retired := meta.Retired[index]
+			if slices.ContainsFunc(active, func(lease Lease) bool { return lease.Generation == retired.Generation }) {
+				index++
+				continue
+			}
+			if err := s.detachGenerationToTrash(filepath.Join(path, "generations", retired.Generation), entry.Name(), retired); err != nil {
+				return fmt.Errorf("detach retired cache generation without active leases: %w", err)
+			}
+			meta.Retired = slices.Delete(meta.Retired, index, index+1)
+		}
 		generationPath := filepath.Join(path, "generations", meta.Generation)
 		if statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
+			meta.Leases = slices.DeleteFunc(meta.Leases, func(lease Lease) bool { return lease.Generation == "" || lease.Generation == meta.Generation })
 			meta.Generation = uuid.NewV7().String()
 			meta.CreatedAt = time.Now().UTC()
 			meta.ProjectAssigned = false
@@ -853,23 +949,6 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 	}
 	var candidates []candidate
 	underPressure := s.updatePressure(fs)
-	if underPressure {
-		for _, entry := range entries {
-			if !entry.IsDir() || entry.Name() == trashDirectoryName {
-				continue
-			}
-			meta, err := s.readMetadata(filepath.Join(s.root, entry.Name()))
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			if err != nil {
-				return nil, fmt.Errorf("read cache metadata while checking pressure victims: %w", err)
-			}
-			if len(meta.Leases) == 0 {
-				return nil, nil
-			}
-		}
-	}
 	for _, entry := range entries {
 		if !entry.IsDir() || entry.Name() == trashDirectoryName {
 			continue
@@ -881,18 +960,71 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read cache metadata while listing pressure victims: %w", err)
 		}
-		if meta.Policy.EvictRunning && len(meta.Leases) > 0 {
+		if meta.Policy.EvictRunning && s.activeLeaseCount(meta) > 0 {
 			candidates = append(candidates, candidate{meta, filepath.Join(s.root, entry.Name())})
 		}
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].meta.LastUsed.Before(candidates[j].meta.LastUsed) })
 	if underPressure {
 		for _, candidate := range candidates {
-			if !candidate.meta.Policy.EvictRunning {
+			leases := make([]Lease, 0, len(candidate.meta.Leases))
+			for index := range candidate.meta.Leases {
+				if candidate.meta.Leases[index].Generation == "" || candidate.meta.Leases[index].Generation == candidate.meta.Generation {
+					candidate.meta.Leases[index].Generation = candidate.meta.Generation
+					leases = append(leases, candidate.meta.Leases[index])
+				}
+			}
+			if len(leases) == 0 {
 				continue
 			}
-			leases := slices.Clone(candidate.meta.Leases)
+			candidate.meta.Retired = append(candidate.meta.Retired, RetiredGeneration{
+				Generation:      candidate.meta.Generation,
+				ProjectID:       candidate.meta.ProjectID,
+				ProjectAssigned: candidate.meta.ProjectAssigned,
+				QuotaBytes:      candidate.meta.QuotaBytes,
+				Policy:          candidate.meta.Policy,
+			})
+			candidate.meta.Generation = uuid.NewV7().String()
+			candidate.meta.CreatedAt = time.Now().UTC()
+			replacementPath := filepath.Join(candidate.path, "generations", candidate.meta.Generation)
+			if err := s.ensureDirectory(replacementPath); err != nil {
+				return nil, fmt.Errorf("create replacement cache generation before Pod eviction: %w", err)
+			}
+			candidate.meta.ProjectID = 0
+			candidate.meta.ProjectAssigned = false
+			candidate.meta.QuotaBytes = 0
+			candidate.meta.Dirty = false
+			if err := s.writeMetadata(candidate.path, candidate.meta); err != nil {
+				_ = s.detachToTrash(replacementPath)
+				return nil, fmt.Errorf("retire cache generation before Pod eviction: %w", err)
+			}
 			return leases, nil
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || entry.Name() == trashDirectoryName {
+				continue
+			}
+			meta, err := s.readMetadata(filepath.Join(s.root, entry.Name()))
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return nil, fmt.Errorf("read cache metadata while listing retired pressure victims: %w", err)
+			}
+			for _, retired := range meta.Retired {
+				if !retired.Policy.EvictRunning {
+					continue
+				}
+				leases := make([]Lease, 0)
+				for _, lease := range meta.Leases {
+					if lease.Generation == retired.Generation {
+						leases = append(leases, lease)
+					}
+				}
+				if len(leases) > 0 {
+					return leases, nil
+				}
+			}
 		}
 	}
 	return nil, nil
