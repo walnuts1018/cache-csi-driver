@@ -57,8 +57,8 @@ func TestNodePublishIsIdempotentForAnExistingMatchingMount(t *testing.T) {
 	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
 		t.Fatalf("idempotent publish: %v", err)
 	}
-	if mounts.bindCalls != 1 {
-		t.Fatalf("bind mount calls = %d, want 1", mounts.bindCalls)
+	if mounts.mountCalls != 1 {
+		t.Fatalf("mount calls = %d, want 1", mounts.mountCalls)
 	}
 	if _, _, _, _, found, err := store.LeaseDetails(request.GetVolumeId()); err != nil || !found {
 		t.Fatalf("cache lease found = %t, error = %v; want an active lease", found, err)
@@ -69,6 +69,22 @@ func TestNodePublishIsIdempotentForAnExistingMatchingMount(t *testing.T) {
 	request.Readonly = true
 	if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("publish with a changed readonly flag error = %v, want AlreadyExists", err)
+	}
+}
+
+func TestNodePublishPassesReadonlyAndNoExecMountOptions(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{NoExec: true}, nil)
+	request := newPublishRequest(t, server.options.KubeletRoot, "restricted-volume")
+	request.Readonly = true
+
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	state, mounted := mounts.mounts[request.GetTargetPath()]
+	if !mounted || !state.readOnly || !state.noExec {
+		t.Fatalf("published mount = %+v, present=%t; want readonly and noexec", state, mounted)
 	}
 }
 
@@ -93,28 +109,27 @@ func TestNodePublishRollsBackLeaseWhenQuotaConfigurationFails(t *testing.T) {
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(request.GetVolumeId()); leaseErr != nil || found {
 		t.Fatalf("cache lease found = %t, error = %v; want the failed lease rolled back", found, leaseErr)
 	}
-	if mounts.bindCalls != 0 {
-		t.Fatalf("bind mount calls = %d, want 0 after quota failure", mounts.bindCalls)
+	if mounts.mountCalls != 0 {
+		t.Fatalf("mount calls = %d, want 0 after quota failure", mounts.mountCalls)
 	}
 }
 
-func TestNodePublishRetainsLeaseWhenFailedMountCannotBeUndone(t *testing.T) {
+func TestNodePublishRollsBackLeaseWhenDetachedMountSetupFails(t *testing.T) {
 	t.Parallel()
 
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 	request := newPublishRequest(t, server.options.KubeletRoot, "mount-cleanup-volume")
-	mounts.remountErr = errors.New("mount options failed")
-	mounts.unmountErr = errors.New("unmount failed")
+	mounts.mountErr = errors.New("mount attributes failed")
 
 	_, err := server.NodePublishVolume(t.Context(), request)
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("publish error = %v, want Internal", err)
 	}
-	if _, _, _, _, found, leaseErr := store.LeaseDetails(request.GetVolumeId()); leaseErr != nil || !found {
-		t.Fatalf("cache lease found = %t, error = %v; want lease retained for an active mount", found, leaseErr)
+	if _, _, _, _, found, leaseErr := store.LeaseDetails(request.GetVolumeId()); leaseErr != nil || found {
+		t.Fatalf("cache lease found = %t, error = %v; want lease rollback before mount attachment", found, leaseErr)
 	}
-	if _, mounted := mounts.mounts[request.GetTargetPath()]; !mounted {
-		t.Fatal("fake mount should remain after unmount failure")
+	if _, mounted := mounts.mounts[request.GetTargetPath()]; mounted {
+		t.Fatal("mount should not be attached when detached mount setup fails")
 	}
 }
 
@@ -154,8 +169,8 @@ func TestNodePublishRejectsForeignMount(t *testing.T) {
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("publish error = %v, want AlreadyExists", err)
 	}
-	if mounts.bindCalls != 0 {
-		t.Fatalf("bind mount calls = %d, want 0", mounts.bindCalls)
+	if mounts.mountCalls != 0 {
+		t.Fatalf("mount calls = %d, want 0", mounts.mountCalls)
 	}
 }
 
@@ -507,9 +522,9 @@ type mountVerification struct {
 
 type testMounter struct {
 	mounts                   map[string]testMount
-	bindCalls                int
+	mountCalls               int
 	unmountCalls             int
-	remountErr               error
+	mountErr                 error
 	unmountErr               error
 	lastVerification         mountVerification
 	sourceMountedCalls       int
@@ -604,23 +619,12 @@ func prepareDamagedMountedCache(t *testing.T, server *Server, mounts *testMounte
 	return &csi.NodeUnpublishVolumeRequest{VolumeId: request.GetVolumeId(), TargetPath: request.GetTargetPath()}, identity, source
 }
 
-func (mounts *testMounter) bindMount(source, target string) error {
-	mounts.bindCalls++
-	mounts.mounts[target] = testMount{source: source}
-	return nil
-}
-
-func (mounts *testMounter) remountOptions(target string, readOnly, noExec bool) error {
-	if mounts.remountErr != nil {
-		return mounts.remountErr
+func (mounts *testMounter) mount(source, target string, readOnly, noExec bool) error {
+	mounts.mountCalls++
+	if mounts.mountErr != nil {
+		return mounts.mountErr
 	}
-	state, found := mounts.mounts[target]
-	if !found {
-		return errNotMounted
-	}
-	state.readOnly = readOnly
-	state.noExec = noExec
-	mounts.mounts[target] = state
+	mounts.mounts[target] = testMount{source: source, readOnly: readOnly, noExec: noExec}
 	return nil
 }
 

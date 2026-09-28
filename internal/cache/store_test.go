@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -370,6 +371,7 @@ func TestRecoverLeasesQuarantinesDamagedObjectOnlyWhenUnmounted(t *testing.T) {
 					t.Error(err)
 				}
 			})
+			trashGate := gateTrashRemoval(t, store)
 			identity := stableIdentity("damaged-" + test.name)
 			generationPath, _, err := store.Acquire(AcquireOptions{
 				Identity: identity,
@@ -407,23 +409,7 @@ func TestRecoverLeasesQuarantinesDamagedObjectOnlyWhenUnmounted(t *testing.T) {
 				if _, err := os.Stat(entry); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("unmounted damaged object was not detached: %v", err)
 				}
-				otherIdentity := stableIdentity("quota-during-quarantine")
-				if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
-					t.Fatal(err)
-				}
-				if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
-					t.Fatal("project ID was reused before trash deletion")
-				}
-				if err := store.CleanupTrash(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-				newProjectID, _, _, err := store.QuotaState(otherIdentity, 1024)
-				if err != nil {
-					t.Fatalf("project ID was not released after physical deletion: %v", err)
-				}
-				if newProjectID != projectID {
-					t.Fatalf("reallocated project ID = %d, want released ID %d", newProjectID, projectID)
-				}
+				assertProjectIDReservedUntilTrashRemoval(t, store, "quota-during-quarantine", projectID, trashGate)
 			} else {
 				if _, err := os.Stat(entry); err != nil {
 					t.Fatalf("uncertain or active damaged object was removed: %v", err)
@@ -474,6 +460,7 @@ func testMissingMetadataRecovery(t *testing.T, name string, mounted, inspectErr 
 			t.Error(err)
 		}
 	})
+	trashGate := gateTrashRemoval(t, store)
 	identity := stableIdentity("missing-metadata-" + name)
 	target := filepath.Join(t.TempDir(), "target")
 	policy := Policy{QuotaEnabled: true, MaxBytes: 1024}
@@ -498,7 +485,7 @@ func testMissingMetadataRecovery(t *testing.T, name string, mounted, inspectErr 
 	if mounted || inspectErr {
 		assertDegradedObjectRetained(t, store, identity, source, target, mounted, inspectErr)
 	}
-	assertMissingMetadataQuarantined(t, store, root, identity, name, projectID)
+	assertMissingMetadataQuarantined(t, store, root, identity, name, projectID, trashGate)
 }
 
 func missingMetadataVerifier(t *testing.T, source string, mounted, inspectErr bool) (func(string, Lease, Policy) (bool, error), *int) {
@@ -552,19 +539,60 @@ func assertDegradedObjectRetained(t *testing.T, store *Store, identity, source, 
 	}
 }
 
-func assertMissingMetadataQuarantined(t *testing.T, store *Store, root, identity, name string, projectID uint32) {
+func assertMissingMetadataQuarantined(t *testing.T, store *Store, root, identity, name string, projectID uint32, trashGate *trashRemovalGate) {
 	t.Helper()
 	if _, err := os.Stat(filepath.Join(root, identity)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("fully unmounted object was not quarantined: %v", err)
 	}
-	otherIdentity := stableIdentity("missing-metadata-reservation-" + name)
+	assertProjectIDReservedUntilTrashRemoval(t, store, "missing-metadata-reservation-"+name, projectID, trashGate)
+}
+
+type trashRemovalGate struct {
+	started     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func (gate *trashRemovalGate) unblock() {
+	gate.releaseOnce.Do(func() { close(gate.release) })
+}
+
+func gateTrashRemoval(t *testing.T, store *Store) *trashRemovalGate {
+	t.Helper()
+	if err := store.CleanupTrash(t.Context()); err != nil {
+		t.Fatalf("wait for initial trash cleanup: %v", err)
+	}
+	gate := &trashRemovalGate{started: make(chan struct{}, 1), release: make(chan struct{})}
+	t.Cleanup(gate.unblock)
+	store.removeTrashEntry = func(path string) error {
+		select {
+		case gate.started <- struct{}{}:
+		default:
+		}
+		<-gate.release
+		return store.removeAll(path)
+	}
+	return gate
+}
+
+func assertProjectIDReservedUntilTrashRemoval(t *testing.T, store *Store, otherName string, projectID uint32, gate *trashRemovalGate) {
+	t.Helper()
+	otherIdentity := stableIdentity(otherName)
 	if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
-		t.Fatal("project ID was reused before physical deletion")
+	cleanupDone := make(chan error, 1)
+	go func() { cleanupDone <- store.CleanupTrash(t.Context()) }()
+	select {
+	case <-gate.started:
+	case <-t.Context().Done():
+		t.Fatal("trash cleanup did not reach physical deletion")
 	}
-	if err := store.CleanupTrash(t.Context()); err != nil {
+	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
+		t.Fatal("project ID was reused before physical deletion completed")
+	}
+	gate.unblock()
+	if err := <-cleanupDone; err != nil {
 		t.Fatal(err)
 	}
 	allocated, _, _, err := store.QuotaState(otherIdentity, 1024)
