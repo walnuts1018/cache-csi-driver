@@ -31,7 +31,7 @@ func remountOptions(target string, readOnly, noExec bool) error {
 func unmount(target string) error { return unix.Unmount(target, 0) }
 
 func mountedAt(target string) (bool, error) {
-	mount, found, err := readMountInfo(target)
+	_, found, err := readMountInfo(target)
 	return found, err
 }
 
