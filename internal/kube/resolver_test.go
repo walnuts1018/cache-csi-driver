@@ -12,6 +12,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+const testCacheClassesResource = "cacheclasses"
+
 func TestIsTemporaryAPIError(t *testing.T) {
 	t.Parallel()
 
@@ -27,11 +29,11 @@ func TestIsTemporaryAPIError(t *testing.T) {
 		{name: "API connection refused", err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, want: true},
 		{name: "deadline exceeded", err: context.DeadlineExceeded, want: true},
 		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
-		{name: "not found", err: apierrors.NewNotFound(schema.GroupResource{Resource: "cacheclasses"}, "missing"), want: false},
-		{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Resource: "cacheclasses"}, "restricted", errors.New("access denied")), want: false},
+		{name: "not found", err: apierrors.NewNotFound(schema.GroupResource{Resource: testCacheClassesResource}, "missing"), want: false},
+		{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Resource: testCacheClassesResource}, "restricted", errors.New("access denied")), want: false},
 		{name: "request canceled", err: context.Canceled, want: false},
 		{name: "DNS name not found", err: &net.DNSError{IsNotFound: true, Err: "no such host"}, want: false},
-		{name: "unknown API status", err: apierrors.NewGenericServerResponse(499, "get", schema.GroupResource{Resource: "cacheclasses"}, "", "client closed request", 0, false), want: false},
+		{name: "unknown API status", err: apierrors.NewGenericServerResponse(499, "get", schema.GroupResource{Resource: testCacheClassesResource}, "", "client closed request", 0, false), want: false},
 		{name: "unrelated Kubernetes status", err: apierrors.NewBadRequest("invalid request"), want: false},
 		{name: "ordinary error", err: errors.New("invalid CacheClass configuration"), want: false},
 	}

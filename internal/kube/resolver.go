@@ -27,8 +27,8 @@ func IsTemporaryAPIError(err error) bool {
 	if err == nil {
 		return false
 	}
-	switch apierrors.ReasonForError(err) {
-	case metav1.StatusReasonTimeout, metav1.StatusReasonServerTimeout, metav1.StatusReasonServiceUnavailable, metav1.StatusReasonTooManyRequests, metav1.StatusReasonInternalError:
+	reason := apierrors.ReasonForError(err)
+	if reason == metav1.StatusReasonTimeout || reason == metav1.StatusReasonServerTimeout || reason == metav1.StatusReasonServiceUnavailable || reason == metav1.StatusReasonTooManyRequests || reason == metav1.StatusReasonInternalError {
 		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {

@@ -511,16 +511,20 @@ func unhealthyVolume(volumeID, reason, message string) *csi.VolumeHealth {
 
 func (s *Server) NodeGetStorageHealth(context.Context, *csi.NodeGetStorageHealthRequest) (*csi.NodeGetStorageHealthResponse, error) {
 	if err := s.store.MetadataError(); err != nil {
-		return &csi.NodeGetStorageHealthResponse{BackendHealth: []*csi.NodeGetStorageHealthResponse_StorageBackendHealth{{Status: csi.StorageHealthErrorType_STORAGE_DEGRADED, Reason: "CacheMetadataUnreadable", Message: "one or more cache metadata records cannot be read"}}}, nil
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheMetadataUnreadable", "one or more cache metadata records cannot be read")
 	}
 	readOnly, err := filesystemReadOnly(s.store.Root())
 	if err != nil {
-		return &csi.NodeGetStorageHealthResponse{BackendHealth: []*csi.NodeGetStorageHealthResponse_StorageBackendHealth{{Status: csi.StorageHealthErrorType_STORAGE_UNREACHABLE, Reason: "CacheRootUnavailable", Message: "cache root filesystem cannot be inspected"}}}, nil
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, "CacheRootUnavailable", "cache root filesystem cannot be inspected")
 	}
 	if readOnly {
-		return &csi.NodeGetStorageHealthResponse{BackendHealth: []*csi.NodeGetStorageHealthResponse_StorageBackendHealth{{Status: csi.StorageHealthErrorType_STORAGE_DEGRADED, Reason: "CacheRootReadOnly", Message: "cache root filesystem is read-only"}}}, nil
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheRootReadOnly", "cache root filesystem is read-only")
 	}
 	return &csi.NodeGetStorageHealthResponse{}, nil
+}
+
+func storageHealthResponse(status csi.StorageHealthErrorType, reason, message string) (*csi.NodeGetStorageHealthResponse, error) {
+	return &csi.NodeGetStorageHealthResponse{BackendHealth: []*csi.NodeGetStorageHealthResponse_StorageBackendHealth{{Status: status, Reason: reason, Message: message}}}, nil
 }
 
 func (s *Server) validateTarget(target string) error {
