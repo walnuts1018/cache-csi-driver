@@ -1,0 +1,13 @@
+apiVersion: cache.storage.walnuts.dev/v1alpha1
+kind: CacheClass
+metadata:
+  name: xfs-project
+spec:
+  backend: xfs-project
+  maxBytes: 64Gi
+  retention: 72h
+  schemaVersion: v1
+  crashRecovery: discard
+  quota:
+    enabled: true
+    defaultMaxBytes: 16Gi

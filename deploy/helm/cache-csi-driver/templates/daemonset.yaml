@@ -1,0 +1,166 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "cache-csi-driver.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "cache-csi-driver.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cache-csi-driver.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "cache-csi-driver.serviceAccountName" . }}
+      priorityClassName: {{ .Values.priorityClassName | quote }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: cache-csi-node
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" (.Chart.AppVersion | trimPrefix "v")) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --cache-root={{ .Values.cacheRootDir }}
+            - --fallback-root={{ .Values.fallbackRootDir }}
+            - --node-id=$(NODE_NAME)
+            - --kubelet-root={{ .Values.kubeletRootDir }}
+            - --gc-interval={{ .Values.gcInterval }}
+            - --pressure-high-free-percent={{ .Values.pressure.highFreePercent }}
+            - --pressure-low-free-percent={{ .Values.pressure.lowFreePercent }}
+            - --pressure-high-inode-free-percent={{ .Values.pressure.highInodeFreePercent }}
+            - --pressure-low-inode-free-percent={{ .Values.pressure.lowInodeFreePercent }}
+            - --project-id-start={{ .Values.projectIDRange.start | int64 }}
+            - --project-id-count={{ .Values.projectIDRange.count | int64 }}
+            {{- with .Values.driver.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: true
+          resources:
+            {{- toYaml .Values.driver.resources | nindent 12 }}
+          ports:
+            - name: liveness
+              containerPort: 9808
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: liveness
+            initialDelaySeconds: {{ .Values.driver.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.driver.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.driver.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.driver.livenessProbe.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: liveness
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: csi-socket-dir
+              mountPath: /csi
+              mountPropagation: Bidirectional
+            - name: kubelet-root
+              mountPath: {{ .Values.kubeletRootDir }}
+              mountPropagation: Bidirectional
+            - name: cache-root
+              mountPath: {{ .Values.cacheRootDir }}
+            - name: fallback-root
+              mountPath: {{ .Values.fallbackRootDir }}
+        - name: csi-node-driver-registrar
+          image: "{{ .Values.registrar.image.repository }}:{{ .Values.registrar.image.tag }}"
+          imagePullPolicy: {{ .Values.registrar.image.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.kubeletRootDir }}/plugins/{{ .Values.driverName }}/csi.sock
+            - --health-port=9809
+            - --v=2
+          resources:
+            {{- toYaml .Values.registrar.resources | nindent 12 }}
+          ports:
+            - name: registrar
+              containerPort: 9809
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: registrar
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: csi-socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: liveness-probe
+          image: "{{ .Values.livenessProbe.image.repository }}:{{ .Values.livenessProbe.image.tag }}"
+          imagePullPolicy: {{ .Values.livenessProbe.image.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --http-endpoint=:9808
+          resources:
+            {{- toYaml .Values.livenessProbe.resources | nindent 12 }}
+          ports:
+            - name: healthz
+              containerPort: 9808
+              protocol: TCP
+          volumeMounts:
+            - name: csi-socket-dir
+              mountPath: /csi
+      volumes:
+        - name: csi-socket-dir
+          hostPath:
+            path: {{ .Values.kubeletRootDir }}/plugins/{{ .Values.driverName }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.kubeletRootDir }}/plugins_registry
+            type: DirectoryOrCreate
+        - name: kubelet-root
+          hostPath:
+            path: {{ .Values.kubeletRootDir }}
+            type: Directory
+        - name: cache-root
+          hostPath:
+            path: {{ .Values.cacheRootDir }}
+            type: DirectoryOrCreate
+        - name: fallback-root
+          hostPath:
+            path: {{ .Values.fallbackRootDir }}
+            type: DirectoryOrCreate
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

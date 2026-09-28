@@ -1,0 +1,47 @@
+[tools]
+go = "1.27.1"
+golangci-lint = "2.14.0"
+helm = "4.3.0"
+"go:sigs.k8s.io/controller-tools/cmd/controller-gen" = "v0.22.0"
+
+[tasks.build]
+description = "Build the CSI node plugin"
+run = """
+set -euo pipefail
+mkdir -p dist
+go build -trimpath -o dist/cache-csi-node ./cmd/cache-csi-node
+"""
+
+[tasks.test]
+description = "Run Go tests"
+run = "go test ./..."
+
+[tasks.manifests]
+description = "Generate CacheClass API code and CRD manifests"
+run = """
+set -euo pipefail
+controller-gen crd:crdVersions=v1 paths=./api/v1alpha1 output:crd:artifacts:config=config/crd/bases
+controller-gen object paths=./api/v1alpha1
+cp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml
+"""
+
+[tasks."lint:go"]
+description = "lint the Go code"
+run = "golangci-lint run"
+
+[tasks."lint:chart"]
+description = "Lint and render the Helm chart"
+run = """
+set -euo pipefail
+helm lint deploy/helm/cache-csi-driver --kube-version 1.37.1
+helm template cache-csi-driver deploy/helm/cache-csi-driver --kube-version 1.37.1 > /dev/null
+"""
+
+[tasks."package:chart"]
+description = "Package the Helm chart into dist"
+depends = ["manifests"]
+run = """
+set -euo pipefail
+mkdir -p dist
+helm package deploy/helm/cache-csi-driver --destination dist
+"""

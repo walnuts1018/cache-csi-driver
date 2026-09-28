@@ -1,0 +1,9 @@
+apiVersion: cache.storage.walnuts.dev/v1alpha1
+kind: CacheClass
+metadata:
+  name: default
+spec:
+  backend: directory
+  retention: 72h
+  schemaVersion: v1
+  crashRecovery: discard

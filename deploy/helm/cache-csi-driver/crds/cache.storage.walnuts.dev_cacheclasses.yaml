@@ -1,0 +1,168 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: cacheclasses.cache.storage.walnuts.dev
+spec:
+  group: cache.storage.walnuts.dev
+  names:
+    kind: CacheClass
+    listKind: CacheClassList
+    plural: cacheclasses
+    shortNames:
+    - cc
+    singular: cacheclass
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.backend
+      name: Backend
+      type: string
+    - jsonPath: .spec.maxBytes
+      name: MaxBytes
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: CacheClass is the schema for cacheclasses.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: CacheClassSpec defines storage and reuse behavior for node-local
+              cache generations.
+            properties:
+              backend:
+                default: directory
+                description: Storage backend used for cache generations.
+                enum:
+                - directory
+                - xfs-project
+                type: string
+              crashRecovery:
+                default: discard
+                description: Policy for generations left active after an unclean node
+                  shutdown.
+                enum:
+                - discard
+                - reuse
+                type: string
+              evictRunning:
+                description: Allows best-effort pressure handling to request graceful
+                  eviction of Pods using active cache generations. Eviction requests
+                  respect PodDisruptionBudgets and do not guarantee cache reclamation.
+                type: boolean
+              maxBytes:
+                anyOf:
+                - type: integer
+                - type: string
+                description: Maximum per-cache quota ceiling for volume-level maxBytes
+                  requests in this class. Requires quota.enabled and the xfs-project
+                  backend; requests above this limit are rejected.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                type: string
+                x-kubernetes-int-or-string: true
+              noExec:
+                description: Mounts cache generations with execution disabled.
+                type: boolean
+              quota:
+                description: Quota configuration for cache generations.
+                properties:
+                  defaultMaxBytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: Per-cache hard limit used when the CSI volume context
+                      omits maxBytes. If maxBytes is set, this default must not exceed
+                      the class ceiling.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    type: string
+                    x-kubernetes-int-or-string: true
+                  enabled:
+                    description: Enables XFS project quota enforcement for each cache
+                      identity. Requires the xfs-project backend and a per-cache limit
+                      in maxBytes or defaultMaxBytes.
+                    type: boolean
+                type: object
+              retention:
+                default: 72h
+                description: Maximum age of an unused cache before it becomes eligible
+                  for garbage collection.
+                type: string
+                x-kubernetes-validations:
+                - message: retention must not be negative
+                  rule: duration(self) >= duration('0s')
+              schemaVersion:
+                default: v1
+                description: Application cache format version included in cache identity.
+                type: string
+                x-kubernetes-validations:
+                - message: schemaVersion contains an invalid character
+                  rule: '!self.contains(''/'') && !self.contains(''\\'') && !self.contains(''\u0000'')'
+              sharingPolicy:
+                default: Shared
+                description: SharingPolicy describes concurrent access to a cache
+                  generation. Shared is safe only when the cache implementation supports
+                  concurrent multi-process access and all Pods using the same cacheKey
+                  coordinate writes. Pods must use compatible effective UID and GID
+                  values because existing file modes can prevent a Pod with different
+                  credentials from writing reused data.
+                enum:
+                - Shared
+                - Exclusive
+                type: string
+            type: object
+            x-kubernetes-validations:
+            - message: quota requires the xfs-project backend
+              rule: '!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled
+                || (has(self.backend) && self.backend == ''xfs-project'')'
+            - message: xfs-project backend requires quota to be enabled
+              rule: '!has(self.backend) || self.backend != ''xfs-project'' || (has(self.quota)
+                && has(self.quota.enabled) && self.quota.enabled)'
+            - message: maxBytes must not be negative
+              rule: '!has(self.maxBytes) || !quantity(string(self.maxBytes)).isLessThan(quantity(''0''))'
+            - message: quota.defaultMaxBytes must not be negative
+              rule: '!has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isLessThan(quantity(''0''))'
+            - message: maxBytes requires quota to be enabled with the xfs-project
+                backend
+              rule: '!has(self.maxBytes) || !quantity(string(self.maxBytes)).isGreaterThan(quantity(''0''))
+                || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled
+                && has(self.backend) && self.backend == ''xfs-project'')'
+            - message: quota.defaultMaxBytes requires quota to be enabled with the
+                xfs-project backend
+              rule: '!has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(''0''))
+                || (has(self.quota.enabled) && self.quota.enabled && has(self.backend)
+                && self.backend == ''xfs-project'')'
+            - message: quota requires maxBytes or quota.defaultMaxBytes
+              rule: '!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled
+                || ((has(self.maxBytes) && quantity(string(self.maxBytes)).isGreaterThan(quantity(''0'')))
+                || (has(self.quota.defaultMaxBytes) && quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(''0''))))'
+            - message: quota.defaultMaxBytes must not exceed maxBytes
+              rule: '!has(self.maxBytes) || !quantity(string(self.maxBytes)).isGreaterThan(quantity(''0''))
+                || !has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))'
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}

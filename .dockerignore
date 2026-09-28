@@ -1,0 +1,10 @@
+.git
+.github
+.vscode
+.cache
+bin
+coverage.out
+dist
+*.tgz
+AGENTS.md
+plan.md

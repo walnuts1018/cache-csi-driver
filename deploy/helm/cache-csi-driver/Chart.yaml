@@ -1,0 +1,12 @@
+apiVersion: v2
+name: cache-csi-driver
+description: Node-local cache CSI driver for inline ephemeral volumes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.37.0-0"
+home: https://github.com/walnuts1018/cache-csi-driver
+sources:
+  - https://github.com/walnuts1018/cache-csi-driver
+maintainers:
+  - name: walnuts1018

@@ -1,0 +1,43 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ printf "%s-cacheclass-reader" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - cache.storage.walnuts.dev
+    resources:
+      - cacheclasses
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+    verbs:
+      - get
+  {{- if .Values.rbac.createPodEvictions }}
+  - apiGroups:
+      - ""
+    resources:
+      - pods/eviction
+    verbs:
+      - create
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ printf "%s-cacheclass-reader" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ printf "%s-cacheclass-reader" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cache-csi-driver.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
