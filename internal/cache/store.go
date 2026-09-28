@@ -26,6 +26,8 @@ type Lease struct {
 	Namespace string `json:"namespace"`
 	PodName   string `json:"podName"`
 	PodUID    string `json:"podUID"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
+	NoExec    bool   `json:"noExec,omitempty"`
 }
 
 type Policy struct {
@@ -142,8 +144,11 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 		meta.Policy = options.Policy
 	}
 	generationPath := filepath.Join(entry, "generations", meta.Generation)
-	if err := os.MkdirAll(generationPath, 0o770); err != nil {
+	if err := os.MkdirAll(generationPath, 0o777); err != nil {
 		return "", false, fmt.Errorf("create cache generation: %w", err)
+	}
+	if err := os.Chmod(generationPath, 0o777); err != nil {
+		return "", false, fmt.Errorf("set cache generation permissions: %w", err)
 	}
 	meta.LastUsed = time.Now().UTC()
 	meta.Leases = append(meta.Leases, options.Lease)

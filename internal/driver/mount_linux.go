@@ -42,6 +42,21 @@ func sameCacheMount(source, target string, readOnly, noExec bool) (bool, error) 
 	if mount.readOnly != readOnly || mount.noExec != noExec || !mount.nodev || !mount.nosuid {
 		return false, nil
 	}
+	return sameMountedSource(source, target)
+}
+
+func sameCacheSource(source, target string) (bool, error) {
+	mount, mounted, err := readMountInfo(target)
+	if err != nil || !mounted {
+		return false, err
+	}
+	if !mount.nodev || !mount.nosuid {
+		return false, nil
+	}
+	return sameMountedSource(source, target)
+}
+
+func sameMountedSource(source, target string) (bool, error) {
 	sourceInfo, err := os.Stat(source)
 	if err != nil {
 		return false, err

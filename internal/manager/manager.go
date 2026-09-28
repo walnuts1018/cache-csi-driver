@@ -3,23 +3,25 @@ package manager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
-	"github.com/walnuts1018/cache-csi-driver/internal/cache"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 )
 
 type MountInspector func(string) (bool, error)
 
 type Options struct {
-	Interval      time.Duration
-	Client        kubernetes.Interface
-	InspectMount  MountInspector
-	Logger        *slog.Logger
+	Interval     time.Duration
+	Client       kubernetes.Interface
+	InspectMount MountInspector
+	Logger       *slog.Logger
 }
 
 type Manager struct {
@@ -51,7 +53,7 @@ func (m *Manager) Recover() error {
 		return errors.New("mount inspector is not configured")
 	}
 	if err := m.store.RecoverLeases(m.inspectMount); err != nil {
-		return errors.New("recover cache leases: " + err.Error())
+		return fmt.Errorf("recover cache leases: %w", err)
 	}
 	return nil
 }

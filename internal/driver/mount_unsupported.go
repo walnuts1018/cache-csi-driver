@@ -15,6 +15,9 @@ func mountedAt(string) (bool, error)          { return false, errors.New("mount 
 func sameCacheMount(string, string, bool, bool) (bool, error) {
 	return false, errors.New("mount inspection requires Linux")
 }
+func sameCacheSource(string, string) (bool, error) {
+	return false, errors.New("mount inspection requires Linux")
+}
 func filesystemReadOnly(string) (bool, error) {
 	return false, errors.New("filesystem inspection requires Linux")
 }

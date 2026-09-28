@@ -24,6 +24,9 @@ func (spec CacheClassSpec) Validate() error {
 	if spec.Backend == "xfs-project" && !spec.Quota.Enabled {
 		return fmt.Errorf("xfs-project backend requires quota to be enabled")
 	}
+	if !spec.Quota.Enabled && !spec.MaxBytes.IsZero() {
+		return fmt.Errorf("maxBytes requires quota to be enabled")
+	}
 	if spec.Quota.Enabled && spec.MaxBytes.IsZero() && spec.Quota.DefaultMaxBytes.IsZero() {
 		return fmt.Errorf("quota requires maxBytes or quota.defaultMaxBytes")
 	}

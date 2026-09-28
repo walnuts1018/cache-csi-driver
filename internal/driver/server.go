@@ -173,7 +173,7 @@ func (s *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			}
 		}
 	}
-	lease := cache.Lease{ID: req.GetVolumeId(), Target: req.GetTargetPath(), Namespace: podNamespace, PodName: podName, PodUID: podUID}
+	lease := cache.Lease{ID: req.GetVolumeId(), Target: req.GetTargetPath(), Namespace: podNamespace, PodName: podName, PodUID: podUID, ReadOnly: req.GetReadonly(), NoExec: policy.NoExec}
 	if err := s.publishNewCache(ctx, req, identity, lease, policy); err != nil {
 		_ = s.store.Release(req.GetVolumeId(), req.GetTargetPath())
 		if fallbackErr := s.publishFallback(req); fallbackErr == nil {
@@ -232,12 +232,7 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 		policy.HighInodeFreePercent = defaultHighInodePercent
 		policy.LowInodeFreePercent = defaultLowInodePercent
 	}
-	if spec.MaxBytes.Sign() > 0 {
-		policy.MaxBytes = spec.MaxBytes.Value()
-	}
-	if spec.Quota.DefaultMaxBytes.Sign() > 0 && policy.MaxBytes == 0 {
-		policy.MaxBytes = spec.Quota.DefaultMaxBytes.Value()
-	}
+	classMaxBytes := spec.MaxBytes.Value()
 	if requestedMaxBytes != "" {
 		if !spec.Quota.Enabled {
 			return cache.Policy{}, errors.New("maxBytes requires an XFS project quota CacheClass")
@@ -246,11 +241,14 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 		if err != nil || requested.Sign() <= 0 {
 			return cache.Policy{}, errors.New("maxBytes must be a positive Kubernetes quantity")
 		}
-		limit := requested.Value()
-		if policy.MaxBytes > 0 && limit > policy.MaxBytes {
-			limit = policy.MaxBytes
+		if classMaxBytes > 0 && requested.Value() > classMaxBytes {
+			return cache.Policy{}, errors.New("maxBytes exceeds the CacheClass per-cache quota ceiling")
 		}
-		policy.MaxBytes = limit
+		policy.MaxBytes = requested.Value()
+	} else if spec.Quota.DefaultMaxBytes.Sign() > 0 {
+		policy.MaxBytes = spec.Quota.DefaultMaxBytes.Value()
+	} else {
+		policy.MaxBytes = classMaxBytes
 	}
 	if spec.Quota.Enabled && policy.MaxBytes <= 0 {
 		return cache.Policy{}, errors.New("CacheClass quota is enabled without an effective maxBytes limit")
@@ -338,7 +336,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	}
 	unlock := s.locks.Lock(req.GetTargetPath())
 	defer unlock()
-	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	_, lease, source, policy, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
@@ -351,7 +349,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 			return nil, status.Error(codes.FailedPrecondition, "volume lease target does not match")
 		}
 		if mounted {
-			same, err := sameCacheMount(source, req.GetTargetPath(), false, false)
+			same, err := sameCacheMount(source, req.GetTargetPath(), lease.ReadOnly, lease.NoExec)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "verify cache mount: %v", err)
 			}
@@ -372,7 +370,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	}
 	fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
 	if mounted {
-		if same, err := sameCacheMount(fallback, req.GetTargetPath(), false, false); err != nil {
+		if same, err := sameCacheSource(fallback, req.GetTargetPath()); err != nil {
 			return nil, status.Errorf(codes.Internal, "verify fallback mount: %v", err)
 		} else if !same {
 			return nil, status.Error(codes.FailedPrecondition, "target mount has no matching cache lease")
@@ -394,7 +392,7 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
-	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	_, lease, source, policy, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
@@ -412,9 +410,16 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if !mounted {
 		return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMountMissing", "cache volume mount is missing")}, nil
 	}
-	if same, err := sameCacheMount(source, lease.Target, false, false); err != nil {
+	var same bool
+	if found {
+		same, err = sameCacheMount(source, lease.Target, lease.ReadOnly, lease.NoExec)
+	} else {
+		same, err = sameCacheSource(source, lease.Target)
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "verify cache mount: %v", err)
-	} else if !same {
+	}
+	if !same {
 		return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeSourceMismatch", "cache volume source does not match its lease")}, nil
 	}
 	return &csi.NodeGetVolumeHealthResponse{VolumeHealth: &csi.VolumeHealth{VolumeId: req.GetVolumeId()}}, nil
