@@ -19,7 +19,7 @@ run = "go test ./..."
 description = "Copy the authoritative CacheClass CRD into the Helm chart"
 run = "cp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml"
 
-[tasks."lint:backend"]
+[tasks."lint:go"]
 description = "lint the Go code"
 run = "golangci-lint run"
 
