@@ -15,7 +15,13 @@ helm install cache-csi-driver \
   --namespace kube-system
 ```
 
-このchartは`CacheClass` CRD、`CSIDriver`、read-onlyのClusterRole、ServiceAccount、Node DaemonSetをインストールします。Node pluginはmount system callを使うためprivileged containerとして動作します。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
+このchartは`CacheClass` CRD、`CSIDriver`、ValidatingAdmissionPolicy、ClusterRole、ServiceAccount、Node DaemonSetをインストールします。ValidatingAdmissionPolicyは、namespaceに`cache.csi.walnuts.dev/allow-use=true`ラベルがない場合にCache CSI volumeを使うPodを拒否します。CacheClassを利用させるnamespaceには、namespaceラベルを変更できる利用者を管理した上で次のようにラベルを付けてください。
+
+```sh
+kubectl label namespace default cache.csi.walnuts.dev/allow-use=true
+```
+
+Helm valuesの`admissionPolicy.enabled=false`でpolicyを無効化する場合は、同等の利用制限を別のAdmission設定で行ってください。ClusterRoleはNamespaceとCacheClassの読み取り権限に加え、既定で`pods/eviction`の作成権限を持ちます。Node pluginはmount system callを使うためprivileged containerとして動作します。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
 Kubernetes API resolverが一時的な障害になり、volume attributeに`maxBytes`がない場合は、volume固有で共有されないfallback directoryを使います。`maxBytes`を指定した要求や、通常cacheのmount・quota設定に失敗した要求ではfallbackに切り替えません。fallbackは`noexec`でmountします。データはNode上の`/run/cache-csi/fallback`に配置します。標準的なLinuxでは`/run`はtmpfsですが、すべてのNode構成で保証されるわけではありません。fallbackデータをメモリ上に保つ場合は、`fallbackRootDir`をNode上のtmpfs内のパスに設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
@@ -78,6 +84,7 @@ spec:
 | `projectIDRange.start` | `2000000000` | XFS project quota用に予約するproject ID範囲の開始値 |
 | `projectIDRange.count` | `1000000` | XFS project quota用に予約するproject IDの個数 |
 | `csiDriver.preventPodSchedulingIfMissing` | `true` | CSI pluginが未登録のNodeへの配置を防止 |
+| `admissionPolicy.enabled` | `true` | 許可ラベルのないnamespaceでのCache CSI利用を拒否 |
 | `rbac.createPodEvictions` | `true` | `evictRunning`用のPod Eviction権限 |
 | `nodeSelector` | `kubernetes.io/os: linux` | DaemonSetを配置するNode |
 

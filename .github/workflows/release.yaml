@@ -45,6 +45,24 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Require current main commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Releases must be dispatched from main" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "::error::Checked out commit does not match the dispatch commit" >&2
+            exit 1
+          fi
+          main_sha="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+          if [[ "$main_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::Releases must use the current main commit" >&2
+            exit 1
+          fi
+
       - name: Resolve and validate tag
         id: release-target
         shell: bash
@@ -101,6 +119,7 @@ jobs:
       - name: Check out release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up mise tools

@@ -1,0 +1,37 @@
+{{- if .Values.admissionPolicy.enabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ printf "%s-cache-access" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+        scope: Namespaced
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(volume,
+          !has(volume.csi) || volume.csi.driver != {{ .Values.driverName | quote }}
+        )
+      message: Cache CSI volumes are restricted to namespaces labeled cache.csi.walnuts.dev/allow-use=true.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ printf "%s-cache-access" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+spec:
+  policyName: {{ printf "%s-cache-access" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+  validationActions:
+    - Deny
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: cache.csi.walnuts.dev/allow-use
+          operator: NotIn
+          values:
+            - "true"
+{{- end }}

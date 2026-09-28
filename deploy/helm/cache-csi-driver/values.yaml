@@ -24,6 +24,9 @@ projectIDRange:
 csiDriver:
   preventPodSchedulingIfMissing: true
 
+admissionPolicy:
+  enabled: true
+
 rbac:
   createPodEvictions: true
 
