@@ -22,4 +22,7 @@ func TestProjectLimitPresent(t *testing.T) {
 	if projectLimitPresent(report, 10042, 17*1024*1024) {
 		t.Fatal("smaller hard quota was accepted")
 	}
+	if projectLimitPresent("#10042 4 0 32768 00 [------]", 10042, 16*1024*1024) {
+		t.Fatal("larger hard quota was accepted for the requested limit")
+	}
 }

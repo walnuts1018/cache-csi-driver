@@ -42,6 +42,9 @@ jobs:
       - name: Run Linux mount API integration test
         run: mise run test:mount-api
 
+      - name: Run XFS project quota integration test
+        run: mise run test:xfs-quota
+
       - name: Verify generated API manifests
         run: |
           mise run manifests

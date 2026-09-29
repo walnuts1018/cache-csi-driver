@@ -91,7 +91,34 @@ docker run --rm --privileged --platform "linux/$go_arch" \
   -v "$tmp_dir:/tmp/cache-csi-mount-api:ro" \
   --entrypoint /tmp/cache-csi-mount-api/mount-api.test \
   ubuntu:26.04 \
-  -test.v -test.count=1 -test.run '^TestMountUsesOpenTreeMountSetattrMoveMount$'
+  -test.v -test.count=1 -test.run '^Test(MountUsesOpenTreeMountSetattrMoveMount|RecoverPreparingLeaseAfterDriverRestartWithAttachedMount)$'
+"""
+
+[tasks."test:xfs-quota"]
+description = "XFS project quota integration coverage on a loopback filesystem"
+run = """
+set -euo pipefail
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+go_arch="$(go env GOARCH)"
+GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 go test -c -o "$tmp_dir/xfs-quota.test" ./internal/quota
+docker run --rm --privileged --platform "linux/$go_arch" \
+  --env CACHE_CSI_REQUIRE_XFS_QUOTA=1 \
+  --env CACHE_CSI_XFS_ROOT=/mnt/cache-csi-xfs \
+  -v "$tmp_dir:/tmp/cache-csi-xfs-quota:ro" \
+  --entrypoint /bin/bash \
+  ubuntu:26.04 \
+  -lc 'set -euo pipefail
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfsprogs
+    image=/tmp/cache-csi-xfs.img
+    truncate -s 1G "$image"
+    mkfs.xfs -f -m reflink=0 "$image"
+    mkdir -p /mnt/cache-csi-xfs
+    mount -o loop,prjquota "$image" /mnt/cache-csi-xfs
+    trap "umount /mnt/cache-csi-xfs" EXIT
+    /tmp/cache-csi-xfs-quota/xfs-quota.test -test.v -test.count=1 -test.run "^TestXFSProjectQuotaEnforcesHardLimit$"'
 """
 
 [tasks.manifests]

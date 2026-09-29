@@ -41,7 +41,7 @@ func projectLimitPresent(output string, projectID uint32, maxBytes int64) bool {
 			continue
 		}
 		hardBlocks, err := strconv.ParseUint(fields[3], 10, 64)
-		if err == nil && hardBlocks >= requiredBlocks {
+		if err == nil && hardBlocks == requiredBlocks {
 			return true
 		}
 	}

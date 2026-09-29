@@ -135,6 +135,9 @@ jobs:
         run: |
           mise run build
           mise run test
+          mise run test:csi-sanity
+          mise run test:mount-api
+          mise run test:xfs-quota
           mise run manifests
           git diff --exit-code -- api/v1alpha1/zz_generated.deepcopy.go config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml
           go vet ./...
