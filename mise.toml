@@ -45,6 +45,7 @@ if ! csi_sanity_bin="$(command -v csi-sanity)"; then
   exit 1
 fi
 if [ "$host_os" = Darwin ]; then
+  # Docker DesktopではhostとLinux VM間のUnix socket接続を利用できないため、DarwinではLinux向けsanity binaryを生成する。
   go_mod_cache="$(go env GOMODCACHE)"
   unset GOBIN
   GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 GOPATH="$tmp_dir" GOMODCACHE="$go_mod_cache" go install -trimpath github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
