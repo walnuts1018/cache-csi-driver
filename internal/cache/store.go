@@ -18,6 +18,12 @@ var ErrDegradedMetadata = errors.New("cache metadata is degraded")
 
 var ErrPressureReclaimIncomplete = errors.New("cache pressure reclaim is incomplete")
 
+var ErrPressureActive = errors.New("cache pool is under pressure")
+
+var ErrFallbackCapacity = errors.New("fallback cache capacity is exhausted")
+
+var ErrFallbackLeaseConflict = errors.New("fallback cache lease ID is already in use")
+
 type PressureConfig struct {
 	HighFreePercent      int
 	LowFreePercent       int
@@ -26,14 +32,16 @@ type PressureConfig struct {
 }
 
 type StoreOptions struct {
-	Pressure       PressureConfig
-	ProjectIDStart uint32
-	ProjectIDCount uint32
+	Pressure          PressureConfig
+	ProjectIDStart    uint32
+	ProjectIDCount    uint32
+	UnmountGeneration func(string) error
 }
 
 type Store struct {
 	root                       string
 	rootFS                     *os.Root
+	unmountGeneration          func(string) error
 	pressure                   PressureConfig
 	projectIDStart             uint32
 	projectIDCount             uint32
@@ -45,6 +53,8 @@ type Store struct {
 	leaseIndex                 map[string]string
 	degraded                   map[string]error
 	projectReservations        map[uint32][]projectReservation
+	projectOwnersByID          map[uint32]projectReservationKey
+	projectIDByGeneration      map[projectReservationKey]uint32
 	unknownProjectReservations map[string]string
 	trashMetadata              map[string]Metadata
 	trashCursor                string
@@ -162,6 +172,7 @@ func NewStore(root string, options StoreOptions) (*Store, error) {
 	store := &Store{
 		root:                       root,
 		rootFS:                     rootFS,
+		unmountGeneration:          options.UnmountGeneration,
 		pressure:                   options.Pressure,
 		projectIDStart:             options.ProjectIDStart,
 		projectIDCount:             options.ProjectIDCount,
@@ -170,6 +181,8 @@ func NewStore(root string, options StoreOptions) (*Store, error) {
 		leaseIndex:                 make(map[string]string),
 		degraded:                   make(map[string]error),
 		projectReservations:        make(map[uint32][]projectReservation),
+		projectOwnersByID:          make(map[uint32]projectReservationKey),
+		projectIDByGeneration:      make(map[projectReservationKey]uint32),
 		unknownProjectReservations: make(map[string]string),
 		trashMetadata:              make(map[string]Metadata),
 		stopTrash:                  make(chan struct{}),

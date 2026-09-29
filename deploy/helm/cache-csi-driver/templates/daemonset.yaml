@@ -38,6 +38,7 @@ spec:
             - --cache-root={{ .Values.cacheRootDir }}
             - --fallback-root={{ .Values.fallbackRootDir }}
             - --fallback-max-bytes={{ .Values.fallbackMaxBytes }}
+            - --fallback-volume-max-bytes={{ .Values.fallbackVolumeMaxBytes }}
             - --node-id=$(NODE_NAME)
             - --kubelet-root={{ .Values.kubeletRootDir }}
             - --gc-interval={{ .Values.gcInterval }}
@@ -83,9 +84,8 @@ spec:
           volumeMounts:
             - name: csi-socket-dir
               mountPath: /csi
-              mountPropagation: Bidirectional
-            - name: kubelet-root
-              mountPath: {{ .Values.kubeletRootDir }}
+            - name: kubelet-pods
+              mountPath: {{ .Values.kubeletRootDir }}/pods
               mountPropagation: Bidirectional
             - name: cache-root
               mountPath: {{ .Values.cacheRootDir }}
@@ -142,9 +142,9 @@ spec:
           hostPath:
             path: {{ .Values.kubeletRootDir }}/plugins_registry
             type: DirectoryOrCreate
-        - name: kubelet-root
+        - name: kubelet-pods
           hostPath:
-            path: {{ .Values.kubeletRootDir }}
+            path: {{ .Values.kubeletRootDir }}/pods
             type: Directory
         - name: cache-root
           hostPath:

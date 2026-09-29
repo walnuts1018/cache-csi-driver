@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 	"uuid"
 )
@@ -121,6 +122,7 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 				s.projectReservations[projectID] = kept
 			}
 		}
+		s.rebuildProjectReservationIndexes()
 		delete(s.trashMetadata, trashID)
 		delete(s.degraded, filepath.Join(trashDirectoryName, trashID))
 		for identity, reservedTrashID := range s.unknownProjectReservations {
@@ -133,6 +135,7 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("persist project ID registry after trash cleanup: %w", err))
 			s.projectReservations = reservationsBeforeCleanup
 			s.unknownProjectReservations = unknownReservationsBeforeCleanup
+			s.rebuildProjectReservationIndexes()
 			s.projectRegistryDirty = true
 		}
 		s.mu.Unlock()
@@ -178,6 +181,9 @@ func (s *Store) detachToTrash(path string) error {
 	identity := filepath.Base(relative)
 	var meta Metadata
 	if isObject {
+		if err := s.unmountGenerationMounts(path); err != nil {
+			return fmt.Errorf("unmount cache generation before trash detach: %w", err)
+		}
 		meta, _ = s.readMetadata(path)
 	}
 	trashPath := filepath.Join(s.root, trashDirectoryName, uuid.NewV7().String())
@@ -197,6 +203,39 @@ func (s *Store) detachToTrash(path string) error {
 		s.indexObjectInTrash(identity, trashID, meta)
 	}
 	return errors.Join(s.syncDirectory(filepath.Dir(path)), s.syncDirectory(filepath.Join(s.root, trashDirectoryName)))
+}
+
+func (s *Store) unmountGenerationMounts(path string) error {
+	if s.unmountGeneration == nil {
+		return nil
+	}
+	relative, err := s.relative(path)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(relative, string(filepath.Separator))
+	if len(parts) == 3 && parts[1] == "generations" {
+		return s.unmountGeneration(path)
+	}
+	if len(parts) != 1 {
+		return nil
+	}
+	entries, err := s.readDir(filepath.Join(path, "generations"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if err := s.unmountGeneration(filepath.Join(path, "generations", entry.Name())); err != nil {
+			return fmt.Errorf("unmount generation %q: %w", entry.Name(), err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) reserveObjectForTrash(identity, trashID string, meta Metadata) error {
@@ -241,9 +280,7 @@ func (s *Store) restoreObjectTrashReservation(identity, trashID string) error {
 
 func (s *Store) indexObjectInTrash(identity, trashID string, meta Metadata) {
 	delete(s.metadataByIdentity, identity)
-	for _, lease := range meta.Leases {
-		delete(s.leaseIndex, lease.ID)
-	}
+	maps.DeleteFunc(s.leaseIndex, func(_ string, leaseIdentity string) bool { return leaseIdentity == identity })
 	if meta.Identity == identity {
 		s.trashMetadata[trashID] = meta
 	}
@@ -269,6 +306,9 @@ func (s *Store) detachGenerationToTrash(path string, identity string, retired Re
 		return nil
 	} else if err != nil {
 		return err
+	}
+	if err := s.unmountGenerationMounts(path); err != nil {
+		return fmt.Errorf("unmount retired cache generation before trash detach: %w", err)
 	}
 	trashPath := filepath.Join(s.root, trashDirectoryName, uuid.NewV7().String())
 	trashID := filepath.Base(trashPath)

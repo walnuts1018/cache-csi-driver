@@ -19,6 +19,12 @@ type AcquireOptions struct {
 	Policy   Policy
 }
 
+type FallbackAllocation struct {
+	Source   string
+	MaxBytes int64
+	NoExec   bool
+}
+
 func Identity(namespaceUID, cacheClass, cacheClassUID, cacheKey, schema string) (string, error) {
 	if namespaceUID == "" || cacheClass == "" || cacheClassUID == "" || cacheKey == "" {
 		return "", errors.New("namespace UID, cacheClass, cacheClass UID, and cacheKey are required")
@@ -27,6 +33,19 @@ func Identity(namespaceUID, cacheClass, cacheClassUID, cacheKey, schema string) 
 		return "", errors.New("cacheKey contains an invalid character")
 	}
 	return stableIdentity(namespaceUID + "\x00" + cacheClass + "\x00" + cacheClassUID + "\x00" + cacheKey + "\x00" + schema), nil
+}
+
+func IdentityWithServiceAccount(namespaceUID, serviceAccountUID, cacheClass, cacheClassUID, cacheKey, schema string) (string, error) {
+	if namespaceUID == "" || cacheClass == "" || cacheClassUID == "" || cacheKey == "" {
+		return "", errors.New("namespace UID, cacheClass, cacheClass UID, and cacheKey are required")
+	}
+	if serviceAccountUID == "" {
+		return "", errors.New("service account UID is required for service-account-scoped cache identity")
+	}
+	if strings.ContainsRune(serviceAccountUID, '\x00') || strings.ContainsRune(cacheKey, '\x00') {
+		return "", errors.New("service account UID or cacheKey contains an invalid character")
+	}
+	return stableIdentity(namespaceUID + "\x00" + serviceAccountUID + "\x00" + cacheClass + "\x00" + cacheClassUID + "\x00" + cacheKey + "\x00" + schema), nil
 }
 
 func FallbackIdentity(volumeID string) (string, error) {
@@ -39,6 +58,10 @@ func FallbackIdentity(volumeID string) (string, error) {
 func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.acquireLocked(options)
+}
+
+func (s *Store) acquireLocked(options AcquireOptions) (string, bool, error) {
 	if err := validateAcquireOptions(options); err != nil {
 		return "", false, err
 	}
@@ -49,9 +72,13 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 	if path, found, err := s.existingLeasePath(options); found || err != nil {
 		return path, false, err
 	}
+	if err := s.rejectUnderPressure(); err != nil {
+		return "", false, err
+	}
 	entry := filepath.Join(s.root, options.Identity)
-	if err := s.ensureDirectory(entry); err != nil {
-		return "", false, fmt.Errorf("create cache entry: %w", err)
+	entryExists, err := s.prepareAcquireEntry(entry)
+	if err != nil {
+		return "", false, err
 	}
 	meta, err := s.readMetadata(entry)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -59,41 +86,153 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 		return "", false, fmt.Errorf("read cache metadata: %w", err)
 	}
 	if errors.Is(err, os.ErrNotExist) {
-		if err := s.discardUntrackedGenerations(entry); err != nil {
-			return "", false, fmt.Errorf("discard incomplete cache generations: %w", err)
+		return s.acquireWithoutMetadata(entry, entryExists, options)
+	}
+	return s.acquireFromMetadata(entry, options, meta)
+}
+
+func (s *Store) prepareAcquireEntry(entry string) (bool, error) {
+	entryExists := true
+	if err := s.stat(entry); errors.Is(err, os.ErrNotExist) {
+		entryExists = false
+		if err := s.rejectUnderPressure(); err != nil {
+			return false, err
 		}
-		meta = Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
-	} else {
-		if err := validateMetadata(options.Identity, meta); err != nil {
+	} else if err != nil {
+		return false, fmt.Errorf("inspect cache entry: %w", err)
+	}
+	if err := s.ensureDirectory(entry); err != nil {
+		return false, fmt.Errorf("create cache entry: %w", err)
+	}
+	return entryExists, nil
+}
+
+func (s *Store) acquireWithoutMetadata(entry string, entryExists bool, options AcquireOptions) (string, bool, error) {
+	if entryExists {
+		if err := s.rejectUnderPressure(); err != nil {
+			return "", false, err
+		}
+	}
+	if err := s.discardUntrackedGenerations(entry); err != nil {
+		return "", false, fmt.Errorf("discard incomplete cache generations: %w", err)
+	}
+	meta := Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
+	return s.createLease(entry, options, meta)
+}
+
+func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
+	if err := validateMetadata(options.Identity, meta); err != nil {
+		s.markDegraded(options.Identity, err)
+		return "", false, err
+	}
+	for _, lease := range meta.Leases {
+		_, existingPolicy, err := leaseGenerationAndPolicy(meta, lease)
+		if err != nil {
 			s.markDegraded(options.Identity, err)
 			return "", false, err
 		}
-		for _, lease := range meta.Leases {
-			_, existingPolicy, err := leaseGenerationAndPolicy(meta, lease)
-			if err != nil {
-				s.markDegraded(options.Identity, err)
-				return "", false, err
-			}
-			if options.Policy.SharingPolicy == "Exclusive" || existingPolicy.SharingPolicy == "Exclusive" {
-				return "", false, ErrExclusivePolicyConflict
-			}
-		}
-		if s.activeLeaseCount(meta) > 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes) {
-			return "", false, ErrQuotaPolicyConflict
-		}
-		if len(meta.Retired) == 0 && s.activeLeaseCount(meta) == 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
-			if err := s.detachToTrash(entry); err != nil {
-				return "", false, fmt.Errorf("discard cache before generation transition: %w", err)
-			}
-			if err := s.ensureDirectory(entry); err != nil {
-				return "", false, fmt.Errorf("create cache entry after generation transition: %w", err)
-			}
-			meta = Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
-		} else {
-			return s.acquireExisting(entry, options, meta)
+		if options.Policy.SharingPolicy == "Exclusive" || existingPolicy.SharingPolicy == "Exclusive" {
+			return "", false, ErrExclusivePolicyConflict
 		}
 	}
-	return s.createLease(entry, options, meta)
+	if s.activeLeaseCount(meta) > 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes) {
+		return "", false, ErrQuotaPolicyConflict
+	}
+	if len(meta.Retired) == 0 && s.activeLeaseCount(meta) == 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
+		if err := s.rejectUnderPressure(); err != nil {
+			return "", false, err
+		}
+		if err := s.detachToTrash(entry); err != nil {
+			return "", false, fmt.Errorf("discard cache before generation transition: %w", err)
+		}
+		if err := s.ensureDirectory(entry); err != nil {
+			return "", false, fmt.Errorf("create cache entry after generation transition: %w", err)
+		}
+		meta = Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
+		return s.createLease(entry, options, meta)
+	}
+	generationPath := filepath.Join(entry, "generations", meta.Generation)
+	if err := s.stat(generationPath); errors.Is(err, os.ErrNotExist) {
+		if err := s.rejectUnderPressure(); err != nil {
+			return "", false, err
+		}
+	} else if err != nil {
+		return "", false, fmt.Errorf("inspect cache generation: %w", err)
+	}
+	return s.acquireExisting(entry, options, meta)
+}
+
+func (s *Store) rejectUnderPressure() error {
+	pressureActive, err := s.pressureActiveLocked()
+	if err != nil {
+		return fmt.Errorf("inspect cache pool pressure: %w", err)
+	}
+	if pressureActive {
+		return ErrPressureActive
+	}
+	return nil
+}
+
+func (s *Store) AcquireFallback(options AcquireOptions, requestedBytes, perVolumeMaxBytes, totalMaxBytes int64) (FallbackAllocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateAcquireOptions(options); err != nil {
+		return FallbackAllocation{}, err
+	}
+	if perVolumeMaxBytes <= 0 || totalMaxBytes <= 0 {
+		return FallbackAllocation{}, errors.New("fallback cache limits must be positive")
+	}
+
+	if identity, meta, found, err := s.findLease(options.Lease.ID); err != nil {
+		return FallbackAllocation{}, err
+	} else if found {
+		if identity != options.Identity {
+			return FallbackAllocation{}, ErrFallbackLeaseConflict
+		}
+		leaseIndex := slices.IndexFunc(meta.Leases, func(lease Lease) bool { return lease.ID == options.Lease.ID })
+		if leaseIndex < 0 || meta.Leases[leaseIndex].Target != options.Lease.Target || meta.Leases[leaseIndex].ReadOnly != options.Lease.ReadOnly {
+			return FallbackAllocation{}, ErrFallbackLeaseConflict
+		}
+		storedLease := meta.Leases[leaseIndex]
+		_, storedPolicy, err := leaseGenerationAndPolicy(meta, storedLease)
+		if err != nil {
+			return FallbackAllocation{}, err
+		}
+		if storedPolicy.MaxBytes <= 0 || storedPolicy.MaxBytes > perVolumeMaxBytes {
+			return FallbackAllocation{}, fmt.Errorf("stored fallback cache limit %d is outside configured bounds", storedPolicy.MaxBytes)
+		}
+		options.Policy = storedPolicy
+		options.Lease.NoExec = storedLease.NoExec
+		path, _, err := s.acquireLocked(options)
+		return FallbackAllocation{Source: path, MaxBytes: storedPolicy.MaxBytes, NoExec: storedLease.NoExec}, err
+	}
+	if len(s.degraded) != 0 {
+		return FallbackAllocation{}, ErrDegradedMetadata
+	}
+	var reserved int64
+	for _, meta := range s.metadataByIdentity {
+		if len(meta.Leases) == 0 {
+			continue
+		}
+		if meta.Policy.MaxBytes <= 0 || meta.Policy.MaxBytes > totalMaxBytes-reserved {
+			return FallbackAllocation{}, errors.New("fallback cache reservations exceed the configured aggregate limit")
+		}
+		reserved += meta.Policy.MaxBytes
+	}
+	available := totalMaxBytes - reserved
+	limit := perVolumeMaxBytes
+	if requestedBytes > 0 {
+		limit = min(limit, requestedBytes)
+	}
+	limit = min(limit, available)
+	pageSize := int64(os.Getpagesize())
+	limit -= limit % pageSize
+	if limit <= 0 {
+		return FallbackAllocation{}, ErrFallbackCapacity
+	}
+	options.Policy.MaxBytes = limit
+	path, _, err := s.acquireLocked(options)
+	return FallbackAllocation{Source: path, MaxBytes: limit, NoExec: options.Lease.NoExec}, err
 }
 
 func validateAcquireOptions(options AcquireOptions) error {

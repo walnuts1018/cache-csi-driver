@@ -15,6 +15,9 @@ func (spec CacheClassSpec) Validate() error {
 	if err := spec.validateSharingPolicy(); err != nil {
 		return err
 	}
+	if err := spec.validateScope(); err != nil {
+		return err
+	}
 	if spec.Retention.Duration < 0 {
 		return fmt.Errorf("retention must not be negative")
 	}
@@ -22,6 +25,15 @@ func (spec CacheClassSpec) Validate() error {
 		return fmt.Errorf("schemaVersion contains an invalid character")
 	}
 	return nil
+}
+
+func (spec CacheClassSpec) validateScope() error {
+	switch spec.Scope {
+	case "", ScopeServiceAccount, ScopeNamespace:
+		return nil
+	default:
+		return fmt.Errorf("unsupported scope %q", spec.Scope)
+	}
 }
 
 func (spec CacheClassSpec) validateBackend() error {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
@@ -59,6 +60,146 @@ func TestMountUsesOpenTreeMountSetattrMoveMount(t *testing.T) {
 	}
 	if _, err := os.Create(filepath.Join(target, "unexpected-write")); !errors.Is(err, unix.EROFS) {
 		t.Fatalf("write through readonly mount: got %v, want %v", err, unix.EROFS)
+	}
+}
+
+func TestFallbackGenerationTmpfsEnforcesItsByteLimit(t *testing.T) {
+	requireLinuxMountAPI(t)
+	fallbackRoot := filepath.Join(t.TempDir(), "fallback-root")
+	if err := os.Mkdir(fallbackRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount("tmpfs", fallbackRoot, "tmpfs", unix.MS_NODEV|unix.MS_NOSUID|unix.MS_NOEXEC, "size=16m,mode=0700"); err != nil {
+		if mountAPISkipError(t, err) {
+			return
+		}
+		t.Fatalf("mount fallback root tmpfs: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := unix.Unmount(fallbackRoot, 0); err != nil && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOENT) {
+			t.Errorf("unmount fallback root tmpfs: %v", err)
+		}
+	})
+	path := filepath.Join(fallbackRoot, "fallback-generation")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := unmountFallbackGeneration(path); err != nil {
+			t.Errorf("unmount bounded fallback generation: %v", err)
+		}
+	})
+	const maxBytes = int64(8 << 20)
+	if err := prepareFallbackGeneration(path, maxBytes, false); err != nil {
+		if mountAPISkipError(t, err) {
+			return
+		}
+		t.Fatalf("mount bounded fallback generation: %v", err)
+	}
+	if err := prepareFallbackGeneration(path, maxBytes, false); err != nil {
+		t.Fatalf("verify existing bounded fallback generation: %v", err)
+	}
+	if sourceMounted, err := sourceMounted(path); err != nil || sourceMounted {
+		t.Fatalf("tmpfs source considered active without a consumer mount = %t, error = %v", sourceMounted, err)
+	}
+	target := filepath.Join(t.TempDir(), "fallback-consumer")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := mount(path, target, false, false); err != nil {
+		t.Fatalf("bind mount fallback generation: %v", err)
+	}
+	if sourceMounted, err := sourceMounted(path); err != nil || !sourceMounted {
+		t.Fatalf("tmpfs source considered active with a consumer mount = %t, error = %v", sourceMounted, err)
+	}
+	if err := unmount(target); err != nil {
+		t.Fatalf("unmount fallback consumer: %v", err)
+	}
+	if sourceMounted, err := sourceMounted(path); err != nil || sourceMounted {
+		t.Fatalf("tmpfs source considered active after its consumer unmounted = %t, error = %v", sourceMounted, err)
+	}
+
+	payload := strings.Repeat("x", int(maxBytes+(1<<20)))
+	err := os.WriteFile(filepath.Join(path, "payload"), []byte(payload), 0o600)
+	if !errors.Is(err, unix.ENOSPC) {
+		t.Fatalf("write beyond fallback volume limit error = %v, want ENOSPC", err)
+	}
+	info, err := os.Stat(filepath.Join(path, "payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > maxBytes+(1<<20) {
+		t.Fatalf("fallback payload size = %d, exceeds attempted write size", info.Size())
+	}
+	if err := unmountFallbackGeneration(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverCorruptFallbackUnmountsGenerationBeforeQuarantine(t *testing.T) {
+	requireLinuxMountAPI(t)
+	root := t.TempDir()
+	store, err := cache.NewStore(root, cache.StoreOptions{UnmountGeneration: UnmountFallbackGeneration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	identity, err := cache.FallbackIdentity("corrupt-fallback-volume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := int64(os.Getpagesize())
+	allocation, err := store.AcquireFallback(cache.AcquireOptions{
+		Identity: identity,
+		Lease: cache.Lease{
+			ID:     "corrupt-fallback-volume",
+			Target: filepath.Join(root, "target"),
+		},
+		Policy: cache.Policy{ClassName: "fallback", SharingPolicy: cache.SharingPolicyExclusive, DiscardOnLastRelease: true},
+	}, 8*pageSize, 8*pageSize, 16*pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareFallbackGeneration(allocation.Source, allocation.MaxBytes, false); err != nil {
+		if mountAPISkipError(t, err) {
+			return
+		}
+		t.Fatalf("mount fallback generation before recovery: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, identity, ".cache-csi.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverLeases(func(source string, lease cache.Lease, policy cache.Policy) (bool, error) {
+		return verifyCacheMount(newMounter(), source, lease, policy)
+	}); err != nil {
+		t.Fatalf("recover fallback with corrupt metadata: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, identity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt fallback object remains after quarantine: %v", err)
+	}
+	if _, mounted, err := generationMountAt(allocation.Source); err != nil || mounted {
+		t.Fatalf("fallback generation tmpfs remains mounted after quarantine = %t, error = %v", mounted, err)
+	}
+	recovered, err := store.AcquireFallback(cache.AcquireOptions{
+		Identity: identity,
+		Lease: cache.Lease{
+			ID:     "corrupt-fallback-volume",
+			Target: filepath.Join(root, "target"),
+		},
+		Policy: cache.Policy{ClassName: "fallback", SharingPolicy: cache.SharingPolicyExclusive, DiscardOnLastRelease: true},
+	}, 8*pageSize, 8*pageSize, 16*pageSize)
+	if err != nil {
+		t.Fatalf("reuse fallback volume ID after quarantine: %v", err)
+	}
+	if recovered.Source == allocation.Source {
+		t.Fatalf("fallback generation path was reused after quarantine: %q", recovered.Source)
+	}
+	if err := store.Release("corrupt-fallback-volume", filepath.Join(root, "target")); err != nil {
+		t.Fatalf("release fallback volume after quarantine recovery: %v", err)
 	}
 }
 

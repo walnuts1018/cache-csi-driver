@@ -123,6 +123,9 @@ func (s *Store) indexObjectMetadata(meta Metadata) {
 		} else {
 			s.projectReservations[projectID] = kept
 		}
+		if len(kept) != previousLength {
+			s.syncProjectReservationIndexes(projectID)
+		}
 	}
 	for _, retired := range meta.Retired {
 		if retired.ProjectID == 0 {

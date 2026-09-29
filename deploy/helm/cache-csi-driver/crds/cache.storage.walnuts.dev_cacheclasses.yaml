@@ -119,8 +119,18 @@ spec:
                 x-kubernetes-validations:
                 - message: schemaVersion contains an invalid character
                   rule: '!self.contains(''/'') && !self.contains(''\\'') && !self.contains(''\u0000'')'
+              scope:
+                default: ServiceAccount
+                description: Scope defines the workload trust boundary included in
+                  cache identity. Namespace allows all workloads in a namespace to
+                  share identity; ServiceAccount isolates workloads by ServiceAccount
+                  UID.
+                enum:
+                - ServiceAccount
+                - Namespace
+                type: string
               sharingPolicy:
-                default: Shared
+                default: Exclusive
                 description: SharingPolicy describes concurrent access to a cache
                   generation. Shared is safe only when the cache implementation supports
                   concurrent multi-process access and all Pods using the same cacheKey

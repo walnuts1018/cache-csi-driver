@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -48,13 +49,18 @@ func IsTemporaryAPIError(err error) bool {
 }
 
 type Resolver struct {
-	namespaceLister   corelisters.NamespaceLister
-	classLister       toolscache.GenericLister
-	namespaceInformer toolscache.SharedIndexInformer
-	classInformer     toolscache.SharedIndexInformer
-	kubernetesFactory informers.SharedInformerFactory
-	dynamicFactory    dynamicinformer.DynamicSharedInformerFactory
-	startOnce         sync.Once
+	namespaceLister        corelisters.NamespaceLister
+	podLister              corelisters.PodLister
+	serviceAccountLister   corelisters.ServiceAccountLister
+	classLister            toolscache.GenericLister
+	namespaceInformer      toolscache.SharedIndexInformer
+	podInformer            toolscache.SharedIndexInformer
+	serviceAccountInformer toolscache.SharedIndexInformer
+	classInformer          toolscache.SharedIndexInformer
+	kubernetesFactory      informers.SharedInformerFactory
+	podFactory             informers.SharedInformerFactory
+	dynamicFactory         dynamicinformer.DynamicSharedInformerFactory
+	startOnce              sync.Once
 }
 
 type ResolvedClass struct {
@@ -62,7 +68,7 @@ type ResolvedClass struct {
 	UID    string
 }
 
-func NewResolver(config *rest.Config) (*Resolver, error) {
+func NewResolver(config *rest.Config, nodeName string) (*Resolver, error) {
 	kubeClient, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("create Kubernetes client: %w", err)
@@ -71,63 +77,102 @@ func NewResolver(config *rest.Config) (*Resolver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create dynamic Kubernetes client: %w", err)
 	}
-	return newResolver(kubeClient, dynamicClient), nil
+	return newResolver(kubeClient, dynamicClient, nodeName), nil
 }
 
-func newResolver(kubernetesClient kubernetes.Interface, dynamicClient dynamic.Interface) *Resolver {
+func newResolver(kubernetesClient kubernetes.Interface, dynamicClient dynamic.Interface, nodeName string) *Resolver {
 	kubernetesFactory := informers.NewSharedInformerFactory(kubernetesClient, 0)
 	namespaceInformer := kubernetesFactory.Core().V1().Namespaces()
+	serviceAccountInformer := kubernetesFactory.Core().V1().ServiceAccounts()
+	podFactory := informers.NewSharedInformerFactoryWithOptions(kubernetesClient, 0, informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+		if nodeName != "" {
+			options.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
+		}
+	}))
+	podInformer := podFactory.Core().V1().Pods()
 	dynamicFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
 	classInformer := dynamicFactory.ForResource(cacheClassGVR)
 	return &Resolver{
-		namespaceLister:   namespaceInformer.Lister(),
-		classLister:       classInformer.Lister(),
-		namespaceInformer: namespaceInformer.Informer(),
-		classInformer:     classInformer.Informer(),
-		kubernetesFactory: kubernetesFactory,
-		dynamicFactory:    dynamicFactory,
+		namespaceLister:        namespaceInformer.Lister(),
+		podLister:              podInformer.Lister(),
+		serviceAccountLister:   serviceAccountInformer.Lister(),
+		classLister:            classInformer.Lister(),
+		namespaceInformer:      namespaceInformer.Informer(),
+		podInformer:            podInformer.Informer(),
+		serviceAccountInformer: serviceAccountInformer.Informer(),
+		classInformer:          classInformer.Informer(),
+		kubernetesFactory:      kubernetesFactory,
+		podFactory:             podFactory,
+		dynamicFactory:         dynamicFactory,
 	}
 }
 
 func (r *Resolver) Start(ctx context.Context) {
 	r.startOnce.Do(func() {
 		r.kubernetesFactory.StartWithContext(ctx)
+		r.podFactory.StartWithContext(ctx)
 		r.dynamicFactory.Start(ctx.Done())
 	})
 }
 
 func (r *Resolver) HasSynced() bool {
-	return r.namespaceInformer.HasSynced() && r.classInformer.HasSynced()
+	return r.namespaceInformer.HasSynced() && r.podInformer.HasSynced() && r.serviceAccountInformer.HasSynced() && r.classInformer.HasSynced()
 }
 
-func (r *Resolver) Resolve(ctx context.Context, namespace, className string) (string, ResolvedClass, error) {
+func (r *Resolver) Resolve(ctx context.Context, namespace, className, podName, podUID string) (string, string, ResolvedClass, error) {
 	if err := ctx.Err(); err != nil {
-		return "", ResolvedClass{}, err
+		return "", "", ResolvedClass{}, err
 	}
 	if !r.HasSynced() {
-		return "", ResolvedClass{}, ErrResolverNotSynced
+		return "", "", ResolvedClass{}, ErrResolverNotSynced
 	}
 	namespaceObject, err := r.namespaceLister.Get(namespace)
 	if err != nil {
-		return "", ResolvedClass{}, fmt.Errorf("get pod namespace: %w", err)
+		return "", "", ResolvedClass{}, fmt.Errorf("get pod namespace: %w", err)
 	}
 	object, err := r.classLister.Get(className)
 	if err != nil {
-		return "", ResolvedClass{}, fmt.Errorf("get CacheClass %q: %w", className, err)
+		return "", "", ResolvedClass{}, fmt.Errorf("get CacheClass %q: %w", className, err)
 	}
 	unstructuredClass, ok := object.(*unstructured.Unstructured)
 	if !ok {
-		return "", ResolvedClass{}, fmt.Errorf("CacheClass %q informer object has unexpected type %T", className, object)
+		return "", "", ResolvedClass{}, fmt.Errorf("CacheClass %q informer object has unexpected type %T", className, object)
 	}
 	class := cachev1alpha1.CacheClass{}
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredClass.Object, &class); err != nil {
-		return "", ResolvedClass{}, fmt.Errorf("decode CacheClass %q: %w", className, err)
+		return "", "", ResolvedClass{}, fmt.Errorf("decode CacheClass %q: %w", className, err)
 	}
 	if err := class.Spec.Validate(); err != nil {
-		return "", ResolvedClass{}, fmt.Errorf("CacheClass %q is invalid: %w", className, err)
+		return "", "", ResolvedClass{}, fmt.Errorf("CacheClass %q is invalid: %w", className, err)
 	}
 	class.UID = unstructuredClass.GetUID()
-	return string(namespaceObject.UID), ResolvedClass{Object: class, UID: string(unstructuredClass.GetUID())}, nil
+	serviceAccountUID := ""
+	scope := class.Spec.Scope
+	if scope == "" {
+		scope = cachev1alpha1.ScopeServiceAccount
+	}
+	if scope == cachev1alpha1.ScopeServiceAccount {
+		pod, err := r.podLister.Pods(namespace).Get(podName)
+		if err != nil {
+			return "", "", ResolvedClass{}, fmt.Errorf("get Pod for service-account-scoped cache: %w", err)
+		}
+		if string(pod.UID) != podUID {
+			return "", "", ResolvedClass{}, fmt.Errorf("pod UID changed while resolving cache identity")
+		}
+		serviceAccountName := pod.Spec.ServiceAccountName
+		if serviceAccountName == "" {
+			serviceAccountName = "default"
+		}
+		serviceAccount, err := r.serviceAccountLister.ServiceAccounts(namespace).Get(serviceAccountName)
+		if err != nil {
+			return "", "", ResolvedClass{}, fmt.Errorf("get Pod ServiceAccount: %w", err)
+		}
+		if serviceAccount.UID == "" {
+			return "", "", ResolvedClass{}, fmt.Errorf("ServiceAccount %s/%s has no UID", namespace, serviceAccountName)
+		}
+		serviceAccountUID = string(serviceAccount.UID)
+	}
+	return string(namespaceObject.UID), serviceAccountUID, ResolvedClass{Object: class, UID: string(unstructuredClass.GetUID())}, nil
 }
 
 func Unstructured(class *cachev1alpha1.CacheClass) (*unstructured.Unstructured, error) {

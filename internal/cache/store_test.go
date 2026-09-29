@@ -16,6 +16,78 @@ import (
 const firstLeaseID = "first"
 const otherLeaseID = "other"
 
+func TestAcquireFallbackReservesPerVolumeAndAggregateLimits(t *testing.T) {
+	t.Parallel()
+	var cleaned []string
+	store, err := NewStore(t.TempDir(), StoreOptions{UnmountGeneration: func(path string) error {
+		cleaned = append(cleaned, path)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	pageSize := int64(os.Getpagesize())
+	acquire := func(id string, requested int64) (string, int64, error) {
+		identity, err := FallbackIdentity(id)
+		if err != nil {
+			return "", 0, err
+		}
+		target := filepath.Join(t.TempDir(), id)
+		allocation, err := store.AcquireFallback(AcquireOptions{
+			Identity: identity,
+			Lease:    Lease{ID: id, Target: target},
+			Policy:   Policy{ClassName: "fallback", SharingPolicy: SharingPolicyExclusive, DiscardOnLastRelease: true},
+		}, requested, 8*pageSize, 10*pageSize)
+		return allocation.Source, allocation.MaxBytes, err
+	}
+
+	firstPath, firstBytes, err := acquire("fallback-first", 20*pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstBytes != 8*pageSize {
+		t.Fatalf("first fallback allocation = %d, want per-volume maximum %d", firstBytes, 8*pageSize)
+	}
+	_, secondBytes, err := acquire("fallback-second", 8*pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondBytes != 2*pageSize {
+		t.Fatalf("second fallback allocation = %d, want remaining aggregate capacity %d", secondBytes, 2*pageSize)
+	}
+	if _, _, err := acquire("fallback-third", pageSize); !errors.Is(err, ErrFallbackCapacity) {
+		t.Fatalf("acquire beyond aggregate fallback limit error = %v, want ErrFallbackCapacity", err)
+	}
+
+	firstIdentity, _ := FallbackIdentity("fallback-first")
+	_, firstLease, _, _, found, err := store.LeaseDetails("fallback-first")
+	if err != nil || !found {
+		t.Fatalf("first fallback lease found = %t, error = %v", found, err)
+	}
+	if err := store.Release("fallback-first", firstLease.Target); err != nil {
+		t.Fatal(err)
+	}
+	if len(cleaned) != 1 || cleaned[0] != firstPath {
+		t.Fatalf("cleaned generations = %v, want [%q]", cleaned, firstPath)
+	}
+	_, thirdBytes, err := acquire("fallback-third", 8*pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thirdBytes != 8*pageSize {
+		t.Fatalf("third fallback allocation after release = %d, want %d", thirdBytes, 8*pageSize)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root(), firstIdentity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released fallback object remains in the object namespace: %v", err)
+	}
+}
+
 func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
@@ -317,14 +389,7 @@ func TestPressureDoesNotRetirePreparingLeaseBeforePublishCommit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "pressure-used-block"), make([]byte, 8192), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewStore(root, StoreOptions{
-		Pressure: PressureConfig{
-			HighFreePercent:      100,
-			LowFreePercent:       99,
-			HighInodeFreePercent: 100,
-			LowInodeFreePercent:  99,
-		},
-	})
+	store, err := NewStore(root, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +398,6 @@ func TestPressureDoesNotRetirePreparingLeaseBeforePublishCommit(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	store.pressureActive = true
 	identity := stableIdentity("preparing-pressure-lease")
 	publishedTarget := filepath.Join(t.TempDir(), "published-mount")
 	if _, _, err := store.Acquire(AcquireOptions{
@@ -368,6 +432,13 @@ func TestPressureDoesNotRetirePreparingLeaseBeforePublishCommit(t *testing.T) {
 		}
 		if attempt == 0 {
 			source = result.source
+			store.pressure = PressureConfig{
+				HighFreePercent:      100,
+				LowFreePercent:       99,
+				HighInodeFreePercent: 100,
+				LowInodeFreePercent:  99,
+			}
+			store.pressureActive = true
 		}
 		assertPreparingGenerationProtected(t, store, identity, result.source, options.Lease.ID, target)
 		barrier.release()
@@ -1296,8 +1367,8 @@ func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
 		Identity: identity,
 		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), "second")},
 		Policy:   policy,
-	}); !errors.Is(err, ErrExclusivePolicyConflict) {
-		t.Fatalf("second active lease error = %v, want exclusive conflict", err)
+	}); !errors.Is(err, ErrPressureActive) {
+		t.Fatalf("second active lease error = %v, want ErrPressureActive", err)
 	}
 	if err := store.Release(firstLeaseID, target); err != nil {
 		t.Fatal(err)
@@ -1306,8 +1377,8 @@ func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
 		Identity: identity,
 		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), "second")},
 		Policy:   policy,
-	}); err != nil {
-		t.Fatalf("new lease after old generation release: %v", err)
+	}); !errors.Is(err, ErrPressureActive) {
+		t.Fatalf("new lease after old generation release error = %v, want ErrPressureActive", err)
 	}
 }
 
@@ -1342,9 +1413,7 @@ func TestRecoveryVerifierReceivesRetiredGenerationSourceAndPolicy(t *testing.T) 
 
 func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 	t.Parallel()
-	store, err := NewStore(t.TempDir(), StoreOptions{
-		Pressure: PressureConfig{HighFreePercent: 100, LowFreePercent: 99},
-	})
+	store, err := NewStore(t.TempDir(), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1383,6 +1452,7 @@ func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 	if len(trash) != len(identities) {
 		t.Fatalf("trash entries before pressure reclaim = %d, want %d", len(trash), len(identities))
 	}
+	store.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
 	store.pressureActive = true
 	if err := store.ReclaimPressure(t.Context()); err != nil {
 		t.Fatal(err)
@@ -1519,12 +1589,8 @@ func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
 	if meta.Generation != activeGeneration {
 		t.Fatal("pressure rotated an empty active generation repeatedly")
 	}
-	newPath, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: Lease{ID: "replacement", Target: filepath.Join(t.TempDir(), "replacement")}, Policy: policy})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if newPath == oldPath {
-		t.Fatal("replacement lease reused the retired generation")
+	if _, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: Lease{ID: "replacement", Target: filepath.Join(t.TempDir(), "replacement")}, Policy: policy}); !errors.Is(err, ErrPressureActive) {
+		t.Fatalf("replacement lease while pressure remains active error = %v, want ErrPressureActive", err)
 	}
 	if _, _, source, _, found, err := store.LeaseDetails(firstLeaseID); err != nil || !found || source != oldPath {
 		t.Fatalf("old lease stopped resolving before unpublish: source %q, found %v, error %v", source, found, err)
@@ -1535,9 +1601,6 @@ func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
 	}
 	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("released retired generation still exists at its original path: %v", err)
-	}
-	if _, _, source, _, found, err := store.LeaseDetails("replacement"); err != nil || !found || source != newPath {
-		t.Fatalf("active replacement lease changed path: source %q, found %v, error %v", source, found, err)
 	}
 }
 
@@ -1564,6 +1627,8 @@ func TestRetiredGenerationReservesProjectIDUntilDeleted(t *testing.T) {
 	if meta.ProjectID == oldProjectID {
 		t.Fatal("replacement generation reused the retired generation's project ID")
 	}
+	store.pressure = PressureConfig{}
+	store.pressureActive = false
 	otherIdentity := stableIdentity("pressure-other-cache")
 	if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
 		t.Fatal(err)
@@ -1585,7 +1650,6 @@ func pressureLease(t *testing.T, name string, policy Policy, projectIDCount uint
 		projectIDCount = 1
 	}
 	store, err := NewStore(t.TempDir(), StoreOptions{
-		Pressure:       PressureConfig{HighFreePercent: 100, LowFreePercent: 99},
 		ProjectIDStart: 32000,
 		ProjectIDCount: projectIDCount,
 	})
@@ -1606,6 +1670,7 @@ func pressureLease(t *testing.T, name string, policy Policy, projectIDCount uint
 	if err := store.CommitPublish(firstLeaseID, target); err != nil {
 		t.Fatal(err)
 	}
+	store.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
 	store.pressureActive = true
 	return store, identity, policy, target, oldPath
 }

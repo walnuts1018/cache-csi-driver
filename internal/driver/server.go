@@ -13,7 +13,7 @@ import (
 const DriverName = "cache.csi.walnuts.dev"
 
 type ClassResolver interface {
-	Resolve(context.Context, string, string) (string, kube.ResolvedClass, error)
+	Resolve(context.Context, string, string, string, string) (string, string, kube.ResolvedClass, error)
 }
 
 type ProjectQuota interface {
@@ -22,6 +22,8 @@ type ProjectQuota interface {
 
 type mounter interface {
 	mount(string, string, bool, bool) error
+	prepareFallback(string, int64, bool) error
+	unmountGeneration(string) error
 	unmount(string) error
 	mountedAt(string) (bool, error)
 	sameCacheMount(string, string, bool, bool) (bool, error)
@@ -31,11 +33,13 @@ type mounter interface {
 }
 
 type Options struct {
-	NodeID        string
-	KubeletRoot   string
-	FallbackRoot  string
-	FallbackStore *cache.Store
-	VendorVersion string
+	NodeID                 string
+	KubeletRoot            string
+	FallbackRoot           string
+	FallbackStore          *cache.Store
+	FallbackMaxBytes       int64
+	FallbackVolumeMaxBytes int64
+	VendorVersion          string
 }
 
 type Server struct {
@@ -63,6 +67,12 @@ type podVolumeContext struct {
 func New(store *cache.Store, resolver ClassResolver, quotaManager ProjectQuota, options Options) *Server {
 	if options.VendorVersion == "" {
 		options.VendorVersion = "dev"
+	}
+	if options.FallbackMaxBytes <= 0 {
+		options.FallbackMaxBytes = 1 << 30
+	}
+	if options.FallbackVolumeMaxBytes <= 0 {
+		options.FallbackVolumeMaxBytes = 128 << 20
 	}
 	return &Server{store: store, fallbackStore: options.FallbackStore, resolver: resolver, quota: quotaManager, mounter: newMounter(), options: options}
 }

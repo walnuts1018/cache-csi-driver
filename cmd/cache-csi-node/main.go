@@ -46,6 +46,7 @@ func run(logger *slog.Logger) error {
 	cacheRoot := flag.String("cache-root", "/var/lib/cache-csi", "cache storage directory")
 	fallbackRoot := flag.String("fallback-root", "/run/cache-csi/fallback", "temporary cache directory used when Kubernetes API resolution fails")
 	fallbackMaxBytes := flag.String("fallback-max-bytes", "1Gi", "maximum total size of the fallback tmpfs filesystem")
+	fallbackVolumeMaxBytes := flag.String("fallback-volume-max-bytes", "128Mi", "maximum size reserved for one fallback cache volume")
 	nodeID := flag.String("node-id", os.Getenv("NODE_NAME"), "Kubernetes node name")
 	kubeletRoot := flag.String("kubelet-root", "/var/lib/kubelet", "kubelet root directory")
 	gcInterval := flag.Duration("gc-interval", 30*time.Second, "cache garbage collection interval")
@@ -66,39 +67,11 @@ func run(logger *slog.Logger) error {
 	if *nodeID == "" {
 		return fmt.Errorf("node ID must be configured")
 	}
-	for _, item := range []struct{ name, path string }{
-		{name: "cache root", path: *cacheRoot},
-		{name: "fallback root", path: *fallbackRoot},
-		{name: "kubelet root", path: *kubeletRoot},
-	} {
-		if !filepath.IsAbs(item.path) {
-			return fmt.Errorf("%s must be an absolute path", item.name)
-		}
-	}
-	fallbackSize, err := fallbackFilesystemSize(*fallbackMaxBytes)
+	paths, err := resolveRuntimePaths(*cacheRoot, *fallbackRoot, *kubeletRoot, *fallbackMaxBytes, *fallbackVolumeMaxBytes, *endpoint)
 	if err != nil {
 		return err
 	}
-	canonicalCacheRoot, err := canonicalPath(*cacheRoot)
-	if err != nil {
-		return fmt.Errorf("resolve cache root: %w", err)
-	}
-	canonicalFallbackRoot, err := canonicalPath(*fallbackRoot)
-	if err != nil {
-		return fmt.Errorf("resolve fallback root: %w", err)
-	}
-	canonicalKubeletRoot, err := canonicalPath(*kubeletRoot)
-	if err != nil {
-		return fmt.Errorf("resolve kubelet root: %w", err)
-	}
-	if pathsOverlap(canonicalCacheRoot, canonicalFallbackRoot) || pathsOverlap(canonicalKubeletRoot, canonicalFallbackRoot) {
-		return fmt.Errorf("fallback root must not overlap the cache root or kubelet root")
-	}
-	socketPath, err := parseEndpoint(*endpoint)
-	if err != nil {
-		return err
-	}
-	if err := mountFallbackTmpfs(*fallbackRoot, fallbackSize); err != nil {
+	if err := mountFallbackTmpfs(*fallbackRoot, paths.fallbackSize); err != nil {
 		return fmt.Errorf("prepare bounded fallback filesystem: %w", err)
 	}
 	if err := driver.PreflightMountAPI(); err != nil {
@@ -120,14 +93,14 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("initialize cache store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
-	fallbackStore, err := cache.NewStore(*fallbackRoot, cache.StoreOptions{Pressure: pressure})
+	fallbackStore, err := cache.NewStore(*fallbackRoot, cache.StoreOptions{UnmountGeneration: driver.UnmountFallbackGeneration})
 	if err != nil {
 		return fmt.Errorf("initialize fallback cache store: %w", errors.Join(err, store.Close()))
 	}
 	defer func() { _ = fallbackStore.Close() }()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	client, resolver := kubernetesClients(logger)
+	client, resolver := kubernetesClients(logger, *nodeID)
 	if resolver != nil {
 		resolver.Start(ctx)
 	}
@@ -146,17 +119,19 @@ func run(logger *slog.Logger) error {
 	}
 
 	service := driver.New(store, resolver, quota.XFS{Binary: "xfs_quota"}, driver.Options{
-		NodeID:        *nodeID,
-		KubeletRoot:   *kubeletRoot,
-		FallbackRoot:  *fallbackRoot,
-		FallbackStore: fallbackStore,
-		VendorVersion: version,
+		NodeID:                 *nodeID,
+		KubeletRoot:            *kubeletRoot,
+		FallbackRoot:           *fallbackRoot,
+		FallbackStore:          fallbackStore,
+		FallbackMaxBytes:       paths.fallbackSize,
+		FallbackVolumeMaxBytes: paths.fallbackVolumeSize,
+		VendorVersion:          version,
 	})
 	grpcServer := grpc.NewServer()
 	csi.RegisterIdentityServer(grpcServer, service)
 	csi.RegisterNodeServer(grpcServer, service)
 
-	listener, cleanupSocket, err := listenUnixSocket(socketPath)
+	listener, cleanupSocket, err := listenUnixSocket(paths.socketPath)
 	if err != nil {
 		return fmt.Errorf("listen on CSI endpoint: %w", err)
 	}
@@ -201,6 +176,58 @@ func run(logger *slog.Logger) error {
 	}
 	<-managerDone
 	return nil
+}
+
+type runtimePaths struct {
+	socketPath         string
+	fallbackSize       int64
+	fallbackVolumeSize int64
+}
+
+func resolveRuntimePaths(cacheRoot, fallbackRoot, kubeletRoot, fallbackMaxBytes, fallbackVolumeMaxBytes, endpoint string) (runtimePaths, error) {
+	for _, item := range []struct{ name, path string }{
+		{name: "cache root", path: cacheRoot},
+		{name: "fallback root", path: fallbackRoot},
+		{name: "kubelet root", path: kubeletRoot},
+	} {
+		if !filepath.IsAbs(item.path) {
+			return runtimePaths{}, fmt.Errorf("%s must be an absolute path", item.name)
+		}
+	}
+	fallbackSize, err := fallbackFilesystemSize(fallbackMaxBytes)
+	if err != nil {
+		return runtimePaths{}, err
+	}
+	fallbackVolumeSize, err := fallbackFilesystemSize(fallbackVolumeMaxBytes)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("parse fallback per-volume maximum: %w", err)
+	}
+	if fallbackVolumeSize > fallbackSize {
+		return runtimePaths{}, errors.New("fallback per-volume maximum must not exceed the aggregate fallback maximum")
+	}
+	canonicalCacheRoot, err := canonicalPath(cacheRoot)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("resolve cache root: %w", err)
+	}
+	canonicalFallbackRoot, err := canonicalPath(fallbackRoot)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("resolve fallback root: %w", err)
+	}
+	canonicalKubeletRoot, err := canonicalPath(kubeletRoot)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("resolve kubelet root: %w", err)
+	}
+	if pathsOverlap(canonicalCacheRoot, canonicalFallbackRoot) || pathsOverlap(canonicalKubeletRoot, canonicalFallbackRoot) {
+		return runtimePaths{}, fmt.Errorf("fallback root must not overlap the cache root or kubelet root")
+	}
+	if pathsOverlap(canonicalCacheRoot, canonicalKubeletRoot) {
+		return runtimePaths{}, fmt.Errorf("cache root must not overlap the kubelet root")
+	}
+	socketPath, err := parseEndpoint(endpoint)
+	if err != nil {
+		return runtimePaths{}, err
+	}
+	return runtimePaths{socketPath: socketPath, fallbackSize: fallbackSize, fallbackVolumeSize: fallbackVolumeSize}, nil
 }
 
 func fallbackFilesystemSize(value string) (int64, error) {
@@ -250,7 +277,7 @@ func canonicalPath(path string) (string, error) {
 	}
 }
 
-func kubernetesClients(logger *slog.Logger) (kubernetes.Interface, *kube.Resolver) {
+func kubernetesClients(logger *slog.Logger, nodeName string) (kubernetes.Interface, *kube.Resolver) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		logger.Warn("in-cluster Kubernetes configuration is unavailable; using isolated fallback caches", "error", err)
@@ -264,7 +291,7 @@ func kubernetesClients(logger *slog.Logger) (kubernetes.Interface, *kube.Resolve
 	if clientErr != nil {
 		logger.Warn("create Kubernetes client for cache pressure eviction failed", "error", clientErr)
 	}
-	resolver, resolverErr := kube.NewResolver(config)
+	resolver, resolverErr := kube.NewResolver(config, nodeName)
 	if resolverErr != nil {
 		logger.Warn("create CacheClass resolver failed; using isolated fallback caches", "error", resolverErr)
 	}

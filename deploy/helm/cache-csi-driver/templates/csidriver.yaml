@@ -8,6 +8,7 @@ spec:
   attachRequired: false
   fsGroupPolicy: None
   podInfoOnMount: true
+  seLinuxMount: false
   volumeLifecycleModes:
     - Ephemeral
   {{- if .Values.csiDriver.preventPodSchedulingIfMissing }}

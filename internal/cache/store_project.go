@@ -19,6 +19,11 @@ type projectReservation struct {
 	TrashID    string `json:"trashID,omitempty"`
 }
 
+type projectReservationKey struct {
+	identity   string
+	generation string
+}
+
 type projectReservationDocument struct {
 	FormatVersion       int                         `json:"formatVersion"`
 	Reservations        []projectIDReservation      `json:"reservations"`
@@ -111,6 +116,7 @@ func (s *Store) reconcileProjectReservations(entries, trashEntries []os.DirEntry
 			s.projectReservations[projectID] = kept
 		}
 	}
+	s.rebuildProjectReservationIndexes()
 	for identity, trashID := range s.unknownProjectReservations {
 		previous := trashID
 		trashID, retain := s.reconcileUnknownProjectReservation(identity, trashID, objects, trash)
@@ -209,16 +215,15 @@ func (s *Store) addMetadataReservations(meta Metadata, trashID string) {
 }
 
 func (s *Store) addProjectReservation(projectID uint32, reservation projectReservation) {
-	for existingProjectID, reservations := range s.projectReservations {
-		for _, existing := range reservations {
-			if (existingProjectID == projectID && (existing.Identity != reservation.Identity || existing.Generation != reservation.Generation)) ||
-				(existingProjectID != projectID && existing.Identity == reservation.Identity && existing.Generation == reservation.Generation) {
-				s.projectRegistryDamaged = true
-			}
-		}
+	key := projectReservationKey{identity: reservation.Identity, generation: reservation.Generation}
+	if existing, found := s.projectOwnersByID[projectID]; found && existing != key {
+		s.projectRegistryDamaged = true
+	}
+	if existing, found := s.projectIDByGeneration[key]; found && existing != projectID {
+		s.projectRegistryDamaged = true
 	}
 	for index, existing := range s.projectReservations[projectID] {
-		if existing.Identity == reservation.Identity && existing.Generation == reservation.Generation {
+		if existing.Identity == key.identity && existing.Generation == key.generation {
 			if existing != reservation {
 				s.projectReservations[projectID][index] = reservation
 				s.projectRegistryDirty = true
@@ -227,7 +232,56 @@ func (s *Store) addProjectReservation(projectID uint32, reservation projectReser
 		}
 	}
 	s.projectReservations[projectID] = append(s.projectReservations[projectID], reservation)
+	if _, found := s.projectOwnersByID[projectID]; !found {
+		s.projectOwnersByID[projectID] = key
+	}
+	if _, found := s.projectIDByGeneration[key]; !found {
+		s.projectIDByGeneration[key] = projectID
+	}
 	s.projectRegistryDirty = true
+}
+
+func (s *Store) rebuildProjectReservationIndexes() {
+	clear(s.projectOwnersByID)
+	clear(s.projectIDByGeneration)
+	for projectID, reservations := range s.projectReservations {
+		for _, reservation := range reservations {
+			key := projectReservationKey{identity: reservation.Identity, generation: reservation.Generation}
+			if owner, found := s.projectOwnersByID[projectID]; found && owner != key {
+				s.projectRegistryDamaged = true
+			} else {
+				s.projectOwnersByID[projectID] = key
+			}
+			if existing, found := s.projectIDByGeneration[key]; found && existing != projectID {
+				s.projectRegistryDamaged = true
+			} else {
+				s.projectIDByGeneration[key] = projectID
+			}
+		}
+	}
+}
+
+func (s *Store) syncProjectReservationIndexes(projectID uint32) {
+	reservations := s.projectReservations[projectID]
+	if len(reservations) == 0 {
+		delete(s.projectOwnersByID, projectID)
+	} else {
+		reservation := reservations[0]
+		s.projectOwnersByID[projectID] = projectReservationKey{identity: reservation.Identity, generation: reservation.Generation}
+	}
+	for key, indexedProjectID := range s.projectIDByGeneration {
+		if indexedProjectID == projectID && !slices.ContainsFunc(reservations, func(reservation projectReservation) bool {
+			return reservation.Identity == key.identity && reservation.Generation == key.generation
+		}) {
+			delete(s.projectIDByGeneration, key)
+		}
+	}
+	for _, reservation := range reservations {
+		key := projectReservationKey{identity: reservation.Identity, generation: reservation.Generation}
+		if _, found := s.projectIDByGeneration[key]; !found {
+			s.projectIDByGeneration[key] = projectID
+		}
+	}
 }
 
 func (s *Store) addUnknownProjectReservation(identity, trashID string) {
@@ -346,6 +400,7 @@ func (s *Store) restoreProjectReservation(projectID uint32, identity, generation
 			s.projectReservations[projectID] = reservations
 		}
 	}
+	s.rebuildProjectReservationIndexes()
 	if err := s.persistProjectReservations(); err != nil {
 		return fmt.Errorf("restore project ID reservation after failed retired generation detach: %w", err)
 	}

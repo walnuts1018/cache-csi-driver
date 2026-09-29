@@ -145,6 +145,9 @@ func (s *Server) unpublishFallback(req *csi.NodeUnpublishVolumeRequest, mounted 
 		if err := removeTargetDirectory(req.GetTargetPath()); err != nil {
 			return status.Errorf(codes.Internal, "remove fallback target: %v", err)
 		}
+		if err := s.mounter.unmountGeneration(source); err != nil {
+			return status.Errorf(codes.Internal, "unmount bounded fallback generation: %v", err)
+		}
 		if err := s.fallbackStore.Release(req.GetVolumeId(), lease.Target); err != nil {
 			return status.Errorf(codes.Internal, "release fallback cache lease: %v", err)
 		}

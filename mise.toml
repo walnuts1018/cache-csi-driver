@@ -17,6 +17,10 @@ go build -trimpath -o dist/cache-csi-node ./cmd/cache-csi-node
 description = "Run Go tests"
 run = "go test ./..."
 
+[tasks."test:race"]
+description = "Run Go tests with the race detector"
+run = "go test -race ./..."
+
 [tasks."test:csi-sanity"]
 description = "Node-only CSI capability checks with csi-sanity"
 run = """
@@ -91,7 +95,7 @@ docker run --rm --privileged --platform "linux/$go_arch" \
   -v "$tmp_dir:/tmp/cache-csi-mount-api:ro" \
   --entrypoint /tmp/cache-csi-mount-api/mount-api.test \
   ubuntu:26.04 \
-  -test.v -test.count=1 -test.run '^Test(MountUsesOpenTreeMountSetattrMoveMount|RecoverPreparingLeaseAfterDriverRestartWithAttachedMount)$'
+  -test.v -test.count=1 -test.run '^Test(MountUsesOpenTreeMountSetattrMoveMount|RecoverPreparingLeaseAfterDriverRestartWithAttachedMount|FallbackGenerationTmpfsEnforcesItsByteLimit|RecoverCorruptFallbackUnmountsGenerationBeforeQuarantine)$'
 """
 
 [tasks."test:xfs-quota"]

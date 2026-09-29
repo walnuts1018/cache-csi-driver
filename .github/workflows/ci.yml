@@ -36,6 +36,9 @@ jobs:
       - name: Run Go tests
         run: mise run test
 
+      - name: Run Go race tests
+        run: mise run test:race
+
       - name: Run CSI conformance checks for node capabilities
         run: mise run test:csi-sanity
 

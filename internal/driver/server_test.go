@@ -162,6 +162,7 @@ func TestNodePublishRollsBackLeaseWhenQuotaConfigurationFails(t *testing.T) {
 	quotaFailure := errors.New("quota configuration failed")
 	spec := cachev1alpha1.CacheClassSpec{
 		Backend: cachev1alpha1.BackendXFSProject,
+		NoExec:  true,
 		Quota: cachev1alpha1.QuotaPolicy{
 			Enabled:         true,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
@@ -169,19 +170,28 @@ func TestNodePublishRollsBackLeaseWhenQuotaConfigurationFails(t *testing.T) {
 	}
 	server, mounts, store := newTestServer(t, spec, quotaFailure)
 	request := newPublishRequest(t, server.options.KubeletRoot, "quota-volume")
+	request.VolumeContext["maxBytes"] = "1Mi"
 
 	_, err := server.NodePublishVolume(t.Context(), request)
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("publish error = %v, want FailedPrecondition", err)
+	if err != nil {
+		t.Fatalf("publish with fallback after quota configuration failure: %v", err)
 	}
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(request.GetVolumeId()); leaseErr != nil || found {
 		t.Fatalf("cache lease found = %t, error = %v; want the failed lease rolled back", found, leaseErr)
 	}
-	if _, _, _, _, found, leaseErr := server.fallbackStore.LeaseDetails(request.GetVolumeId()); leaseErr != nil || found {
-		t.Fatalf("fallback lease found = %t, error = %v; quota failure must not create fallback state", found, leaseErr)
+	if _, lease, _, policy, found, leaseErr := server.fallbackStore.LeaseDetails(request.GetVolumeId()); leaseErr != nil || !found {
+		t.Fatalf("fallback lease found = %t, error = %v; want bounded fallback after quota failure", found, leaseErr)
+	} else if policy.MaxBytes != 1<<20 || !lease.NoExec || !policy.NoExec {
+		t.Fatalf("fallback lease policy = (%+v, %+v), want 1Mi and noexec", lease, policy)
 	}
-	if mounts.mountCalls != 0 {
-		t.Fatalf("mount calls = %d, want 0 after quota failure", mounts.mountCalls)
+	if mounts.mountCalls != 1 || !mounts.mounts[request.GetTargetPath()].noExec {
+		t.Fatalf("mount calls = %d, mount = %+v; want one noexec fallback mount", mounts.mountCalls, mounts.mounts[request.GetTargetPath()])
+	}
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatalf("idempotent republish of bounded fallback: %v", err)
+	}
+	if mounts.mountCalls != 1 {
+		t.Fatalf("idempotent fallback republish called mount %d times, want one", mounts.mountCalls)
 	}
 }
 
@@ -207,7 +217,7 @@ func TestNodePublishRollsBackLeaseWhenDetachedMountSetupFails(t *testing.T) {
 func TestNodePublishUsesFallbackForExclusiveSharingConflict(t *testing.T) {
 	t.Parallel()
 
-	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{SharingPolicy: cachev1alpha1.SharingPolicyExclusive, EvictRunning: true}, nil)
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{SharingPolicy: cachev1alpha1.SharingPolicyExclusive, EvictRunning: true, NoExec: true}, nil)
 	first := newPublishRequest(t, server.options.KubeletRoot, "exclusive-first")
 	if _, err := server.NodePublishVolume(t.Context(), first); err != nil {
 		t.Fatal(err)
@@ -235,9 +245,9 @@ func TestNodePublishUsesFallbackForExclusiveSharingConflict(t *testing.T) {
 func TestNodePublishUsesFallbackForDegradedMetadataWithoutQuota(t *testing.T) {
 	t.Parallel()
 
-	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{NoExec: true}, nil)
 	request := newPublishRequest(t, server.options.KubeletRoot, "degraded-unmounted-volume")
-	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	identity, err := cache.IdentityWithServiceAccount("namespace-uid", "service-account-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,11 +313,13 @@ func TestNodePublishKeepsQuotaIdentityConflictHard(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := newPublishRequest(t, server.options.KubeletRoot, "quota-exclusive-second")
-	if _, err := server.NodePublishVolume(t.Context(), second); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("second publish error = %v, want FailedPrecondition", err)
+	if _, err := server.NodePublishVolume(t.Context(), second); err != nil {
+		t.Fatalf("second publish should use an isolated fallback cache: %v", err)
 	}
-	if _, _, _, _, found, err := server.fallbackStore.LeaseDetails(second.GetVolumeId()); err != nil || found {
-		t.Fatalf("fallback lease found = %t, error = %v; quota policy must not be bypassed", found, err)
+	if _, _, _, policy, found, err := server.fallbackStore.LeaseDetails(second.GetVolumeId()); err != nil || !found {
+		t.Fatalf("fallback lease found = %t, error = %v; want fallback for exclusive quota conflict", found, err)
+	} else if policy.MaxBytes != 1<<20 {
+		t.Fatalf("fallback maxBytes = %d, want 1Mi", policy.MaxBytes)
 	}
 }
 
@@ -424,11 +436,12 @@ func TestFallbackRejectsHardResolutionErrorsLimitsAndCancellation(t *testing.T) 
 	t.Parallel()
 
 	cases := []struct {
-		name       string
-		resolver   ClassResolver
-		maxBytes   string
-		cancel     bool
-		wantStatus codes.Code
+		name         string
+		resolver     ClassResolver
+		maxBytes     string
+		cancel       bool
+		wantStatus   codes.Code
+		wantFallback bool
 	}{
 		{
 			name:       "CacheClass not found",
@@ -446,10 +459,11 @@ func TestFallbackRejectsHardResolutionErrorsLimitsAndCancellation(t *testing.T) 
 			wantStatus: codes.Unavailable,
 		},
 		{
-			name:       "maxBytes has no resolved quota policy",
-			resolver:   nil,
-			maxBytes:   "1Mi",
-			wantStatus: codes.FailedPrecondition,
+			name:         "maxBytes uses a bounded fallback when resolver is unavailable",
+			resolver:     nil,
+			maxBytes:     "1Mi",
+			wantStatus:   codes.OK,
+			wantFallback: true,
 		},
 		{
 			name:       "cancelled request",
@@ -480,8 +494,11 @@ func TestFallbackRejectsHardResolutionErrorsLimitsAndCancellation(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(filepath.Join(server.fallbackStore.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("%s: fallback object was created: %v", test.name, err)
+		_, statErr := os.Stat(filepath.Join(server.fallbackStore.Root(), identity))
+		if test.wantFallback && statErr != nil {
+			t.Errorf("%s: fallback object was not created: %v", test.name, statErr)
+		} else if !test.wantFallback && !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("%s: fallback object was created: %v", test.name, statErr)
 		}
 	}
 }
@@ -560,7 +577,7 @@ func TestNodeUnpublishPreservesLeaseForForeignMount(t *testing.T) {
 
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 	request := newPublishRequest(t, server.options.KubeletRoot, "foreign-unpublish-volume")
-	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	identity, err := cache.IdentityWithServiceAccount("namespace-uid", "service-account-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +620,7 @@ func TestNodeGetVolumeHealthReportsUnreadableMetadataAsInaccessible(t *testing.T
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 	request := newPublishRequest(t, server.options.KubeletRoot, "unreadable-metadata-volume")
 	request.VolumeId = inlineVolumeID(testPodUID, "unreadable-metadata-volume")
-	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	identity, err := cache.IdentityWithServiceAccount("namespace-uid", "service-account-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +670,7 @@ func TestRecoverCacheLeasesVerifiesMountSourceAndOptions(t *testing.T) {
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{NoExec: true}, nil)
 	request := newPublishRequest(t, server.options.KubeletRoot, "recovery-volume")
 	request.Readonly = true
-	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	identity, err := cache.IdentityWithServiceAccount("namespace-uid", "service-account-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,7 +745,7 @@ func TestPolicyForMapsSharingPolicy(t *testing.T) {
 		input  cachev1alpha1.SharingPolicy
 		wanted string
 	}{
-		{name: "default", wanted: string(cachev1alpha1.SharingPolicyShared)},
+		{name: "default", wanted: string(cachev1alpha1.SharingPolicyExclusive)},
 		{name: "shared", input: cachev1alpha1.SharingPolicyShared, wanted: string(cachev1alpha1.SharingPolicyShared)},
 		{name: "exclusive", input: cachev1alpha1.SharingPolicyExclusive, wanted: string(cachev1alpha1.SharingPolicyExclusive)},
 	}
@@ -762,11 +779,11 @@ type testResolver struct {
 	err  error
 }
 
-func (resolver *testResolver) Resolve(context.Context, string, string) (string, kube.ResolvedClass, error) {
+func (resolver *testResolver) Resolve(context.Context, string, string, string, string) (string, string, kube.ResolvedClass, error) {
 	if resolver.err != nil {
-		return "", kube.ResolvedClass{}, resolver.err
+		return "", "", kube.ResolvedClass{}, resolver.err
 	}
-	return "namespace-uid", kube.ResolvedClass{
+	return "namespace-uid", "service-account-uid", kube.ResolvedClass{
 		Object: cachev1alpha1.CacheClass{Spec: resolver.spec},
 		UID:    "class-uid",
 	}, nil
@@ -880,7 +897,7 @@ func prepareDamagedMountedCache(t *testing.T, server *Server, mounts *testMounte
 	t.Helper()
 	request := newPublishRequest(t, server.options.KubeletRoot, volumeID)
 	request.VolumeId = inlineVolumeID(testPodUID, volumeID)
-	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	identity, err := cache.IdentityWithServiceAccount("namespace-uid", "service-account-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -919,6 +936,9 @@ func (mounts *testMounter) mount(source, target string, readOnly, noExec bool) e
 	mounts.mounts[target] = testMount{source: source, readOnly: readOnly, noExec: noExec}
 	return nil
 }
+
+func (*testMounter) prepareFallback(string, int64, bool) error { return nil }
+func (*testMounter) unmountGeneration(string) error            { return nil }
 
 func (mounts *testMounter) unmount(target string) error {
 	mounts.unmountCalls++

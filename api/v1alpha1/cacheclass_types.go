@@ -8,6 +8,7 @@ import (
 type CacheBackend string
 type CrashRecoveryPolicy string
 type SharingPolicy string
+type CacheScope string
 
 const (
 	BackendDirectory       CacheBackend        = "directory"
@@ -16,6 +17,8 @@ const (
 	CrashRecoveryReuse     CrashRecoveryPolicy = "reuse"
 	SharingPolicyShared    SharingPolicy       = "Shared"
 	SharingPolicyExclusive SharingPolicy       = "Exclusive"
+	ScopeServiceAccount    CacheScope          = "ServiceAccount"
+	ScopeNamespace         CacheScope          = "Namespace"
 )
 
 // CacheClassSpec defines storage and reuse behavior for node-local cache generations.
@@ -48,9 +51,13 @@ type CacheClassSpec struct {
 	// +kubebuilder:validation:Enum=discard;reuse
 	CrashRecovery CrashRecoveryPolicy `json:"crashRecovery,omitempty"`
 	// SharingPolicy describes concurrent access to a cache generation. Shared is safe only when the cache implementation supports concurrent multi-process access and all Pods using the same cacheKey coordinate writes. Pods must use compatible effective UID and GID values because existing file modes can prevent a Pod with different credentials from writing reused data.
-	// +kubebuilder:default=Shared
+	// +kubebuilder:default=Exclusive
 	// +kubebuilder:validation:Enum=Shared;Exclusive
 	SharingPolicy SharingPolicy `json:"sharingPolicy,omitempty"`
+	// Scope defines the workload trust boundary included in cache identity. Namespace allows all workloads in a namespace to share identity; ServiceAccount isolates workloads by ServiceAccount UID.
+	// +kubebuilder:default=ServiceAccount
+	// +kubebuilder:validation:Enum=ServiceAccount;Namespace
+	Scope CacheScope `json:"scope,omitempty"`
 	// Quota configuration for cache generations.
 	Quota QuotaPolicy `json:"quota,omitzero"`
 	// Allows best-effort pressure handling to request graceful eviction of Pods using active cache generations. Eviction requests respect PodDisruptionBudgets and do not guarantee cache reclamation.

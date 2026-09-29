@@ -157,6 +157,14 @@ func (s *Store) underLowWatermark(fs unix.Statfs_t) bool {
 	return below(fs.Bavail, fs.Blocks, s.pressure.LowFreePercent) || below(fs.Ffree, fs.Files, s.pressure.LowInodeFreePercent)
 }
 
+func (s *Store) pressureActiveLocked() (bool, error) {
+	usage, err := filesystemUsage(s.root)
+	if err != nil {
+		return false, err
+	}
+	return s.updatePressure(usage), nil
+}
+
 func (s *Store) updatePressure(fs unix.Statfs_t) bool {
 	if !s.pressureActive {
 		s.pressureActive = s.underLowWatermark(fs)
