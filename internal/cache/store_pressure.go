@@ -175,6 +175,7 @@ func (s *Store) pressureActiveLocked() (bool, error) {
 func (s *Store) updatePressure(fs unix.Statfs_t) bool {
 	if !s.pressureActive {
 		s.pressureActive = s.underLowWatermark(fs)
+		s.updatePressureState(fs)
 		return s.pressureActive
 	}
 	bytesRecovered := s.pressure.HighFreePercent == 0 || above(fs.Bavail, fs.Blocks, s.pressure.HighFreePercent)
@@ -182,7 +183,19 @@ func (s *Store) updatePressure(fs unix.Statfs_t) bool {
 	if bytesRecovered && inodesRecovered {
 		s.pressureActive = false
 	}
+	s.updatePressureState(fs)
 	return s.pressureActive
+}
+
+func (s *Store) updatePressureState(fs unix.Statfs_t) {
+	s.pressureState = pressureStateNormal
+	if !s.pressureActive {
+		return
+	}
+	s.pressureState = "reclaiming"
+	if s.underCriticalWatermark(fs) {
+		s.pressureState = "critical"
+	}
 }
 
 func (s *Store) underCriticalWatermark(fs unix.Statfs_t) bool {

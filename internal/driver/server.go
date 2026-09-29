@@ -2,10 +2,13 @@ package driver
 
 import (
 	"context"
+	"log/slog"
+	"sync/atomic"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 	"github.com/walnuts1018/cache-csi-driver/internal/kube"
+	"github.com/walnuts1018/cache-csi-driver/internal/metrics"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -40,19 +43,24 @@ type Options struct {
 	FallbackMaxBytes       int64
 	FallbackVolumeMaxBytes int64
 	VendorVersion          string
+	Metrics                *metrics.Metrics
+	Logger                 *slog.Logger
 }
 
 type Server struct {
 	csi.UnimplementedIdentityServer
 	csi.UnimplementedNodeServer
-	store         *cache.Store
-	fallbackStore *cache.Store
-	resolver      ClassResolver
-	quota         ProjectQuota
-	mounter       mounter
-	options       Options
-	locks         operationLocks
-	identityLocks operationLocks
+	store           *cache.Store
+	fallbackStore   *cache.Store
+	resolver        ClassResolver
+	quota           ProjectQuota
+	mounter         mounter
+	options         Options
+	locks           operationLocks
+	identityLocks   operationLocks
+	metrics         *metrics.Metrics
+	logger          *slog.Logger
+	backendDegraded atomic.Bool
 }
 
 type podVolumeContext struct {
@@ -75,7 +83,19 @@ func New(store *cache.Store, resolver ClassResolver, quotaManager ProjectQuota, 
 	if options.FallbackVolumeMaxBytes <= 0 {
 		options.FallbackVolumeMaxBytes = 128 << 20
 	}
-	return &Server{store: store, fallbackStore: options.FallbackStore, resolver: resolver, quota: quotaManager, mounter: newMounter(), options: options}
+	if options.Logger == nil {
+		options.Logger = slog.Default()
+	}
+	return &Server{
+		store:         store,
+		fallbackStore: options.FallbackStore,
+		resolver:      resolver,
+		quota:         quotaManager,
+		mounter:       newMounter(),
+		options:       options,
+		metrics:       options.Metrics,
+		logger:        options.Logger,
+	}
 }
 
 func (s *Server) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {

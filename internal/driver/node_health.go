@@ -87,6 +87,9 @@ func (s *Server) NodeGetStorageHealth(context.Context, *csi.NodeGetStorageHealth
 	if !s.store.Ready() {
 		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheRecoveryInProgress", "cache store recovery is still in progress")
 	}
+	if s.backendDegraded.Load() {
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheBackendOperationFailed", "an unexpected cache backend operation failed since plugin startup; failed cache publishes use fallback")
+	}
 	backends := []struct {
 		store             *cache.Store
 		recoveryReason    string

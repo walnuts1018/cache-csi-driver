@@ -95,6 +95,7 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 			continue
 		}
 		s.mu.Lock()
+		s.trashDeleted++
 		reservationsBeforeCleanup := make(map[uint32][]projectReservation, len(s.projectReservations))
 		for projectID, reservations := range s.projectReservations {
 			reservationsBeforeCleanup[projectID] = slices.Clone(reservations)
@@ -281,6 +282,10 @@ func (s *Store) restoreObjectTrashReservation(identity, trashID string) error {
 }
 
 func (s *Store) indexObjectInTrash(identity, trashID string, meta Metadata) {
+	if previous, exists := s.metadataByIdentity[identity]; exists {
+		s.removeFallbackReservation(previous)
+		s.retiredGenerationCount -= len(previous.Retired)
+	}
 	delete(s.metadataByIdentity, identity)
 	maps.DeleteFunc(s.leaseIndex, func(_ string, leaseIdentity string) bool { return leaseIdentity == identity })
 	if meta.Identity == identity {

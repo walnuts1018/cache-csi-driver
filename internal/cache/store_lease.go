@@ -209,15 +209,9 @@ func (s *Store) AcquireFallback(options AcquireOptions, requestedBytes, perVolum
 	if len(s.degraded) != 0 {
 		return FallbackAllocation{}, ErrDegradedMetadata
 	}
-	var reserved int64
-	for _, meta := range s.metadataByIdentity {
-		if len(meta.Leases) == 0 {
-			continue
-		}
-		if meta.Policy.MaxBytes <= 0 || meta.Policy.MaxBytes > totalMaxBytes-reserved {
-			return FallbackAllocation{}, errors.New("fallback cache reservations exceed the configured aggregate limit")
-		}
-		reserved += meta.Policy.MaxBytes
+	reserved := s.fallbackReservedBytes
+	if reserved < 0 || reserved > totalMaxBytes {
+		return FallbackAllocation{}, errors.New("fallback cache reservations exceed the configured aggregate limit")
 	}
 	available := totalMaxBytes - reserved
 	limit := perVolumeMaxBytes

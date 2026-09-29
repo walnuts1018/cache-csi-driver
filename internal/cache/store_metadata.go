@@ -105,6 +105,8 @@ type Metadata struct {
 func (s *Store) indexObjectMetadata(meta Metadata) {
 	_, recoveringDegraded := s.degraded[meta.Identity]
 	if previous, exists := s.metadataByIdentity[meta.Identity]; exists {
+		s.removeFallbackReservation(previous)
+		s.retiredGenerationCount -= len(previous.Retired)
 		for _, lease := range previous.Leases {
 			delete(s.leaseIndex, lease.ID)
 		}
@@ -117,6 +119,8 @@ func (s *Store) indexObjectMetadata(meta Metadata) {
 		}
 	}
 	s.metadataByIdentity[meta.Identity] = meta
+	s.addFallbackReservation(meta)
+	s.retiredGenerationCount += len(meta.Retired)
 	delete(s.degraded, meta.Identity)
 	for _, lease := range meta.Leases {
 		s.leaseIndex[lease.ID] = meta.Identity
@@ -150,8 +154,24 @@ func (s *Store) indexObjectMetadata(meta Metadata) {
 }
 
 func (s *Store) markDegraded(identity string, cause error) {
+	if previous, exists := s.metadataByIdentity[identity]; exists {
+		s.removeFallbackReservation(previous)
+		s.retiredGenerationCount -= len(previous.Retired)
+	}
 	delete(s.metadataByIdentity, identity)
 	s.degraded[identity] = fmt.Errorf("%w: %v", ErrDegradedMetadata, cause)
+}
+
+func (s *Store) addFallbackReservation(meta Metadata) {
+	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) > 0 && meta.Policy.MaxBytes > 0 {
+		s.fallbackReservedBytes += meta.Policy.MaxBytes
+	}
+}
+
+func (s *Store) removeFallbackReservation(meta Metadata) {
+	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) > 0 && meta.Policy.MaxBytes > 0 {
+		s.fallbackReservedBytes -= meta.Policy.MaxBytes
+	}
 }
 
 func (s *Store) indexDegradedLeaseIDs(identity string, meta Metadata) {

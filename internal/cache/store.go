@@ -29,6 +29,8 @@ var ErrFallbackLeaseConflict = errors.New("fallback cache lease ID is already in
 
 var ErrStoreNotReady = errors.New("cache store indexes are not ready")
 
+const pressureStateNormal = "normal"
+
 type PressureConfig struct {
 	HighFreePercent          int
 	LowFreePercent           int
@@ -55,6 +57,7 @@ type Store struct {
 	projectRegistryDamaged     bool
 	projectRegistryDirty       bool
 	pressureActive             bool
+	pressureState              string
 	pressureDetachFailed       map[string]struct{}
 	metadataByIdentity         map[string]Metadata
 	leaseIndex                 map[string]string
@@ -64,6 +67,9 @@ type Store struct {
 	projectIDByGeneration      map[projectReservationKey]uint32
 	unknownProjectReservations map[string]string
 	trashMetadata              map[string]Metadata
+	trashDeleted               uint64
+	fallbackReservedBytes      int64
+	retiredGenerationCount     int
 	trashCursor                string
 	removeTrashEntry           func(string) error
 	mu                         sync.Mutex
@@ -81,7 +87,31 @@ type Store struct {
 	collectorFinished          bool
 }
 
+type RuntimeStats struct {
+	Ready                 bool
+	PressureState         string
+	DegradedObjects       int
+	CacheObjects          int
+	RetiredGenerations    int
+	FallbackReservedBytes int64
+	TrashObjectsDeleted   uint64
+}
+
 func (s *Store) Root() string { return s.root }
+
+func (s *Store) RuntimeStats() RuntimeStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return RuntimeStats{
+		Ready:                 s.ready.Load(),
+		PressureState:         s.pressureState,
+		DegradedObjects:       len(s.degraded),
+		CacheObjects:          len(s.metadataByIdentity),
+		RetiredGenerations:    s.retiredGenerationCount,
+		FallbackReservedBytes: s.fallbackReservedBytes,
+		TrashObjectsDeleted:   s.trashDeleted,
+	}
+}
 
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
@@ -231,6 +261,7 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		rootFS:                     rootFS,
 		unmountGeneration:          options.UnmountGeneration,
 		pressure:                   options.Pressure,
+		pressureState:              pressureStateNormal,
 		projectIDStart:             options.ProjectIDStart,
 		projectIDCount:             options.ProjectIDCount,
 		pressureDetachFailed:       make(map[string]struct{}),
@@ -305,6 +336,9 @@ func (s *Store) resetIndexState() {
 	s.projectRegistryDamaged = false
 	s.projectRegistryDirty = false
 	s.pressureActive = false
+	s.pressureState = pressureStateNormal
+	s.fallbackReservedBytes = 0
+	s.retiredGenerationCount = 0
 	s.trashCursor = ""
 }
 

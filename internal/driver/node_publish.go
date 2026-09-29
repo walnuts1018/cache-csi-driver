@@ -33,11 +33,12 @@ func (s *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
-	handled, err := s.handleExistingPublish(req)
+	outcome, err := s.handleExistingPublish(req)
 	if err != nil {
 		return nil, err
 	}
-	if handled {
+	if outcome != "" {
+		s.recordPublishOutcome(outcome)
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 	if err := s.publish(ctx, req, volumeContext); err != nil {
@@ -52,7 +53,7 @@ func (s *Server) publishWhileStoreNotReady(ctx context.Context, req *csi.NodePub
 		return status.Errorf(codes.Internal, "inspect target mount while cache store is recovering: %v", err)
 	}
 	if !mounted {
-		return s.publishFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly)
+		return s.useFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly, expectedFallbackCause("store_recovering"), nil)
 	}
 	if s.fallbackStore != nil {
 		_, lease, source, _, found, err := s.fallbackStore.LeaseDetails(req.GetVolumeId())
@@ -65,6 +66,7 @@ func (s *Server) publishWhileStoreNotReady(ctx context.Context, req *csi.NodePub
 				return err
 			}
 			if handled {
+				s.recordFallbackReuse()
 				return nil
 			}
 		}
@@ -75,6 +77,7 @@ func (s *Server) publishWhileStoreNotReady(ctx context.Context, req *csi.NodePub
 		return status.Errorf(codes.Internal, "verify fallback mount while cache store is recovering: %v", err)
 	}
 	if same {
+		s.recordFallbackReuse()
 		return nil
 	}
 	return status.Error(codes.Unavailable, "cache store recovery is in progress and the existing mount has not been verified")
@@ -101,9 +104,6 @@ func (s *Server) validatePublishRequest(req *csi.NodePublishVolumeRequest) (podV
 	if accessMode.GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY && !req.GetReadonly() {
 		return podVolumeContext{}, status.Error(codes.InvalidArgument, "single-node reader-only access requires a readonly volume publish")
 	}
-	if err := s.validateTarget(req.GetTargetPath()); err != nil {
-		return podVolumeContext{}, status.Error(codes.InvalidArgument, err.Error())
-	}
 	attributes := req.GetVolumeContext()
 	volumeContext := podVolumeContext{
 		namespace:          attributes["csi.storage.k8s.io/pod.namespace"],
@@ -120,6 +120,9 @@ func (s *Server) validatePublishRequest(req *csi.NodePublishVolumeRequest) (podV
 	if volumeContext.namespace == "" || volumeContext.name == "" || volumeContext.uid == "" || volumeContext.cacheClass == "" || volumeContext.cacheKey == "" {
 		return podVolumeContext{}, status.Error(codes.InvalidArgument, "pod information, cacheClass, and cacheKey are required")
 	}
+	if err := s.validatePublishTarget(req.GetTargetPath(), volumeContext.uid); err != nil {
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, err.Error())
+	}
 	if len(volumeContext.cacheKey) > 1024 || strings.ContainsRune(volumeContext.cacheKey, '\x00') {
 		return podVolumeContext{}, status.Error(codes.InvalidArgument, "cacheKey is invalid or exceeds 1024 bytes")
 	}
@@ -132,13 +135,13 @@ func (s *Server) validatePublishRequest(req *csi.NodePublishVolumeRequest) (podV
 	return volumeContext, nil
 }
 
-func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (bool, error) {
+func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (string, error) {
 	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
 	if err != nil {
-		return false, status.Errorf(codes.Internal, "inspect target mount: %v", err)
+		return "", status.Errorf(codes.Internal, "inspect target mount: %v", err)
 	}
 	if !mounted {
-		return false, nil
+		return "", nil
 	}
 	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	metadataDegraded := errors.Is(err, cache.ErrDegradedMetadata)
@@ -146,10 +149,14 @@ func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (bool,
 		err = nil
 	}
 	if err != nil {
-		return false, status.Errorf(codes.Internal, "read cache lease: %v", err)
+		return "", status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
 	if found {
-		return s.verifyExistingLeaseMount(s.store, req, lease, source)
+		handled, err := s.verifyExistingLeaseMount(s.store, req, lease, source)
+		if handled {
+			return publishOutcomeHit, err
+		}
+		return "", err
 	}
 	if s.fallbackStore != nil {
 		_, fallbackLease, fallbackSource, _, fallbackFound, err := s.fallbackStore.LeaseDetails(req.GetVolumeId())
@@ -159,31 +166,35 @@ func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (bool,
 			err = nil
 		}
 		if err != nil {
-			return false, status.Errorf(codes.Internal, "read fallback lease: %v", err)
+			return "", status.Errorf(codes.Internal, "read fallback lease: %v", err)
 		}
 		if fallbackFound {
-			return s.verifyExistingLeaseMount(s.fallbackStore, req, fallbackLease, fallbackSource)
+			handled, err := s.verifyExistingLeaseMount(s.fallbackStore, req, fallbackLease, fallbackSource)
+			if handled {
+				return publishOutcomeFallback, err
+			}
+			return "", err
 		}
 	}
 	verifiedDegradedMount, verifyErr := s.verifyExistingDegradedMount(req)
 	if verifyErr != nil {
-		return false, status.Errorf(codes.Internal, "verify degraded cache mount: %v", verifyErr)
+		return "", status.Errorf(codes.Internal, "verify degraded cache mount: %v", verifyErr)
 	}
 	if verifiedDegradedMount {
-		return true, nil
+		return publishOutcomeHit, nil
 	}
 	if metadataDegraded {
-		return false, status.Error(codes.Internal, "cache volume metadata is unreadable")
+		return "", status.Error(codes.Internal, "cache volume metadata is unreadable")
 	}
 	fallback := fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
 	same, err := s.mounter.sameCacheMount(fallback, req.GetTargetPath(), req.GetReadonly(), true)
 	if err != nil {
-		return false, status.Errorf(codes.Internal, "verify fallback mount: %v", err)
+		return "", status.Errorf(codes.Internal, "verify fallback mount: %v", err)
 	}
 	if same {
-		return true, nil
+		return publishOutcomeFallback, nil
 	}
-	return false, status.Error(codes.AlreadyExists, "target is already mounted by another volume")
+	return "", status.Error(codes.AlreadyExists, "target is already mounted by another volume")
 }
 
 func (s *Server) verifyExistingDegradedMount(req *csi.NodePublishVolumeRequest) (bool, error) {
@@ -247,8 +258,8 @@ func (s *Server) publish(ctx context.Context, req *csi.NodePublishVolumeRequest,
 
 	storedPolicy, existingLease, err := s.prepareLease(req, identity)
 	if err != nil {
-		if fallbackAllowed(err) {
-			return s.publishFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy)
+		if cause, ok := fallbackCauseForError(err, "cache_acquire_failed"); ok {
+			return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, cause, err)
 		}
 		if errors.Is(err, cache.ErrDegradedMetadata) {
 			return status.Errorf(codes.Internal, "read cache lease: %v", err)
@@ -320,9 +331,9 @@ func (s *Server) publishAfterResolutionFailure(ctx context.Context, req *csi.Nod
 	identity, lease, source, policy, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		if errors.Is(err, cache.ErrDegradedMetadata) {
-			return s.publishFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly)
+			return s.useFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly, expectedFallbackCause("metadata_degraded"), err)
 		}
-		return status.Errorf(codes.Internal, "read cache lease: %v", err)
+		return s.useFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly, unexpectedFallbackCause("cache_acquire_failed"), err)
 	}
 	if !found {
 		if s.fallbackStore != nil {
@@ -339,7 +350,7 @@ func (s *Server) publishAfterResolutionFailure(ctx context.Context, req *csi.Nod
 				}
 			}
 		}
-		return s.publishFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly)
+		return s.useFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly, fallbackCauseForResolution(resolveErr), resolveErr)
 	}
 	if lease.Target != req.GetTargetPath() {
 		return status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
@@ -430,19 +441,11 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 	return policy, nil
 }
 
-func fallbackAllowed(err error) bool {
-	if errors.Is(err, cache.ErrDegradedMetadata) || errors.Is(err, cache.ErrExclusivePolicyConflict) ||
-		errors.Is(err, cache.ErrQuotaPolicyConflict) || errors.Is(err, cache.ErrLeaseGenerationRetired) || errors.Is(err, cache.ErrPressureActive) {
-		return true
-	}
-	return status.Code(err) == codes.Unknown || status.Code(err) == codes.Internal
-}
-
 func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolumeRequest, identity string, lease cache.Lease, policy cache.Policy) error {
 	source, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 	if err != nil {
-		if fallbackAllowed(err) {
-			return s.publishFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy)
+		if cause, ok := fallbackCauseForError(err, "cache_acquire_failed"); ok {
+			return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, cause, err)
 		}
 		code := codes.Internal
 		if errors.Is(err, cache.ErrQuotaPolicyConflict) || errors.Is(err, cache.ErrExclusivePolicyConflict) || errors.Is(err, cache.ErrLeaseGenerationRetired) {
@@ -452,17 +455,21 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 	}
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {
 		if err := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); err != nil {
+			s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("quota_setup_failed"), err)
 			return status.Errorf(codes.Internal, "apply cache quota failed; release normal cache lease failed: %v", err)
 		}
-		return s.publishFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy)
+		return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, unexpectedFallbackCause("quota_setup_failed"), err)
 	}
 	source, err = s.store.Expose(identity)
 	if err != nil {
-		if fallbackAllowed(err) {
+		if cause, ok := fallbackCauseForError(err, "generation_expose_failed"); ok {
 			if releaseErr := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
+				if cause.class == fallbackClassUnexpected {
+					s.markUnexpectedBackendFailure(ctx, cause, err)
+				}
 				return status.Errorf(codes.Internal, "expose cache generation failed; release cache lease failed: %v", releaseErr)
 			}
-			return s.publishFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy)
+			return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, cause, err)
 		}
 		return s.rollbackPublish(req, status.Errorf(codes.FailedPrecondition, "expose cache generation: %v", err))
 	}
@@ -479,6 +486,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 	if err := s.store.CommitPublish(req.GetVolumeId(), req.GetTargetPath()); err != nil {
 		return status.Errorf(codes.Internal, "commit published cache lease: %v", err)
 	}
+	s.recordNormalPublish(publishOutcomeMiss)
 	return nil
 }
 
@@ -492,16 +500,18 @@ func (s *Server) rollbackPublish(req *csi.NodePublishVolumeRequest, publishErr e
 func (s *Server) publishCache(ctx context.Context, req *csi.NodePublishVolumeRequest, identity, source string, policy cache.Policy) error {
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {
 		if releaseErr := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
+			s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("quota_setup_failed"), err)
 			return status.Errorf(codes.Internal, "apply cache quota failed; release cache lease failed: %v", releaseErr)
 		}
-		return s.publishFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy)
+		return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, unexpectedFallbackCause("quota_setup_failed"), err)
 	}
 	source, err := s.store.Expose(identity)
 	if err != nil {
 		if releaseErr := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
+			s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("generation_expose_failed"), err)
 			return status.Errorf(codes.Internal, "expose cache generation failed; release cache lease failed: %v", releaseErr)
 		}
-		return s.publishFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy)
+		return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, unexpectedFallbackCause("generation_expose_failed"), err)
 	}
 	if err := s.mount(req, source, policy.NoExec); err != nil {
 		return err
@@ -509,6 +519,7 @@ func (s *Server) publishCache(ctx context.Context, req *csi.NodePublishVolumeReq
 	if err := s.store.CommitPublish(req.GetVolumeId(), req.GetTargetPath()); err != nil {
 		return status.Errorf(codes.Internal, "commit published cache lease: %v", err)
 	}
+	s.recordNormalPublish(publishOutcomeHit)
 	return nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"github.com/walnuts1018/cache-csi-driver/internal/driver"
 	"github.com/walnuts1018/cache-csi-driver/internal/kube"
 	"github.com/walnuts1018/cache-csi-driver/internal/manager"
+	"github.com/walnuts1018/cache-csi-driver/internal/metrics"
 	"github.com/walnuts1018/cache-csi-driver/internal/quota"
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -43,6 +45,7 @@ func main() {
 
 func run(logger *slog.Logger) error {
 	endpoint := flag.String("endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint")
+	metricsAddress := flag.String("metrics-address", ":9807", "Prometheus metrics HTTP listen address")
 	cacheRoot := flag.String("cache-root", "/var/lib/cache-csi", "cache storage directory")
 	fallbackRoot := flag.String("fallback-root", "/run/cache-csi/fallback", "temporary cache directory used when Kubernetes API resolution fails")
 	fallbackMaxBytes := flag.String("fallback-max-bytes", "1Gi", "maximum total size of the fallback tmpfs filesystem")
@@ -102,6 +105,7 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("initialize fallback cache store: %w", errors.Join(err, store.Close()))
 	}
 	defer func() { _ = fallbackStore.Close() }()
+	metricSet := metrics.New()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	client, resolver := kubernetesClients(logger)
@@ -114,6 +118,7 @@ func run(logger *slog.Logger) error {
 		InspectMount:  driver.VerifyCacheMount,
 		FallbackStore: fallbackStore,
 		Logger:        logger,
+		Metrics:       metricSet,
 	})
 	if client == nil {
 		logger.Warn("Pod pressure eviction is unavailable because the in-cluster Kubernetes client could not be created")
@@ -127,6 +132,8 @@ func run(logger *slog.Logger) error {
 		FallbackMaxBytes:       paths.fallbackSize,
 		FallbackVolumeMaxBytes: paths.fallbackVolumeSize,
 		VendorVersion:          version,
+		Metrics:                metricSet,
+		Logger:                 logger,
 	})
 	grpcServer := grpc.NewServer()
 	csi.RegisterIdentityServer(grpcServer, service)
@@ -137,8 +144,14 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("listen on CSI endpoint: %w", err)
 	}
 	defer cleanupSocket()
+	var listenConfig net.ListenConfig
+	metricsListener, err := listenConfig.Listen(ctx, "tcp", *metricsAddress)
+	if err != nil {
+		return fmt.Errorf("listen on metrics endpoint: %w", err)
+	}
+	metricsServer := &http.Server{Handler: metricSet.Handler(), ReadHeaderTimeout: 5 * time.Second}
 
-	logger.Info("starting cache CSI node driver", "version", version, "revision", revision, "nodeID", *nodeID, "endpoint", *endpoint)
+	logger.Info("starting cache CSI node driver", "version", version, "revision", revision, "nodeID", *nodeID, "endpoint", *endpoint, "metricsAddress", *metricsAddress)
 	managerContext, cancelManager := context.WithCancel(ctx)
 	managerDone := make(chan struct{})
 	go func() {
@@ -165,13 +178,28 @@ func run(logger *slog.Logger) error {
 	go func() {
 		serveErr <- grpcServer.Serve(listener)
 	}()
+	metricsErr := make(chan error, 1)
+	go func() {
+		metricsErr <- serveMetrics(managerContext, metricsServer, metricsListener)
+	}()
 
 	select {
 	case err := <-serveErr:
 		cancelManager()
 		<-managerDone
+		if metricsServeErr := <-metricsErr; metricsServeErr != nil {
+			return errors.Join(fmt.Errorf("serve CSI gRPC endpoint: %w", err), fmt.Errorf("serve metrics endpoint: %w", metricsServeErr))
+		}
 		if err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			return fmt.Errorf("serve CSI gRPC endpoint: %w", err)
+		}
+		return nil
+	case err := <-metricsErr:
+		cancelManager()
+		grpcServer.Stop()
+		<-managerDone
+		if err != nil {
+			return fmt.Errorf("serve metrics endpoint: %w", err)
 		}
 		return nil
 	case <-ctx.Done():
@@ -192,7 +220,36 @@ func run(logger *slog.Logger) error {
 		<-stopped
 	}
 	<-managerDone
+	if err := <-metricsErr; err != nil {
+		return fmt.Errorf("shut down metrics endpoint: %w", err)
+	}
 	return nil
+}
+
+func serveMetrics(ctx context.Context, server *http.Server, listener net.Listener) error {
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+	select {
+	case err := <-serveDone:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		shutdownErr := server.Shutdown(shutdownContext)
+		if shutdownErr != nil {
+			_ = server.Close()
+		}
+		serveErr := <-serveDone
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		return errors.Join(shutdownErr, serveErr)
+	}
 }
 
 type runtimePaths struct {

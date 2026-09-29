@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
+	"github.com/walnuts1018/cache-csi-driver/internal/metrics"
 )
 
 const (
@@ -79,6 +81,7 @@ type Options struct {
 	InspectMount     MountInspector
 	FallbackStore    *cache.Store
 	Logger           *slog.Logger
+	Metrics          *metrics.Metrics
 }
 
 type Manager struct {
@@ -88,6 +91,8 @@ type Manager struct {
 	client           kubernetes.Interface
 	inspectMount     MountInspector
 	logger           *slog.Logger
+	metrics          *metrics.Metrics
+	storeNames       []string
 	evictionMu       sync.Mutex
 	evictions        map[evictionKey]evictionState
 }
@@ -103,36 +108,53 @@ func New(store *cache.Store, options Options) *Manager {
 		options.Logger = slog.Default()
 	}
 	stores := []*cache.Store{store}
+	storeNames := []string{"primary"}
 	if options.FallbackStore != nil && options.FallbackStore != store {
 		stores = append(stores, options.FallbackStore)
+		storeNames = append(storeNames, "fallback")
 	}
-	return &Manager{
+	manager := &Manager{
 		stores:           stores,
+		storeNames:       storeNames,
 		interval:         options.Interval,
 		pressureInterval: options.PressureInterval,
 		client:           options.Client,
 		inspectMount:     options.InspectMount,
 		logger:           options.Logger,
+		metrics:          options.Metrics,
 		evictions:        make(map[evictionKey]evictionState),
 	}
+	for index := range stores {
+		if manager.metrics != nil {
+			manager.metrics.SetRecoveryState(storeNames[index], "initializing")
+		}
+	}
+	return manager
 }
 
 func (m *Manager) Recover(ctx context.Context) error {
 	if m.inspectMount == nil {
 		return errors.New("mount inspector is not configured")
 	}
-	for _, store := range m.stores {
+	// primary cacheのindex構築を待つ前にfallback leaseを復旧し、長時間scan中もfallback publishを維持する。
+	for index, store := range slices.Backward(m.stores) {
+		started := time.Now()
+		if m.metrics != nil {
+			m.metrics.SetRecoveryState(m.storeNames[index], "recovering")
+		}
 		if err := store.WaitForIndexes(ctx); err != nil {
+			m.recordRecovery(index, "failure", time.Since(started).Seconds())
 			return fmt.Errorf("wait for cache indexes under %s: %w", store.Root(), err)
 		}
-	}
-	// Recover fallback leases first so the primary store remains unavailable until both stores are ready.
-	for index := len(m.stores) - 1; index >= 0; index-- {
-		store := m.stores[index]
+		indexDuration := time.Since(started)
+		started = time.Now()
 		if err := store.RecoverLeasesContext(ctx, m.inspectMount); err != nil {
+			m.recordRecovery(index, "failure", (indexDuration + time.Since(started)).Seconds())
 			return fmt.Errorf("recover cache leases under %s: %w", store.Root(), err)
 		}
+		m.recordRecovery(index, "success", (indexDuration + time.Since(started)).Seconds())
 	}
+	m.syncStoreMetrics()
 	return nil
 }
 
@@ -159,6 +181,7 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) collect(ctx context.Context, now time.Time) {
+	defer m.syncStoreMetrics()
 	for _, store := range m.stores {
 		if err := store.Collect(now); err != nil {
 			m.logger.ErrorContext(ctx, "cache collection failed", "root", store.Root(), "error", err)
@@ -171,6 +194,7 @@ func (m *Manager) collect(ctx context.Context, now time.Time) {
 }
 
 func (m *Manager) pressure(ctx context.Context) {
+	defer m.syncStoreMetrics()
 	if err := ctx.Err(); err != nil {
 		return
 	}
@@ -251,10 +275,24 @@ func (m *Manager) evictWithBackoff(ctx context.Context, victim cache.PressureVic
 	}
 
 	var err error
+	action := "eviction"
 	if victim.ForceDelete {
+		action = "force_delete"
 		err = m.forceDelete(ctx, lease)
 	} else {
 		err = m.evict(ctx, lease)
+	}
+	result := "accepted"
+	switch {
+	case apierrors.IsNotFound(err):
+		result = "not_found"
+	case apierrors.IsTooManyRequests(err):
+		result = "blocked"
+	case err != nil:
+		result = "failed"
+	}
+	if m.metrics != nil {
+		m.metrics.RecordPressureAction(action, result)
 	}
 	if apierrors.IsNotFound(err) {
 		m.setEvictionState(key, nextEvictionState(now, state, err))
@@ -283,6 +321,35 @@ func (m *Manager) evictWithBackoff(ctx context.Context, victim cache.PressureVic
 		return
 	}
 	m.logger.InfoContext(ctx, "requested Pod eviction for cache pressure", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", acceptedEvictionDelay)
+}
+
+func (m *Manager) recordRecovery(index int, result string, durationSeconds float64) {
+	if m.metrics != nil {
+		m.metrics.RecordRecoveryAttempt(m.storeNames[index], result, durationSeconds)
+		if result == "success" {
+			m.metrics.SetRecoveryState(m.storeNames[index], "ready")
+		} else {
+			m.metrics.SetRecoveryState(m.storeNames[index], "failed")
+		}
+	}
+}
+
+func (m *Manager) syncStoreMetrics() {
+	if m.metrics == nil {
+		return
+	}
+	for index, store := range m.stores {
+		stats := store.RuntimeStats()
+		m.metrics.SetStoreSnapshot(m.storeNames[index], metrics.StoreSnapshot{
+			Ready:                 stats.Ready,
+			PressureState:         stats.PressureState,
+			DegradedObjects:       stats.DegradedObjects,
+			CacheObjects:          stats.CacheObjects,
+			RetiredGenerations:    stats.RetiredGenerations,
+			FallbackReservedBytes: stats.FallbackReservedBytes,
+			TrashObjectsDeleted:   stats.TrashObjectsDeleted,
+		})
+	}
 }
 
 func (m *Manager) evictionState(key evictionKey) (evictionState, bool) {
