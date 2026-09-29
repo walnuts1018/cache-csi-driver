@@ -21,6 +21,17 @@ const SharingPolicyShared = "Shared"
 
 const SharingPolicyExclusive = "Exclusive"
 
+const PressurePolicyUnusedOnly = "UnusedOnly"
+
+const PressurePolicyEvict = "Evict"
+
+const PressurePolicyForceDelete = "ForceDelete"
+
+type PressureVictim struct {
+	Lease       Lease
+	ForceDelete bool
+}
+
 type Lease struct {
 	ID         string `json:"id"`
 	Target     string `json:"target"`
@@ -49,7 +60,7 @@ type Policy struct {
 	NoExec               bool          `json:"noExec"`
 	SchemaVersion        string        `json:"schemaVersion"`
 	CrashRecoveryReuse   bool          `json:"crashRecoveryReuse"`
-	EvictRunning         bool          `json:"evictRunning"`
+	PressurePolicy       string        `json:"pressurePolicy,omitempty"`
 	QuotaEnabled         bool          `json:"quotaEnabled"`
 	MaxBytes             int64         `json:"maxBytes"`
 	Retention            time.Duration `json:"retention"`
@@ -168,12 +179,19 @@ func validateMetadata(identity string, meta Metadata) error {
 	if !validSharingPolicy(meta.Policy.SharingPolicy) {
 		return errors.New("cache metadata has an unsupported sharing policy")
 	}
+	if !validPressurePolicy(meta.Policy.PressurePolicy) {
+		return errors.New("cache metadata has an unsupported pressure policy")
+	}
 	for _, retired := range meta.Retired {
-		if retired.Generation == "" || retired.Policy.Retention < 0 || !validSharingPolicy(retired.Policy.SharingPolicy) {
+		if retired.Generation == "" || retired.Policy.Retention < 0 || !validSharingPolicy(retired.Policy.SharingPolicy) || !validPressurePolicy(retired.Policy.PressurePolicy) {
 			return errors.New("cache metadata has an invalid retired generation policy")
 		}
 	}
 	return nil
+}
+
+func validPressurePolicy(policy string) bool {
+	return policy == "" || policy == PressurePolicyUnusedOnly || policy == PressurePolicyEvict || policy == PressurePolicyForceDelete
 }
 
 func validSharingPolicy(policy string) bool {

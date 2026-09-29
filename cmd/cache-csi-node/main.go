@@ -52,8 +52,10 @@ func run(logger *slog.Logger) error {
 	gcInterval := flag.Duration("gc-interval", 30*time.Second, "cache garbage collection interval")
 	highFreePercent := flag.Int("pressure-high-free-percent", 25, "free-byte percentage at which cache pressure collection stops")
 	lowFreePercent := flag.Int("pressure-low-free-percent", 20, "free-byte percentage at which cache pressure collection starts")
+	criticalFreePercent := flag.Int("pressure-critical-free-percent", 0, "critical free-byte percentage at which opted-in cache Pods may be force deleted; zero disables force deletion")
 	highInodeFreePercent := flag.Int("pressure-high-inode-free-percent", 15, "free-inode percentage at which cache pressure collection stops")
 	lowInodeFreePercent := flag.Int("pressure-low-inode-free-percent", 10, "free-inode percentage at which cache pressure collection starts")
+	criticalInodeFreePercent := flag.Int("pressure-critical-inode-free-percent", 0, "critical free-inode percentage at which opted-in cache Pods may be force deleted; zero disables force deletion")
 	projectIDStart := flag.Uint("project-id-start", 2_000_000_000, "first project ID reserved for cache identities")
 	projectIDCount := flag.Uint("project-id-count", 1_000_000, "number of project IDs reserved for cache identities")
 	flag.Parse()
@@ -79,12 +81,14 @@ func run(logger *slog.Logger) error {
 	}
 
 	pressure := cache.PressureConfig{
-		HighFreePercent:      *highFreePercent,
-		LowFreePercent:       *lowFreePercent,
-		HighInodeFreePercent: *highInodeFreePercent,
-		LowInodeFreePercent:  *lowInodeFreePercent,
+		HighFreePercent:          *highFreePercent,
+		LowFreePercent:           *lowFreePercent,
+		CriticalFreePercent:      *criticalFreePercent,
+		HighInodeFreePercent:     *highInodeFreePercent,
+		LowInodeFreePercent:      *lowInodeFreePercent,
+		CriticalInodeFreePercent: *criticalInodeFreePercent,
 	}
-	store, err := cache.NewStore(*cacheRoot, cache.StoreOptions{
+	store, err := cache.NewStoreAsync(*cacheRoot, cache.StoreOptions{
 		Pressure:       pressure,
 		ProjectIDStart: uint32(*projectIDStart),
 		ProjectIDCount: uint32(*projectIDCount),
@@ -100,7 +104,7 @@ func run(logger *slog.Logger) error {
 	defer func() { _ = fallbackStore.Close() }()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	client, resolver := kubernetesClients(logger, *nodeID)
+	client, resolver := kubernetesClients(logger)
 	if resolver != nil {
 		resolver.Start(ctx)
 	}
@@ -111,9 +115,6 @@ func run(logger *slog.Logger) error {
 		FallbackStore: fallbackStore,
 		Logger:        logger,
 	})
-	if err := cacheManager.Recover(); err != nil {
-		return err
-	}
 	if client == nil {
 		logger.Warn("Pod pressure eviction is unavailable because the in-cluster Kubernetes client could not be created")
 	}
@@ -142,7 +143,23 @@ func run(logger *slog.Logger) error {
 	managerDone := make(chan struct{})
 	go func() {
 		defer close(managerDone)
-		cacheManager.Run(managerContext)
+		for {
+			if err := cacheManager.Recover(managerContext); err == nil {
+				cacheManager.Run(managerContext)
+				return
+			} else if managerContext.Err() != nil {
+				return
+			} else {
+				logger.WarnContext(managerContext, "cache recovery is incomplete; new volumes use bounded fallback", "error", err)
+			}
+			timer := time.NewTimer(5 * time.Second)
+			select {
+			case <-managerContext.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
 	}()
 	serveErr := make(chan error, 1)
 	go func() {
@@ -277,7 +294,7 @@ func canonicalPath(path string) (string, error) {
 	}
 }
 
-func kubernetesClients(logger *slog.Logger, nodeName string) (kubernetes.Interface, *kube.Resolver) {
+func kubernetesClients(logger *slog.Logger) (kubernetes.Interface, *kube.Resolver) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		logger.Warn("in-cluster Kubernetes configuration is unavailable; using isolated fallback caches", "error", err)
@@ -291,7 +308,7 @@ func kubernetesClients(logger *slog.Logger, nodeName string) (kubernetes.Interfa
 	if clientErr != nil {
 		logger.Warn("create Kubernetes client for cache pressure eviction failed", "error", clientErr)
 	}
-	resolver, resolverErr := kube.NewResolver(config, nodeName)
+	resolver, resolverErr := kube.NewResolver(config)
 	if resolverErr != nil {
 		logger.Warn("create CacheClass resolver failed; using isolated fallback caches", "error", resolverErr)
 	}

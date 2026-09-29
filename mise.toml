@@ -2,6 +2,8 @@
 go = "1.27.1"
 golangci-lint = "2.14.0"
 helm = "4.3.0"
+kind = "0.33.0"
+kubectl = "1.37.1"
 "go:sigs.k8s.io/controller-tools/cmd/controller-gen" = "v0.22.0"
 "go:github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity" = "v5.6.0"
 
@@ -124,6 +126,10 @@ docker run --rm --privileged --platform "linux/$go_arch" \
     trap "umount /mnt/cache-csi-xfs" EXIT
     /tmp/cache-csi-xfs-quota/xfs-quota.test -test.v -test.count=1 -test.run "^TestXFSProjectQuotaEnforcesHardLimit$"'
 """
+
+[tasks."test:e2e:kind"]
+description = "Run cache lifecycle integration checks on a two-worker Kind cluster"
+run = "bash hack/test-kind-lifecycle.sh"
 
 [tasks.manifests]
 description = "Generate CacheClass API code and CRD manifests"

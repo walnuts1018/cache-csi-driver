@@ -16,20 +16,23 @@ gcInterval: 30s
 pressure:
   highFreePercent: 25
   lowFreePercent: 20
+  criticalFreePercent: 0
   highInodeFreePercent: 15
   lowInodeFreePercent: 10
+  criticalInodeFreePercent: 0
 projectIDRange:
   start: 2000000000
   count: 1000000
 
 csiDriver:
-  preventPodSchedulingIfMissing: true
+  preventPodSchedulingIfMissing: false
 
 admissionPolicy:
   enabled: true
 
 rbac:
   createPodEvictions: true
+  deletePodsAtCriticalPressure: false
 
 serviceAccount:
   create: true

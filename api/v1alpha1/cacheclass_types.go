@@ -9,6 +9,7 @@ type CacheBackend string
 type CrashRecoveryPolicy string
 type SharingPolicy string
 type CacheScope string
+type PressurePolicy string
 
 const (
 	BackendDirectory       CacheBackend        = "directory"
@@ -19,6 +20,9 @@ const (
 	SharingPolicyExclusive SharingPolicy       = "Exclusive"
 	ScopeServiceAccount    CacheScope          = "ServiceAccount"
 	ScopeNamespace         CacheScope          = "Namespace"
+	PressurePolicyUnused   PressurePolicy      = "UnusedOnly"
+	PressurePolicyEvict    PressurePolicy      = "Evict"
+	PressurePolicyForce    PressurePolicy      = "ForceDelete"
 )
 
 // CacheClassSpec defines storage and reuse behavior for node-local cache generations.
@@ -60,8 +64,10 @@ type CacheClassSpec struct {
 	Scope CacheScope `json:"scope,omitempty"`
 	// Quota configuration for cache generations.
 	Quota QuotaPolicy `json:"quota,omitzero"`
-	// Allows best-effort pressure handling to request graceful eviction of Pods using active cache generations. Eviction requests respect PodDisruptionBudgets and do not guarantee cache reclamation.
-	EvictRunning bool `json:"evictRunning,omitempty"`
+	// Policy for active cache generations during filesystem pressure. ForceDelete requires the node's critical pressure watermark and explicit Pod delete RBAC.
+	// +kubebuilder:default=UnusedOnly
+	// +kubebuilder:validation:Enum=UnusedOnly;Evict;ForceDelete
+	PressurePolicy PressurePolicy `json:"pressurePolicy,omitempty"`
 	// Mounts cache generations with execution disabled.
 	NoExec bool `json:"noExec,omitempty"`
 }

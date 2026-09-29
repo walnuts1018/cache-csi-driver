@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 var ErrQuotaPolicyConflict = errors.New("active cache generation cannot change its effective quota")
@@ -24,11 +27,15 @@ var ErrFallbackCapacity = errors.New("fallback cache capacity is exhausted")
 
 var ErrFallbackLeaseConflict = errors.New("fallback cache lease ID is already in use")
 
+var ErrStoreNotReady = errors.New("cache store indexes are not ready")
+
 type PressureConfig struct {
-	HighFreePercent      int
-	LowFreePercent       int
-	HighInodeFreePercent int
-	LowInodeFreePercent  int
+	HighFreePercent          int
+	LowFreePercent           int
+	CriticalFreePercent      int
+	HighInodeFreePercent     int
+	LowInodeFreePercent      int
+	CriticalInodeFreePercent int
 }
 
 type StoreOptions struct {
@@ -65,6 +72,13 @@ type Store struct {
 	trashRequests              chan chan error
 	closeOnce                  sync.Once
 	closeErr                   error
+	initDone                   chan struct{}
+	initErr                    error
+	indexReady                 atomic.Bool
+	ready                      atomic.Bool
+	collectorMu                sync.Mutex
+	collectorStarted           bool
+	collectorFinished          bool
 }
 
 func (s *Store) Root() string { return s.root }
@@ -72,10 +86,41 @@ func (s *Store) Root() string { return s.root }
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.stopTrash)
-		<-s.trashDone
+		<-s.initDone
+		s.collectorMu.Lock()
+		if !s.collectorStarted && !s.collectorFinished {
+			s.collectorFinished = true
+			close(s.trashDone)
+		}
+		collectorStarted := s.collectorStarted
+		s.collectorMu.Unlock()
+		if collectorStarted {
+			<-s.trashDone
+		}
 		s.closeErr = s.rootFS.Close()
 	})
 	return s.closeErr
+}
+
+func (s *Store) Ready() bool {
+	return s.ready.Load()
+}
+
+func (s *Store) WaitForIndexes(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.initDone:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.initErr != nil {
+		return fmt.Errorf("initialize cache indexes: %w", s.initErr)
+	}
+	if !s.indexReady.Load() {
+		return ErrStoreNotReady
+	}
+	return nil
 }
 
 func (s *Store) relative(path string) (string, error) {
@@ -142,6 +187,18 @@ func (s *Store) removeAll(path string) error {
 }
 
 func NewStore(root string, options StoreOptions) (*Store, error) {
+	return newStoreMode(root, options, true, true)
+}
+
+func newStore(root string, options StoreOptions, startTrashCollector bool) (*Store, error) {
+	return newStoreMode(root, options, true, startTrashCollector)
+}
+
+func NewStoreAsync(root string, options StoreOptions) (*Store, error) {
+	return newStoreMode(root, options, false, false)
+}
+
+func newStoreMode(root string, options StoreOptions, initializeIndexes, startTrashCollector bool) (*Store, error) {
 	if !filepath.IsAbs(root) {
 		return nil, errors.New("cache root must be absolute")
 	}
@@ -188,13 +245,102 @@ func NewStore(root string, options StoreOptions) (*Store, error) {
 		stopTrash:                  make(chan struct{}),
 		trashDone:                  make(chan struct{}),
 		trashRequests:              make(chan chan error),
+		initDone:                   make(chan struct{}),
 	}
-	if err := store.rebuildIndexes(); err != nil {
-		_ = rootFS.Close()
-		return nil, fmt.Errorf("rebuild cache indexes: %w", err)
+	if initializeIndexes {
+		if err := store.rebuildIndexes(); err != nil {
+			_ = rootFS.Close()
+			return nil, fmt.Errorf("rebuild cache indexes: %w", err)
+		}
+		store.indexReady.Store(true)
+		store.ready.Store(true)
+		close(store.initDone)
+		if startTrashCollector {
+			store.startTrashCollector()
+		} else {
+			store.finishTrashCollector()
+		}
+	} else {
+		go store.initializeIndexes()
 	}
-	go store.runTrashCollector()
 	return store, nil
+}
+
+func (s *Store) initializeIndexes() {
+	defer close(s.initDone)
+	for {
+		if s.stopRequested() {
+			return
+		}
+		s.mu.Lock()
+		s.resetIndexState()
+		err := s.rebuildIndexes()
+		s.initErr = err
+		s.indexReady.Store(err == nil)
+		s.mu.Unlock()
+		if err == nil {
+			s.startTrashCollector()
+			return
+		}
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-s.stopTrash:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Store) resetIndexState() {
+	clear(s.metadataByIdentity)
+	clear(s.leaseIndex)
+	clear(s.degraded)
+	clear(s.projectReservations)
+	clear(s.projectOwnersByID)
+	clear(s.projectIDByGeneration)
+	clear(s.unknownProjectReservations)
+	clear(s.trashMetadata)
+	clear(s.pressureDetachFailed)
+	s.projectRegistryDamaged = false
+	s.projectRegistryDirty = false
+	s.pressureActive = false
+	s.trashCursor = ""
+}
+
+func (s *Store) startTrashCollector() {
+	s.collectorMu.Lock()
+	defer s.collectorMu.Unlock()
+	if s.collectorStarted || s.collectorFinished {
+		return
+	}
+	select {
+	case <-s.stopTrash:
+		s.collectorFinished = true
+		close(s.trashDone)
+	default:
+		s.collectorStarted = true
+		go s.runTrashCollector()
+	}
+}
+
+func (s *Store) finishTrashCollector() {
+	s.collectorMu.Lock()
+	defer s.collectorMu.Unlock()
+	if s.collectorFinished {
+		return
+	}
+	s.collectorFinished = true
+	close(s.trashDone)
+}
+
+func (s *Store) stopRequested() bool {
+	select {
+	case <-s.stopTrash:
+		return true
+	default:
+		return false
+	}
 }
 
 func ensureDirectory(path string) error {

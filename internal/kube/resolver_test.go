@@ -23,6 +23,8 @@ import (
 
 const testCacheClassesResource = "cacheclasses"
 
+const testCacheClassUID = "class-uid"
+
 func TestIsTemporaryAPIError(t *testing.T) {
 	t.Parallel()
 
@@ -62,45 +64,76 @@ func TestResolverUsesInformerCachesAfterStartupSync(t *testing.T) {
 	t.Parallel()
 
 	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "build", UID: "namespace-uid"}}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "compiler-0", Namespace: namespace.Name, UID: "pod-uid"}, Spec: corev1.PodSpec{NodeName: "node-a", ServiceAccountName: "builder"}}
 	serviceAccount := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "builder", Namespace: namespace.Name, UID: "service-account-uid"}}
 	cacheClass := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": cachev1alpha1.GroupVersion.String(),
 		"kind":       "CacheClass",
 		"metadata": map[string]any{
 			"name": "compiler",
-			"uid":  "class-uid",
+			"uid":  testCacheClassUID,
 		},
 		"spec": map[string]any{"backend": "directory"},
 	}}
-	kubernetesClient := kubefake.NewClientset(namespace, pod, serviceAccount)
+	kubernetesClient := kubefake.NewClientset(namespace, serviceAccount)
 	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cacheClass)
-	resolver := newResolver(kubernetesClient, dynamicClient, "node-a")
-	if _, _, _, err := resolver.Resolve(t.Context(), namespace.Name, "compiler", pod.Name, string(pod.UID)); !errors.Is(err, ErrResolverNotSynced) {
+	resolver := newResolver(kubernetesClient, dynamicClient)
+	if _, _, _, err := resolver.Resolve(t.Context(), namespace.Name, "compiler", serviceAccount.Name); !errors.Is(err, ErrResolverNotSynced) {
 		t.Fatalf("resolve before cache sync error = %v, want ErrResolverNotSynced", err)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	resolver.Start(ctx)
-	if !toolscache.WaitForCacheSync(ctx.Done(), resolver.namespaceInformer.HasSynced, resolver.podInformer.HasSynced, resolver.serviceAccountInformer.HasSynced, resolver.classInformer.HasSynced) {
+	if !toolscache.WaitForCacheSync(ctx.Done(), resolver.namespaceInformer.HasSynced, resolver.serviceAccountInformer.HasSynced, resolver.classInformer.HasSynced) {
 		t.Fatal("resolver informer caches did not synchronize")
 	}
 
-	resolvedNamespaceUID, resolvedServiceAccountUID, resolvedClass, err := resolver.Resolve(ctx, namespace.Name, "compiler", pod.Name, string(pod.UID))
+	resolvedNamespaceUID, resolvedServiceAccountUID, resolvedClass, err := resolver.Resolve(ctx, namespace.Name, "compiler", serviceAccount.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolvedNamespaceUID != string(namespace.UID) || resolvedServiceAccountUID != string(serviceAccount.UID) || resolvedClass.UID != "class-uid" || resolvedClass.Object.Spec.Backend != cachev1alpha1.BackendDirectory {
+	if resolvedNamespaceUID != string(namespace.UID) || resolvedServiceAccountUID != string(serviceAccount.UID) || resolvedClass.UID != testCacheClassUID || resolvedClass.Object.Spec.Backend != cachev1alpha1.BackendDirectory {
 		t.Fatalf("resolved cache identity inputs = namespace UID %q, service account UID %q, class %+v", resolvedNamespaceUID, resolvedServiceAccountUID, resolvedClass)
 	}
 
 	cancel()
-	if _, _, _, err := resolver.Resolve(t.Context(), namespace.Name, "compiler", pod.Name, string(pod.UID)); err != nil {
+	if _, _, _, err := resolver.Resolve(t.Context(), namespace.Name, "compiler", serviceAccount.Name); err != nil {
 		t.Fatalf("resolve from the synchronized cache after API informer shutdown: %v", err)
 	}
 	for _, action := range append(kubernetesClient.Actions(), dynamicClient.Actions()...) {
 		if action.GetVerb() == "get" {
 			t.Fatalf("resolver issued a per-request API GET: %#v", action)
 		}
+		if action.GetResource().Resource == "pods" {
+			t.Fatalf("resolver queried Pods instead of using podInfoOnMount context: %#v", action)
+		}
+	}
+}
+
+func TestResolverReportsServiceAccountCacheMissSeparately(t *testing.T) {
+	t.Parallel()
+
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "build", UID: "namespace-uid"}}
+	cacheClass := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": cachev1alpha1.GroupVersion.String(),
+		"kind":       "CacheClass",
+		"metadata": map[string]any{
+			"name": "compiler",
+			"uid":  testCacheClassUID,
+		},
+		"spec": map[string]any{"backend": "directory"},
+	}}
+	kubernetesClient := kubefake.NewClientset(namespace)
+	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cacheClass)
+	resolver := newResolver(kubernetesClient, dynamicClient)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	resolver.Start(ctx)
+	if !toolscache.WaitForCacheSync(ctx.Done(), resolver.namespaceInformer.HasSynced, resolver.serviceAccountInformer.HasSynced, resolver.classInformer.HasSynced) {
+		t.Fatal("resolver informer caches did not synchronize")
+	}
+
+	_, _, _, err := resolver.Resolve(ctx, namespace.Name, "compiler", "newly-created")
+	if !errors.Is(err, ErrServiceAccountNotCached) || !apierrors.IsNotFound(err) {
+		t.Fatalf("resolve missing ServiceAccount error = %v, want distinct cache-miss sentinel wrapping NotFound", err)
 	}
 }

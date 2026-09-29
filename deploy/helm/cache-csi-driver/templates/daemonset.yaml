@@ -44,8 +44,10 @@ spec:
             - --gc-interval={{ .Values.gcInterval }}
             - --pressure-high-free-percent={{ .Values.pressure.highFreePercent }}
             - --pressure-low-free-percent={{ .Values.pressure.lowFreePercent }}
+            - --pressure-critical-free-percent={{ .Values.pressure.criticalFreePercent }}
             - --pressure-high-inode-free-percent={{ .Values.pressure.highInodeFreePercent }}
             - --pressure-low-inode-free-percent={{ .Values.pressure.lowInodeFreePercent }}
+            - --pressure-critical-inode-free-percent={{ .Values.pressure.criticalInodeFreePercent }}
             - --project-id-start={{ .Values.projectIDRange.start | int64 }}
             - --project-id-count={{ .Values.projectIDRange.count | int64 }}
             {{- with .Values.driver.extraArgs }}
@@ -92,6 +94,8 @@ spec:
             - name: fallback-root
               mountPath: {{ .Values.fallbackRootDir }}
               mountPropagation: Bidirectional
+            - name: tmp
+              mountPath: /tmp
         - name: csi-node-driver-registrar
           image: "{{ .Values.registrar.image.repository }}:{{ .Values.registrar.image.tag }}"
           imagePullPolicy: {{ .Values.registrar.image.pullPolicy }}
@@ -154,6 +158,10 @@ spec:
           hostPath:
             path: {{ .Values.fallbackRootDir }}
             type: DirectoryOrCreate
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

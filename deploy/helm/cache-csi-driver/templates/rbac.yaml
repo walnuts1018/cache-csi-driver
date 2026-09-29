@@ -17,7 +17,6 @@ rules:
       - ""
     resources:
       - namespaces
-      - pods
       - serviceaccounts
     verbs:
       - get
@@ -30,6 +29,14 @@ rules:
       - pods/eviction
     verbs:
       - create
+  {{- end }}
+  {{- if .Values.rbac.deletePodsAtCriticalPressure }}
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - delete
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

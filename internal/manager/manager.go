@@ -29,9 +29,10 @@ type evictionKey struct {
 }
 
 type evictionState struct {
-	nextAttempt time.Time
-	attempts    int
-	gone        bool
+	nextAttempt          time.Time
+	attempts             int
+	gone                 bool
+	forceDeleteAttempted bool
 }
 
 func (s evictionState) shouldSkip(now time.Time) bool {
@@ -116,12 +117,19 @@ func New(store *cache.Store, options Options) *Manager {
 	}
 }
 
-func (m *Manager) Recover() error {
+func (m *Manager) Recover(ctx context.Context) error {
 	if m.inspectMount == nil {
 		return errors.New("mount inspector is not configured")
 	}
 	for _, store := range m.stores {
-		if err := store.RecoverLeases(m.inspectMount); err != nil {
+		if err := store.WaitForIndexes(ctx); err != nil {
+			return fmt.Errorf("wait for cache indexes under %s: %w", store.Root(), err)
+		}
+	}
+	// Recover fallback leases first so the primary store remains unavailable until both stores are ready.
+	for index := len(m.stores) - 1; index >= 0; index-- {
+		store := m.stores[index]
+		if err := store.RecoverLeasesContext(ctx, m.inspectMount); err != nil {
 			return fmt.Errorf("recover cache leases under %s: %w", store.Root(), err)
 		}
 	}
@@ -195,7 +203,7 @@ func (m *Manager) pressure(ctx context.Context) {
 	if m.client == nil {
 		return
 	}
-	var victims []cache.Lease
+	var victims []cache.PressureVictim
 	victimsComplete := true
 	for _, store := range m.stores {
 		storeVictims, err := store.PressureVictims()
@@ -206,53 +214,72 @@ func (m *Manager) pressure(ctx context.Context) {
 		}
 		victims = append(victims, storeVictims...)
 	}
-	seen := make(map[evictionKey]struct{}, len(victims))
+	seen := make(map[evictionKey]int, len(victims))
 	active := make(map[evictionKey]struct{}, len(victims))
-	uniqueVictims := make([]cache.Lease, 0, len(victims))
-	for _, lease := range victims {
+	uniqueVictims := make([]cache.PressureVictim, 0, len(victims))
+	for _, victim := range victims {
+		lease := victim.Lease
 		if lease.Namespace == "" || lease.PodName == "" || lease.PodUID == "" {
 			m.logger.WarnContext(ctx, "skipping Pod eviction because lease Pod identity is incomplete", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID)
 			continue
 		}
 		key := evictionKey{namespace: lease.Namespace, podUID: lease.PodUID}
 		active[key] = struct{}{}
-		if _, ok := seen[key]; ok {
+		if index, ok := seen[key]; ok {
+			uniqueVictims[index].ForceDelete = uniqueVictims[index].ForceDelete || victim.ForceDelete
 			continue
 		}
-		seen[key] = struct{}{}
-		uniqueVictims = append(uniqueVictims, lease)
+		seen[key] = len(uniqueVictims)
+		uniqueVictims = append(uniqueVictims, victim)
 	}
 	m.pruneEvictions(active, victimsComplete)
-	for _, lease := range uniqueVictims {
-		m.evictWithBackoff(ctx, lease)
+	for _, victim := range uniqueVictims {
+		m.evictWithBackoff(ctx, victim)
 	}
 }
 
-func (m *Manager) evictWithBackoff(ctx context.Context, lease cache.Lease) {
+func (m *Manager) evictWithBackoff(ctx context.Context, victim cache.PressureVictim) {
 	if ctx.Err() != nil {
 		return
 	}
+	lease := victim.Lease
 	key := evictionKey{namespace: lease.Namespace, podUID: lease.PodUID}
 	now := time.Now()
 	state, found := m.evictionState(key)
-	if found && state.shouldSkip(now) {
+	if found && state.shouldSkip(now) && (!victim.ForceDelete || state.forceDeleteAttempted || state.gone) {
 		return
 	}
 
-	err := m.evict(ctx, lease)
+	var err error
+	if victim.ForceDelete {
+		err = m.forceDelete(ctx, lease)
+	} else {
+		err = m.evict(ctx, lease)
+	}
 	if apierrors.IsNotFound(err) {
 		m.setEvictionState(key, nextEvictionState(now, state, err))
 		m.logger.DebugContext(ctx, "cache pressure victim Pod no longer exists", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID)
 		return
 	}
 	state = nextEvictionState(now, state, err)
+	if victim.ForceDelete {
+		state.forceDeleteAttempted = true
+	}
 	m.setEvictionState(key, state)
 	if err != nil {
-		if apierrors.IsTooManyRequests(err) {
+		if apierrors.IsTooManyRequests(err) && !victim.ForceDelete {
 			m.logger.WarnContext(ctx, "Pod eviction was blocked, possibly by a PodDisruptionBudget", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
 			return
 		}
-		m.logger.WarnContext(ctx, "Pod eviction for cache pressure failed", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
+		if victim.ForceDelete {
+			m.logger.WarnContext(ctx, "Pod force deletion at critical cache pressure failed", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
+		} else {
+			m.logger.WarnContext(ctx, "Pod eviction for cache pressure failed", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
+		}
+		return
+	}
+	if victim.ForceDelete {
+		m.logger.WarnContext(ctx, "requested UID-preconditioned Pod force deletion at critical cache pressure", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", acceptedEvictionDelay)
 		return
 	}
 	m.logger.InfoContext(ctx, "requested Pod eviction for cache pressure", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", acceptedEvictionDelay)
@@ -300,4 +327,13 @@ func (m *Manager) evict(ctx context.Context, lease cache.Lease) error {
 		},
 	}
 	return m.client.PolicyV1().Evictions(lease.Namespace).Evict(ctx, eviction)
+}
+
+func (m *Manager) forceDelete(ctx context.Context, lease cache.Lease) error {
+	uid := types.UID(lease.PodUID)
+	gracePeriodSeconds := int64(0)
+	return m.client.CoreV1().Pods(lease.Namespace).Delete(ctx, lease.PodName, metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriodSeconds,
+		Preconditions:      &metav1.Preconditions{UID: &uid},
+	})
 }

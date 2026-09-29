@@ -21,11 +21,11 @@ helm install cache-csi-driver \
 kubectl label namespace default cache.csi.walnuts.dev/allow-use=true
 ```
 
-Helm valuesの`admissionPolicy.enabled=false`でpolicyを無効化する場合は、同等の利用制限を別のAdmission設定で行ってください。ClusterRoleはNamespace、CacheClass、Node上のPodとServiceAccountの参照権限を持ち、既定で`pods/eviction`の作成権限を持ちます。Pod informerは現在のNodeに割り当てられたPodだけをwatchします。Node pluginはmount system callを使うためprivileged containerとして動作し、mount属性付きmountの伝播にLinux kernel 5.12以降が必要です。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映され、`kubeletRootDir`と重複できません。
+Helm valuesの`admissionPolicy.enabled=false`でpolicyを無効化する場合は、同等の利用制限を別のAdmission設定で行ってください。ClusterRoleはNamespace、CacheClass、ServiceAccountの参照権限と既定で`pods/eviction`の作成権限を持ちます。Podの直接削除権限は`rbac.deletePodsAtCriticalPressure=true`を指定した場合だけ追加されます。Node pluginはmount system callを使うためprivileged containerとして動作し、mount属性付きmountの伝播にLinux kernel 5.12以降が必要です。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映され、`kubeletRootDir`と重複できません。
 
-CacheClass、Namespace、Node上のPod、ServiceAccountはNode pluginのInformer cacheから参照します。initial sync完了後は、API serverの一時障害中もcacheにあるClassを利用できます。cold start直後でInformer cacheが同期していない要求は`Unavailable`となり、kubeletのretryで再試行されます。通常cacheのmetadata異常、共有競合、quota設定失敗、pressure中の新規cache publishでは、volume IDごとに分離したfallback objectへ切り替えます。fallbackはquota有効時も使用でき、volume attributeの`maxBytes`、解決済みCacheClassの有効上限、`fallbackVolumeMaxBytes`のうち小さい値をgenerationごとのtmpfs上限にします。複数fallback volumeの予約容量の合計は`fallbackMaxBytes`を超えません。fallback容量が尽きた場合は`ResourceExhausted`を返します。CacheClassを解決できない場合はCacheClass固有の既定上限を確認できないため、指定されたvolume attributeの`maxBytes`とNode側のfallback上限で制限します。fallback leaseとgenerationは`fallbackRootDir`配下のStore metadataで管理し、last release時はgeneration tmpfsをunmountしてからobjectをtrashへdetachします。fallback mountには常に`nodev`と`nosuid`を付け、`noExec`に応じて`noexec`を付けます。fallback用tmpfsのmount伝播に`Bidirectional`を使います。
+CacheClass、Namespace、ServiceAccountはNode pluginのInformer cacheから参照します。PodのNamespace、name、UID、ServiceAccount.nameはCSIの`podInfoOnMount`から取得します。initial sync完了後は、API serverの一時障害中もcacheにあるClassを利用できます。Informer cacheのcold start中は要求をbounded fallbackへ切り替えます。CSI socketは通常Storeのindex構築とlease recoveryより先に利用可能になり、復旧中の新規publish要求にはbounded fallbackを使います。通常cacheのmetadata異常、共有競合、quota設定失敗、pressure中の新規cache publishでも、volume IDごとに分離したfallback objectへ切り替えます。fallbackはquota有効時も使用でき、volume attributeの`maxBytes`、解決済みCacheClassの有効上限、`fallbackVolumeMaxBytes`のうち小さい値をgenerationごとのtmpfs上限にします。複数fallback volumeの予約容量の合計は`fallbackMaxBytes`を超えません。fallback容量が尽きた場合は`ResourceExhausted`を返します。CacheClassを解決できない場合はCacheClass固有の既定上限を確認できないため、指定されたvolume attributeの`maxBytes`とNode側のfallback上限で制限します。fallback leaseとgenerationは`fallbackRootDir`配下のStore metadataで管理し、last release時はgeneration tmpfsをunmountしてからobjectをtrashへdetachします。fallback mountには常に`nodev`と`nosuid`を付け、`noExec`に応じて`noexec`を付けます。fallback用tmpfsのmount伝播に`Bidirectional`を使います。
 
-`preventPodSchedulingIfMissing`を有効にしているため、CSI pluginが登録されていないNodeへのPod配置を防ぎます。Cluster Autoscalerを使う場合は、CSI node-aware schedulingを有効にしてください。
+`preventPodSchedulingIfMissing`は既定で無効です。有効にするとCSI pluginが登録されていないNodeへのPod配置を防ぎますが、CSI node-aware schedulingに対応しないCluster AutoscalerやKarpenterではscale-from-zeroなどを妨げる場合があります。利用するautoscalerがCSI-awareであることを確認してから有効にしてください。
 
 ## CacheClassとPod volume
 
@@ -80,20 +80,23 @@ spec:
 | `gcInterval` | `30s` | retention-based cache GC scan interval |
 | `pressure.highFreePercent` | `25` | cache filesystemの空き容量GC終了水位 |
 | `pressure.lowFreePercent` | `20` | cache filesystemの空き容量GC開始水位 |
+| `pressure.criticalFreePercent` | `0` | 強制削除を許可する空き容量の危険水位。`0`では無効 |
 | `pressure.highInodeFreePercent` | `15` | cache filesystemの空きinode GC終了水位 |
 | `pressure.lowInodeFreePercent` | `10` | cache filesystemの空きinode GC開始水位 |
+| `pressure.criticalInodeFreePercent` | `0` | 強制削除を許可する空きinodeの危険水位。`0`では無効 |
 | `projectIDRange.start` | `2000000000` | XFS project quota用に予約するproject ID範囲の開始値 |
 | `projectIDRange.count` | `1000000` | XFS project quota用に予約するproject IDの個数 |
-| `csiDriver.preventPodSchedulingIfMissing` | `true` | CSI pluginが未登録のNodeへの配置を防止 |
+| `csiDriver.preventPodSchedulingIfMissing` | `false` | CSI pluginが未登録のNodeへの配置を防止。CSI-aware schedulingに対応したautoscalerでのみ有効化 |
 | `admissionPolicy.enabled` | `true` | 許可ラベルのないnamespaceでのCache CSI利用を拒否 |
-| `rbac.createPodEvictions` | `true` | `evictRunning`用のPod Eviction権限 |
+| `rbac.createPodEvictions` | `true` | `pressurePolicy: Evict`用のPod Eviction権限 |
+| `rbac.deletePodsAtCriticalPressure` | `false` | critical pressure時に直接Pod削除を許可 |
 | `nodeSelector` | `kubernetes.io/os: linux` | DaemonSetを配置するNode |
 
 `CacheClass.spec.maxBytes`は、各cache identityに対してvolume側が要求できるquota上限です。`quota.enabled`と`backend: xfs-project`が必要で、volume attributeの`maxBytes`がこの上限を超える場合はmount要求を拒否します。volume attributeに`maxBytes`がない場合は`quota.defaultMaxBytes`を設定していればその値を使い、未設定なら`spec.maxBytes`を使います。quotaを有効にするCacheClassには`spec.maxBytes`または`quota.defaultMaxBytes`を設定してください。`examples/cacheclass-xfs-project.yaml`と`examples/pod-inline-cache-xfs-project.yaml`に設定例があります。
 
 pressure watermarksはCacheClassごとではなく、`cacheRootDir`が属する単一filesystem全体に適用します。Node pluginは`gcInterval`とは別に3秒ごとに空き容量とinodeを確認し、開始水位を下回ると未使用cacheを物理削除して終了水位までの回復を試みます。pressure中は、新しいCSI leaseによる通常cacheのpublishを止めてbounded fallbackへ切り替えます。既にmount済みのPodによる書き込みは継続するため、`directory` backendだけではNode filesystemを満杯から守るhard limitを保証できません。cache専用filesystemと`xfs-project` quotaを推奨します。`retention`は未使用cacheの保持期間で、省略時はAPI serverのdefaultである`72h`です。明示的な`0s`ではretentionを理由にした回収を無効にしますが、pressure時の回収対象にはなります。`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
 
-`evictRunning`を有効にしたCacheClassでは、未使用cacheを回収した後もglobal pressureが続く場合、そのcacheを利用中のPodへKubernetes Eviction APIでbest-effortの退去要求を出します。PodDisruptionBudgetにより拒否される場合やPodが退去しない場合があり、cacheの回収は保証されません。driverはPodを強制削除しません。Node pluginのClusterRoleは全namespaceの`pods/eviction`作成だけを追加し、Podの直接削除権限は持ちません。active Pod evictionを使わない場合は`rbac.createPodEvictions=false`にできます。
+`CacheClass.spec.pressurePolicy`の既定値`UnusedOnly`ではactive Podを終了させません。`Evict`は未使用cacheを回収した後もglobal pressureが続く場合にKubernetes Eviction APIで退去を要求します。Eviction APIはPodDisruptionBudgetを尊重するため、拒否された場合やPodが退去しない場合にcacheの回収は保証されません。`ForceDelete`は通常pressure時には同じEviction APIを使い、`pressure.criticalFreePercent`または`pressure.criticalInodeFreePercent`で設定した、開始水位より低い危険水位を下回った場合だけUID precondition付きのPod Deleteをgrace period 0で要求します。直接削除はPodDisruptionBudgetを迂回します。既定の危険水位は`0`で無効であり、force delete RBACも既定で無効です。使用する場合は危険水位を慎重に設定し、`rbac.deletePodsAtCriticalPressure=true`を明示してください。必要なPodへのtermination要求より先にcache generationを退役させ、後続Podには空の新世代を割り当てます。退役世代は最後のleaseが解放されるまで保持します。
 
 `sharingPolicy`の既定値は`Exclusive`です。`Shared`を明示する場合、同じ`cacheKey`を使うPod同士で書き込みを調整し、cache実装が複数プロセスからの同時アクセスに対応している必要があります。再利用したファイルのmodeによってはUID/GIDが異なるPodから書き込めないため、実効UID/GIDも揃えてください。`scope`の既定値`ServiceAccount`ではServiceAccount UIDをcache identityに含めます。`scope: Namespace`を指定すると同一Namespace内のServiceAccount間で同じ`cacheKey`を共有するため、Namespace内のworkloadが同じ信頼境界にある場合に限って使ってください。
 

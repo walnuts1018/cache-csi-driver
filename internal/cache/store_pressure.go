@@ -13,7 +13,7 @@ import (
 )
 
 func validatePressure(pressure PressureConfig) error {
-	for _, threshold := range []int{pressure.HighFreePercent, pressure.LowFreePercent, pressure.HighInodeFreePercent, pressure.LowInodeFreePercent} {
+	for _, threshold := range []int{pressure.HighFreePercent, pressure.LowFreePercent, pressure.CriticalFreePercent, pressure.HighInodeFreePercent, pressure.LowInodeFreePercent, pressure.CriticalInodeFreePercent} {
 		if threshold < 0 || threshold > 100 {
 			return errors.New("pressure percentages must be between 0 and 100")
 		}
@@ -21,7 +21,14 @@ func validatePressure(pressure PressureConfig) error {
 	if !validWatermarks(pressure.HighFreePercent, pressure.LowFreePercent) || !validWatermarks(pressure.HighInodeFreePercent, pressure.LowInodeFreePercent) {
 		return errors.New("pressure high watermarks must be greater than paired low watermarks")
 	}
+	if !validCriticalWatermark(pressure.LowFreePercent, pressure.CriticalFreePercent) || !validCriticalWatermark(pressure.LowInodeFreePercent, pressure.CriticalInodeFreePercent) {
+		return errors.New("critical pressure watermarks must be lower than paired low watermarks")
+	}
 	return nil
+}
+
+func validCriticalWatermark(low, critical int) bool {
+	return critical == 0 || low > critical
 }
 
 func validWatermarks(high, low int) bool {
@@ -178,6 +185,10 @@ func (s *Store) updatePressure(fs unix.Statfs_t) bool {
 	return s.pressureActive
 }
 
+func (s *Store) underCriticalWatermark(fs unix.Statfs_t) bool {
+	return below(fs.Bavail, fs.Blocks, s.pressure.CriticalFreePercent) || below(fs.Ffree, fs.Files, s.pressure.CriticalInodeFreePercent)
+}
+
 func (s *Store) MetadataError() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,7 +201,7 @@ func (s *Store) MetadataError() error {
 	return nil
 }
 
-func (s *Store) PressureVictims() ([]Lease, error) {
+func (s *Store) PressureVictims() ([]PressureVictim, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fs, err := filesystemUsage(s.root)
@@ -207,6 +218,7 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 	if !underPressure {
 		return nil, nil
 	}
+	criticalPressure := s.underCriticalWatermark(fs)
 	identities := make([]string, 0, len(s.metadataByIdentity))
 	for identity := range s.metadataByIdentity {
 		identities = append(identities, identity)
@@ -221,7 +233,7 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 				return nil, nil
 			}
 		}
-		if meta.Policy.EvictRunning && s.activeLeaseCount(meta) > 0 && !s.hasPreparingGenerationLease(meta, meta.Generation) {
+		if policyAllowsPressureTermination(meta.Policy.PressurePolicy) && s.activeLeaseCount(meta) > 0 && !s.hasPreparingGenerationLease(meta, meta.Generation) {
 			candidates = append(candidates, candidate{identity: identity, meta: meta, path: filepath.Join(s.root, identity)})
 		}
 	}
@@ -231,14 +243,14 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 			if s.hasPreparingGenerationLease(candidate.meta, candidate.meta.Generation) {
 				continue
 			}
-			leases := make([]Lease, 0, len(candidate.meta.Leases))
+			victims := make([]PressureVictim, 0, len(candidate.meta.Leases))
 			for index := range candidate.meta.Leases {
 				if candidate.meta.Leases[index].Generation == "" || candidate.meta.Leases[index].Generation == candidate.meta.Generation {
 					candidate.meta.Leases[index].Generation = candidate.meta.Generation
-					leases = append(leases, candidate.meta.Leases[index])
+					victims = append(victims, PressureVictim{Lease: candidate.meta.Leases[index], ForceDelete: shouldForceDelete(candidate.meta.Policy.PressurePolicy, criticalPressure)})
 				}
 			}
-			if len(leases) == 0 {
+			if len(victims) == 0 {
 				continue
 			}
 			candidate.meta.Retired = append(candidate.meta.Retired, RetiredGeneration{
@@ -262,7 +274,7 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 				_ = s.detachToTrash(replacementPath)
 				return nil, fmt.Errorf("retire cache generation before Pod eviction: %w", err)
 			}
-			return leases, nil
+			return victims, nil
 		}
 		for _, identity := range identities {
 			meta, err := s.readObjectMetadata(identity)
@@ -270,25 +282,33 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 				continue
 			}
 			for _, retired := range meta.Retired {
-				if !retired.Policy.EvictRunning {
+				if !policyAllowsPressureTermination(retired.Policy.PressurePolicy) {
 					continue
 				}
 				if s.hasPreparingGenerationLease(meta, retired.Generation) {
 					continue
 				}
-				leases := make([]Lease, 0)
+				victims := make([]PressureVictim, 0)
 				for _, lease := range meta.Leases {
 					if lease.Generation == retired.Generation && !lease.Preparing {
-						leases = append(leases, lease)
+						victims = append(victims, PressureVictim{Lease: lease, ForceDelete: shouldForceDelete(retired.Policy.PressurePolicy, criticalPressure)})
 					}
 				}
-				if len(leases) > 0 {
-					return leases, nil
+				if len(victims) > 0 {
+					return victims, nil
 				}
 			}
 		}
 	}
 	return nil, nil
+}
+
+func policyAllowsPressureTermination(policy string) bool {
+	return policy == PressurePolicyEvict || policy == PressurePolicyForceDelete
+}
+
+func shouldForceDelete(policy string, criticalPressure bool) bool {
+	return policy == PressurePolicyForceDelete && criticalPressure
 }
 
 func filesystemUsage(path string) (unix.Statfs_t, error) {

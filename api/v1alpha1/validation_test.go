@@ -47,3 +47,27 @@ func TestCacheClassSpecValidateScope(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheClassSpecValidatePressurePolicy(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name    string
+		policy  PressurePolicy
+		wantErr bool
+	}{
+		{name: "omitted pressure policy"},
+		{name: "unused only", policy: PressurePolicyUnused},
+		{name: "PDB respecting eviction", policy: PressurePolicyEvict},
+		{name: "critical force delete", policy: PressurePolicyForce},
+		{name: "unsupported pressure policy", policy: PressurePolicy("Unknown"), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gotErr := (CacheClassSpec{PressurePolicy: test.policy}).Validate()
+			if (gotErr != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %t", gotErr, test.wantErr)
+			}
+		})
+	}
+}

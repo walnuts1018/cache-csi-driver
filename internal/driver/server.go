@@ -13,7 +13,7 @@ import (
 const DriverName = "cache.csi.walnuts.dev"
 
 type ClassResolver interface {
-	Resolve(context.Context, string, string, string, string) (string, string, kube.ResolvedClass, error)
+	Resolve(context.Context, string, string, string) (string, string, kube.ResolvedClass, error)
 }
 
 type ProjectQuota interface {
@@ -56,12 +56,13 @@ type Server struct {
 }
 
 type podVolumeContext struct {
-	namespace  string
-	name       string
-	uid        string
-	cacheClass string
-	cacheKey   string
-	maxBytes   string
+	namespace          string
+	name               string
+	uid                string
+	serviceAccountName string
+	cacheClass         string
+	cacheKey           string
+	maxBytes           string
 }
 
 func New(store *cache.Store, resolver ClassResolver, quotaManager ProjectQuota, options Options) *Server {

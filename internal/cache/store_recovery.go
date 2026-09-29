@@ -262,6 +262,13 @@ func (s *Store) RecoverDegraded(ctx context.Context, verifyMount func(source str
 }
 
 func (s *Store) RecoverLeases(verifyMount func(source string, lease Lease, policy Policy) (bool, error)) error {
+	return s.RecoverLeasesContext(context.Background(), verifyMount)
+}
+
+func (s *Store) RecoverLeasesContext(ctx context.Context, verifyMount func(source string, lease Lease, policy Policy) (bool, error)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if verifyMount == nil {
@@ -272,32 +279,41 @@ func (s *Store) RecoverLeases(verifyMount func(source string, lease Lease, polic
 		return err
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if entry.IsDir() && entry.Name() != trashDirectoryName {
-			if err := s.recoverObjectLeases(filepath.Join(s.root, entry.Name()), entry.Name(), verifyMount); err != nil {
+			if err := s.recoverObjectLeases(ctx, filepath.Join(s.root, entry.Name()), entry.Name(), verifyMount); err != nil {
 				return err
 			}
 		}
 	}
+	s.ready.Store(true)
 	return nil
 }
 
-func (s *Store) recoverObjectLeases(path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
+func (s *Store) recoverObjectLeases(ctx context.Context, path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	meta, err := s.readMetadata(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return s.recoverMissingMetadataObject(path, identity, verifyMount)
+		return s.recoverMissingMetadataObject(ctx, path, identity, verifyMount)
 	}
 	if err == nil {
 		err = validateMetadata(identity, meta)
 	}
 	if err != nil {
 		s.markDegraded(identity, err)
-		s.quarantineDegradedObject(path, identity, verifyMount)
-		return nil
+		return s.quarantineForRecovery(ctx, path, identity, verifyMount)
 	}
-	return s.recoverValidObjectLeases(path, identity, meta, verifyMount)
+	return s.recoverValidObjectLeases(ctx, path, identity, meta, verifyMount)
 }
 
-func (s *Store) recoverMissingMetadataObject(path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
+func (s *Store) recoverMissingMetadataObject(ctx context.Context, path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	generations, err := s.readDir(filepath.Join(path, "generations"))
 	if errors.Is(err, os.ErrNotExist) || err == nil && !hasGenerationDirectory(generations) {
 		contents, readErr := s.readDir(path)
@@ -307,8 +323,7 @@ func (s *Store) recoverMissingMetadataObject(path, identity string, verifyMount 
 		}
 		if hasUntrackedObjectPayload(contents) {
 			s.markDegraded(identity, errors.New("cache metadata is missing while object data remains"))
-			s.quarantineDegradedObject(path, identity, verifyMount)
-			return nil
+			return s.quarantineForRecovery(ctx, path, identity, verifyMount)
 		}
 		if err := s.discardUntrackedGenerations(path); err != nil {
 			s.markDegraded(identity, err)
@@ -320,14 +335,16 @@ func (s *Store) recoverMissingMetadataObject(path, identity string, verifyMount 
 		return nil
 	}
 	s.markDegraded(identity, errors.New("cache metadata is missing while generations remain"))
-	s.quarantineDegradedObject(path, identity, verifyMount)
-	return nil
+	return s.quarantineForRecovery(ctx, path, identity, verifyMount)
 }
 
-func (s *Store) recoverValidObjectLeases(path, identity string, meta Metadata, verifyMount func(string, Lease, Policy) (bool, error)) error {
+func (s *Store) recoverValidObjectLeases(ctx context.Context, path, identity string, meta Metadata, verifyMount func(string, Lease, Policy) (bool, error)) error {
 	wasDirty := meta.Dirty
 	hadPreparingLease := slices.ContainsFunc(meta.Leases, func(lease Lease) bool { return lease.Preparing })
-	active, uncertain := s.verifyRecoveredLeases(path, identity, meta, verifyMount)
+	active, uncertain, err := s.verifyRecoveredLeases(ctx, path, identity, meta, verifyMount)
+	if err != nil {
+		return err
+	}
 	if uncertain {
 		return nil
 	}
@@ -361,7 +378,11 @@ func (s *Store) recoverValidObjectLeases(path, identity string, meta Metadata, v
 		return s.recoverDirtyObject(path, identity, meta)
 	}
 	meta.Leases = active
-	if s.recoverRetiredGenerations(path, identity, &meta, active) {
+	retiredHandled, err := s.recoverRetiredGenerations(ctx, path, identity, &meta, active)
+	if err != nil {
+		return err
+	}
+	if retiredHandled {
 		return nil
 	}
 	generationPath := filepath.Join(path, "generations", meta.Generation)
@@ -382,25 +403,28 @@ func (s *Store) recoverValidObjectLeases(path, identity string, meta Metadata, v
 	return nil
 }
 
-func (s *Store) verifyRecoveredLeases(path, identity string, meta Metadata, verifyMount func(string, Lease, Policy) (bool, error)) ([]Lease, bool) {
+func (s *Store) verifyRecoveredLeases(ctx context.Context, path, identity string, meta Metadata, verifyMount func(string, Lease, Policy) (bool, error)) ([]Lease, bool, error) {
 	active := make([]Lease, 0, len(meta.Leases))
 	for _, lease := range meta.Leases {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
 		generation, policy, err := leaseGenerationAndPolicy(meta, lease)
 		if err != nil {
 			s.markDegraded(identity, err)
-			return nil, true
+			return nil, true, nil
 		}
 		mounted, err := verifyMount(filepath.Join(path, "generations", generation), lease, policy)
 		if err != nil {
 			s.markDegraded(identity, err)
-			return nil, true
+			return nil, true, nil
 		}
 		if mounted {
 			lease.Preparing = false
 			active = append(active, lease)
 		}
 	}
-	return active, false
+	return active, false, nil
 }
 
 func (s *Store) recoverDirtyObject(path, identity string, meta Metadata) error {
@@ -424,8 +448,11 @@ func (s *Store) recoverDirtyObject(path, identity string, meta Metadata) error {
 	return nil
 }
 
-func (s *Store) recoverRetiredGenerations(path, identity string, meta *Metadata, active []Lease) bool {
+func (s *Store) recoverRetiredGenerations(ctx context.Context, path, identity string, meta *Metadata, active []Lease) (bool, error) {
 	for index := 0; index < len(meta.Retired); {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		retired := meta.Retired[index]
 		if slices.ContainsFunc(active, func(lease Lease) bool { return lease.Generation == retired.Generation }) {
 			index++
@@ -433,15 +460,18 @@ func (s *Store) recoverRetiredGenerations(path, identity string, meta *Metadata,
 		}
 		if err := s.detachGenerationToTrash(filepath.Join(path, "generations", retired.Generation), identity, retired); err != nil {
 			s.markDegraded(identity, err)
-			return true
+			return true, nil
 		}
 		meta.Retired = slices.Delete(meta.Retired, index, index+1)
 	}
-	return false
+	return false, nil
 }
 
-func (s *Store) quarantineDegradedObject(path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) {
-	_ = s.quarantineDegradedObjectChecked(context.Background(), path, identity, verifyMount)
+func (s *Store) quarantineForRecovery(ctx context.Context, path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
+	if err := s.quarantineDegradedObjectChecked(ctx, path, identity, verifyMount); err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) quarantineDegradedObjectChecked(ctx context.Context, path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {

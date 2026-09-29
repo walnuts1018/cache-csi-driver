@@ -84,28 +84,50 @@ func unhealthyVolume(volumeID, reason, message string) *csi.VolumeHealth {
 }
 
 func (s *Server) NodeGetStorageHealth(context.Context, *csi.NodeGetStorageHealthRequest) (*csi.NodeGetStorageHealthResponse, error) {
-	if err := s.store.MetadataError(); err != nil {
-		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheMetadataUnreadable", "one or more cache metadata records cannot be read")
+	if !s.store.Ready() {
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheRecoveryInProgress", "cache store recovery is still in progress")
 	}
-	if s.fallbackStore != nil {
-		if err := s.fallbackStore.MetadataError(); err != nil {
-			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "FallbackMetadataUnreadable", "fallback cache metadata cannot be read")
+	backends := []struct {
+		store             *cache.Store
+		recoveryReason    string
+		unavailableReason string
+		readOnlyReason    string
+		registryReason    string
+		name              string
+	}{
+		{
+			store:             s.store,
+			recoveryReason:    "CacheRecoveryInProgress",
+			unavailableReason: "CacheRootUnavailable",
+			readOnlyReason:    "CacheRootReadOnly",
+			registryReason:    "CacheProjectIDRegistryUnavailable",
+			name:              "cache",
+		},
+		{
+			store:             s.fallbackStore,
+			recoveryReason:    "FallbackRecoveryInProgress",
+			unavailableReason: "FallbackRootUnavailable",
+			readOnlyReason:    "FallbackRootReadOnly",
+			registryReason:    "FallbackProjectIDRegistryUnavailable",
+			name:              "fallback cache",
+		},
+	}
+	for _, backend := range backends {
+		if backend.store == nil {
+			continue
 		}
-	}
-	readOnly, err := s.mounter.filesystemReadOnly(s.store.Root())
-	if err != nil {
-		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, "CacheRootUnavailable", "cache root filesystem cannot be inspected")
-	}
-	if readOnly {
-		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheRootReadOnly", "cache root filesystem is read-only")
-	}
-	if s.fallbackStore != nil {
-		readOnly, err := s.mounter.filesystemReadOnly(s.fallbackStore.Root())
+		if !backend.store.Ready() {
+			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, backend.recoveryReason, backend.name+" store recovery is still in progress")
+		}
+		readOnly, err := s.mounter.filesystemReadOnly(backend.store.Root())
 		if err != nil {
-			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, "FallbackRootUnavailable", "fallback cache filesystem cannot be inspected")
+			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, backend.unavailableReason, backend.name+" filesystem cannot be inspected")
 		}
 		if readOnly {
-			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "FallbackRootReadOnly", "fallback cache filesystem is read-only")
+			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, backend.readOnlyReason, backend.name+" filesystem is read-only")
+		}
+		if err := backend.store.ProjectRegistryError(); err != nil {
+			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, backend.registryReason, backend.name+" project ID registry is unavailable")
 		}
 	}
 	return &csi.NodeGetStorageHealthResponse{}, nil

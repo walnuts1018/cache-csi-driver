@@ -8,9 +8,16 @@ import (
 	"time"
 
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	kubefake "k8s.io/client-go/kubernetes/fake"
+	kubetesting "k8s.io/client-go/testing"
 )
+
+const podResourceName = "pods"
 
 func TestEvictionRetryDelay(t *testing.T) {
 	t.Parallel()
@@ -55,9 +62,49 @@ func TestAcceptedEvictionWaitsBeforeRetry(t *testing.T) {
 func TestNotFoundEvictionStateWaitsForVictimPruning(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.September, 29, 0, 0, 0, 0, time.UTC)
-	state := nextEvictionState(now, evictionState{}, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "gone"))
+	state := nextEvictionState(now, evictionState{}, apierrors.NewNotFound(schema.GroupResource{Resource: podResourceName}, "gone"))
 	if !state.gone || !state.shouldSkip(now) {
 		t.Fatalf("not-found eviction state = %+v, want terminal state until victim pruning", state)
+	}
+}
+
+func TestCriticalForceDeleteUsesUIDPreconditionAndCooldown(t *testing.T) {
+	t.Parallel()
+	store, err := cache.NewStore(t.TempDir(), cache.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	client := kubefake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "cache-user", Namespace: "workloads", UID: types.UID("pod-uid")}})
+	manager := New(store, Options{Client: client})
+	lease := cache.Lease{Namespace: "workloads", PodName: "cache-user", PodUID: "pod-uid"}
+	manager.evictWithBackoff(t.Context(), cache.PressureVictim{Lease: lease})
+	manager.evictWithBackoff(t.Context(), cache.PressureVictim{Lease: lease, ForceDelete: true})
+	manager.evictWithBackoff(t.Context(), cache.PressureVictim{Lease: lease, ForceDelete: true})
+	actions := client.Actions()
+	if len(actions) != 2 {
+		t.Fatalf("eviction escalation actions = %d, want Eviction plus one Delete within cooldown", len(actions))
+	}
+	if actions[0].GetVerb() != "create" || actions[0].GetResource().Resource != podResourceName || actions[0].GetSubresource() != "eviction" {
+		t.Fatalf("initial pressure action = %s %s/%s, want PDB-respecting Pod Eviction", actions[0].GetVerb(), actions[0].GetResource().Resource, actions[0].GetSubresource())
+	}
+	deleteAction, ok := actions[1].(kubetesting.DeleteAction)
+	if !ok {
+		t.Fatalf("critical escalation action = %T, want Pod delete", actions[1])
+	}
+	if actions[1].GetResource().Resource != podResourceName || actions[1].GetVerb() != "delete" {
+		t.Fatalf("critical action = %s %s, want delete pods", actions[1].GetVerb(), actions[1].GetResource().Resource)
+	}
+	options := deleteAction.GetDeleteOptions()
+	if options.GracePeriodSeconds == nil || *options.GracePeriodSeconds != 0 {
+		t.Fatalf("grace period = %v, want zero", options.GracePeriodSeconds)
+	}
+	if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != "pod-uid" {
+		t.Fatalf("delete UID precondition = %+v, want pod-uid", options.Preconditions)
 	}
 }
 
@@ -178,7 +225,7 @@ func TestRecoverIncludesFallbackStore(t *testing.T) {
 			return false, nil
 		},
 	})
-	if err := manager.Recover(); err != nil {
+	if err := manager.Recover(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(fallbackRoot, identity)); !errors.Is(err, os.ErrNotExist) {

@@ -19,7 +19,7 @@ const trashDirectoryName = ".trash"
 const trashBatchSize = 16
 
 func (s *Store) runTrashCollector() {
-	defer close(s.trashDone)
+	defer s.finishTrashCollector()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	_ = s.cleanupTrashBatch()
@@ -42,6 +42,8 @@ func (s *Store) CleanupTrash(ctx context.Context) error {
 		return ctx.Err()
 	case <-s.stopTrash:
 		return errors.New("cache store is closed")
+	case <-s.trashDone:
+		return errors.New("cache store has no trash collector")
 	case s.trashRequests <- response:
 	}
 	select {

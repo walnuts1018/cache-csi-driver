@@ -20,9 +20,11 @@ import (
 )
 
 const (
-	testDefault = "default"
-	testPodName = "pod"
-	testPodUID  = "pod-uid"
+	testDefault            = "default"
+	testPodName            = "pod"
+	testPodUID             = "pod-uid"
+	testServiceAccountName = "builder"
+	testOneMi              = "1Mi"
 )
 
 func TestNodeGetCapabilitiesAdvertisesImplementedRPCs(t *testing.T) {
@@ -106,6 +108,96 @@ func TestNodePublishIsIdempotentForAnExistingMatchingMount(t *testing.T) {
 	request.Readonly = true
 	if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("publish with a changed readonly flag error = %v, want AlreadyExists", err)
+	}
+}
+
+func TestNodePublishResolvesServiceAccountFromKubeletVolumeContext(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request := newPublishRequest(t, server.options.KubeletRoot, "service-account-context")
+	request.VolumeContext["csi.storage.k8s.io/serviceAccount.name"] = "custom-builder"
+
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if got := server.resolver.(*testResolver).serviceAccountName; got != "custom-builder" {
+		t.Fatalf("resolver ServiceAccount name = %q, want custom-builder from podInfoOnMount", got)
+	}
+}
+
+func TestNodePublishRequiresReadonlyForReaderOnlyAccessMode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rejects writable request", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+		request := newPublishRequest(t, server.options.KubeletRoot, "reader-only-writable")
+		request.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
+		if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("reader-only writable publish error = %v, want InvalidArgument", err)
+		}
+	})
+
+	t.Run("accepts readonly request", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+		request := newPublishRequest(t, server.options.KubeletRoot, "reader-only-readonly")
+		request.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
+		request.Readonly = true
+		if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+			t.Fatalf("reader-only readonly publish error = %v", err)
+		}
+	})
+}
+
+func TestNodePublishUsesBoundedFallbackUntilCacheStoreRecoveryCompletes(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request := newPublishRequest(t, server.options.KubeletRoot, "store-not-ready")
+	request.VolumeContext["maxBytes"] = testOneMi
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unreadyStore, err := cache.NewStoreAsync(store.Root(), cache.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.store = unreadyStore
+	t.Cleanup(func() {
+		if err := unreadyStore.Close(); err != nil {
+			t.Errorf("close asynchronously initialized cache store: %v", err)
+		}
+	})
+	if err := unreadyStore.WaitForIndexes(t.Context()); err != nil {
+		t.Fatalf("wait for cache store indexing: %v", err)
+	}
+	if unreadyStore.Ready() {
+		t.Fatal("cache store became ready before lease recovery")
+	}
+
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatalf("publish while the normal cache store is recovering: %v", err)
+	}
+	_, _, _, policy, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId())
+	if err != nil || !found {
+		t.Fatalf("fallback lease found = %t, error = %v; want a bounded fallback lease", found, err)
+	}
+	if policy.MaxBytes != 1<<20 || mounts.mountCalls != 1 || !mounts.mounts[request.GetTargetPath()].noExec {
+		t.Fatalf("fallback policy = %+v, mount calls = %d, mount = %+v; want 1Mi, one noexec mount", policy, mounts.mountCalls, mounts.mounts[request.GetTargetPath()])
+	}
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatalf("idempotent fallback republish while the normal store is recovering: %v", err)
+	}
+	if mounts.mountCalls != 1 {
+		t.Fatalf("idempotent fallback republish called mount %d times, want one", mounts.mountCalls)
+	}
+
+	unknownMount := newPublishRequest(t, server.options.KubeletRoot, "store-not-ready-unknown-mount")
+	mounts.mounts[unknownMount.GetTargetPath()] = testMount{source: filepath.Join(store.Root(), "unknown", "generations", "unknown")}
+	if _, err := server.NodePublishVolume(t.Context(), unknownMount); status.Code(err) != codes.Unavailable {
+		t.Fatalf("publish over an unverified mount during store recovery error = %v, want Unavailable", err)
 	}
 }
 
@@ -217,7 +309,7 @@ func TestNodePublishRollsBackLeaseWhenDetachedMountSetupFails(t *testing.T) {
 func TestNodePublishUsesFallbackForExclusiveSharingConflict(t *testing.T) {
 	t.Parallel()
 
-	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{SharingPolicy: cachev1alpha1.SharingPolicyExclusive, EvictRunning: true, NoExec: true}, nil)
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{SharingPolicy: cachev1alpha1.SharingPolicyExclusive, PressurePolicy: cachev1alpha1.PressurePolicyEvict, NoExec: true}, nil)
 	first := newPublishRequest(t, server.options.KubeletRoot, "exclusive-first")
 	if _, err := server.NodePublishVolume(t.Context(), first); err != nil {
 		t.Fatal(err)
@@ -235,8 +327,8 @@ func TestNodePublishUsesFallbackForExclusiveSharingConflict(t *testing.T) {
 	}
 	if _, _, source, policy, found, err := server.fallbackStore.LeaseDetails(second.GetVolumeId()); err != nil || !found {
 		t.Fatalf("fallback lease found = %t, error = %v; want an isolated fallback lease", found, err)
-	} else if !policy.EvictRunning || !policy.NoExec {
-		t.Fatalf("fallback policy = %+v, want evictRunning and noexec preserved", policy)
+	} else if policy.PressurePolicy != string(cachev1alpha1.PressurePolicyEvict) || !policy.NoExec {
+		t.Fatalf("fallback policy = %+v, want Evict and noexec preserved", policy)
 	} else if mounts.mounts[second.GetTargetPath()].source != source {
 		t.Fatalf("second target source = %q, want fallback source %q", mounts.mounts[second.GetTargetPath()].source, source)
 	}
@@ -432,7 +524,7 @@ func TestResolverUnavailablePublishesRestrictedFallbackAndUnpublishes(t *testing
 	}
 }
 
-func TestFallbackRejectsHardResolutionErrorsLimitsAndCancellation(t *testing.T) {
+func TestFallbackClassificationForResolutionErrorsAndCancellation(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -454,9 +546,16 @@ func TestFallbackRejectsHardResolutionErrorsLimitsAndCancellation(t *testing.T) 
 			wantStatus: codes.FailedPrecondition,
 		},
 		{
-			name:       "informer cache has not synced",
-			resolver:   &testResolver{err: kube.ErrResolverNotSynced},
-			wantStatus: codes.Unavailable,
+			name:         "informer cache has not synced",
+			resolver:     &testResolver{err: kube.ErrResolverNotSynced},
+			wantStatus:   codes.OK,
+			wantFallback: true,
+		},
+		{
+			name:         "ServiceAccount has not reached its informer cache",
+			resolver:     &testResolver{err: kube.ErrServiceAccountNotCached},
+			wantStatus:   codes.OK,
+			wantFallback: true,
 		},
 		{
 			name:         "maxBytes uses a bounded fallback when resolver is unavailable",
@@ -614,7 +713,7 @@ func TestNodeUnpublishPreservesLeaseForForeignMount(t *testing.T) {
 	}
 }
 
-func TestNodeGetVolumeHealthReportsUnreadableMetadataAsInaccessible(t *testing.T) {
+func TestNodeHealthKeepsObjectMetadataFailureScopedToVolume(t *testing.T) {
 	t.Parallel()
 
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
@@ -658,9 +757,110 @@ func TestNodeGetVolumeHealthReportsUnreadableMetadataAsInaccessible(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	storageHealth := storageResponse.GetBackendHealth()
-	if len(storageHealth) != 1 || storageHealth[0].GetStatus() != csi.StorageHealthErrorType_STORAGE_DEGRADED || storageHealth[0].GetReason() != "CacheMetadataUnreadable" {
-		t.Fatalf("storage health = %+v, want degraded unreadable-metadata status", storageHealth)
+	if storageHealth := storageResponse.GetBackendHealth(); len(storageHealth) != 0 {
+		t.Fatalf("storage health = %+v, want healthy backend status despite isolated metadata corruption", storageHealth)
+	}
+}
+
+func TestNodeGetStorageHealthReportsProjectRegistryFailure(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	cacheRoot := filepath.Join(root, "cache")
+	if err := os.MkdirAll(cacheRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheRoot, ".project-ids.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := cache.NewStore(cacheRoot, cache.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	server := New(store, nil, nil, Options{})
+	server.mounter = &testMounter{}
+
+	response, err := server.NodeGetStorageHealth(t.Context(), &csi.NodeGetStorageHealthRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendHealth := response.GetBackendHealth()
+	if len(backendHealth) != 1 || backendHealth[0].GetStatus() != csi.StorageHealthErrorType_STORAGE_DEGRADED || backendHealth[0].GetReason() != "CacheProjectIDRegistryUnavailable" {
+		t.Fatalf("storage health = %+v, want degraded project registry status", backendHealth)
+	}
+}
+
+func TestNodeGetStorageHealthReportsRecoveryBeforeInspectingStore(t *testing.T) {
+	t.Parallel()
+
+	store, err := cache.NewStoreAsync(filepath.Join(t.TempDir(), "cache"), cache.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	mounts := &testMounter{filesystemReadOnlyErr: errors.New("must not inspect root before recovery")}
+	server := New(store, nil, nil, Options{})
+	server.mounter = mounts
+
+	response, err := server.NodeGetStorageHealth(t.Context(), &csi.NodeGetStorageHealthRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendHealth := response.GetBackendHealth()
+	if len(backendHealth) != 1 || backendHealth[0].GetStatus() != csi.StorageHealthErrorType_STORAGE_DEGRADED || backendHealth[0].GetReason() != "CacheRecoveryInProgress" {
+		t.Fatalf("storage health = %+v, want cache-recovery-in-progress status", backendHealth)
+	}
+}
+
+func TestNodeGetStorageHealthReportsCacheRootFailures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		setup  func(*testMounter)
+		status csi.StorageHealthErrorType
+		reason string
+	}{
+		{
+			name: "read only root",
+			setup: func(mounts *testMounter) {
+				mounts.filesystemReadOnlyResult = true
+			},
+			status: csi.StorageHealthErrorType_STORAGE_DEGRADED,
+			reason: "CacheRootReadOnly",
+		},
+		{
+			name: "unavailable root",
+			setup: func(mounts *testMounter) {
+				mounts.filesystemReadOnlyErr = errors.New("filesystem inspection failed")
+			},
+			status: csi.StorageHealthErrorType_STORAGE_UNREACHABLE,
+			reason: "CacheRootUnavailable",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server, mounts, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+			test.setup(mounts)
+			response, err := server.NodeGetStorageHealth(t.Context(), &csi.NodeGetStorageHealthRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			backendHealth := response.GetBackendHealth()
+			if len(backendHealth) != 1 || backendHealth[0].GetStatus() != test.status || backendHealth[0].GetReason() != test.reason {
+				t.Fatalf("storage health = %+v, want status %s with reason %q", backendHealth, test.status, test.reason)
+			}
+		})
 	}
 }
 
@@ -775,11 +975,13 @@ func TestPolicyForPreservesZeroRetention(t *testing.T) {
 }
 
 type testResolver struct {
-	spec cachev1alpha1.CacheClassSpec
-	err  error
+	spec               cachev1alpha1.CacheClassSpec
+	err                error
+	serviceAccountName string
 }
 
-func (resolver *testResolver) Resolve(context.Context, string, string, string, string) (string, string, kube.ResolvedClass, error) {
+func (resolver *testResolver) Resolve(_ context.Context, _, _, serviceAccountName string) (string, string, kube.ResolvedClass, error) {
+	resolver.serviceAccountName = serviceAccountName
 	if resolver.err != nil {
 		return "", "", kube.ResolvedClass{}, resolver.err
 	}
@@ -831,6 +1033,8 @@ type testMounter struct {
 	sourceMountedErr         error
 	lastSource               string
 	sourceMountedFromTargets bool
+	filesystemReadOnlyResult bool
+	filesystemReadOnlyErr    error
 }
 
 func newTestServer(t *testing.T, spec cachev1alpha1.CacheClassSpec, quotaError error) (*Server, *testMounter, *cache.Store) {
@@ -883,12 +1087,13 @@ func newPublishRequest(t *testing.T, kubeletRoot, volumeID string) *csi.NodePubl
 			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
 		},
 		VolumeContext: map[string]string{
-			"csi.storage.k8s.io/ephemeral":     "true",
-			"csi.storage.k8s.io/pod.namespace": testDefault,
-			"csi.storage.k8s.io/pod.name":      testPodName,
-			"csi.storage.k8s.io/pod.uid":       testPodUID,
-			"cacheClass":                       testDefault,
-			"cacheKey":                         "cache-key",
+			"csi.storage.k8s.io/ephemeral":           "true",
+			"csi.storage.k8s.io/pod.namespace":       testDefault,
+			"csi.storage.k8s.io/pod.name":            testPodName,
+			"csi.storage.k8s.io/pod.uid":             testPodUID,
+			"csi.storage.k8s.io/serviceAccount.name": testServiceAccountName,
+			"cacheClass":                             testDefault,
+			"cacheKey":                               "cache-key",
 		},
 	}
 }
@@ -985,4 +1190,6 @@ func (mounts *testMounter) sourceMounted(source string) (bool, error) {
 	return mounts.sourceMountedResult, nil
 }
 
-func (*testMounter) filesystemReadOnly(string) (bool, error) { return false, nil }
+func (mounts *testMounter) filesystemReadOnly(string) (bool, error) {
+	return mounts.filesystemReadOnlyResult, mounts.filesystemReadOnlyErr
+}

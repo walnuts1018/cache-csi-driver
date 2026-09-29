@@ -67,11 +67,6 @@ spec:
                 - discard
                 - reuse
                 type: string
-              evictRunning:
-                description: Allows best-effort pressure handling to request graceful
-                  eviction of Pods using active cache generations. Eviction requests
-                  respect PodDisruptionBudgets and do not guarantee cache reclamation.
-                type: boolean
               maxBytes:
                 anyOf:
                 - type: integer
@@ -85,6 +80,16 @@ spec:
               noExec:
                 description: Mounts cache generations with execution disabled.
                 type: boolean
+              pressurePolicy:
+                default: UnusedOnly
+                description: Policy for active cache generations during filesystem
+                  pressure. ForceDelete requires the node's critical pressure watermark
+                  and explicit Pod delete RBAC.
+                enum:
+                - UnusedOnly
+                - Evict
+                - ForceDelete
+                type: string
               quota:
                 description: Quota configuration for cache generations.
                 properties:

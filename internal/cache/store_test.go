@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const firstLeaseID = "first"
@@ -367,7 +369,7 @@ func TestPressureVictimsSkipsMetadataScanWhenPressureIsOff(t *testing.T) {
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
 		Lease:    Lease{ID: "pressure-off", Target: filepath.Join(t.TempDir(), "target")},
-		Policy:   Policy{EvictRunning: true},
+		Policy:   Policy{PressurePolicy: PressurePolicyEvict},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +405,7 @@ func TestPressureDoesNotRetirePreparingLeaseBeforePublishCommit(t *testing.T) {
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
 		Lease:    Lease{ID: "published", Target: publishedTarget},
-		Policy:   Policy{EvictRunning: true},
+		Policy:   Policy{PressurePolicy: PressurePolicyEvict},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +416,7 @@ func TestPressureDoesNotRetirePreparingLeaseBeforePublishCommit(t *testing.T) {
 	options := AcquireOptions{
 		Identity: identity,
 		Lease:    Lease{ID: "preparing", Target: target},
-		Policy:   Policy{EvictRunning: true},
+		Policy:   Policy{PressurePolicy: PressurePolicyEvict},
 	}
 	var source string
 	for attempt := range 2 {
@@ -623,10 +625,12 @@ func TestValidatePressureWatermarks(t *testing.T) {
 		{
 			name: "configured watermarks",
 			pressure: PressureConfig{
-				HighFreePercent:      25,
-				LowFreePercent:       20,
-				HighInodeFreePercent: 15,
-				LowInodeFreePercent:  10,
+				HighFreePercent:          25,
+				LowFreePercent:           20,
+				CriticalFreePercent:      10,
+				HighInodeFreePercent:     15,
+				LowInodeFreePercent:      10,
+				CriticalInodeFreePercent: 5,
 			},
 		},
 		{name: "disabled watermarks"},
@@ -645,6 +649,20 @@ func TestValidatePressureWatermarks(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "critical watermark is not lower",
+			pressure: PressureConfig{
+				HighFreePercent:     25,
+				LowFreePercent:      20,
+				CriticalFreePercent: 20,
+			},
+			wantErr: true,
+		},
+		{
+			name:     "critical watermark requires a paired low watermark",
+			pressure: PressureConfig{CriticalFreePercent: 5},
+			wantErr:  true,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -652,6 +670,50 @@ func TestValidatePressureWatermarks(t *testing.T) {
 			err := validatePressure(test.pressure)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("validatePressure() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestCriticalWatermarkDetection(t *testing.T) {
+	t.Parallel()
+	store := &Store{pressure: PressureConfig{CriticalFreePercent: 10, CriticalInodeFreePercent: 5}}
+	tests := []struct {
+		name string
+		fs   unix.Statfs_t
+		want bool
+	}{
+		{name: "above both critical limits", fs: unix.Statfs_t{Bavail: 20, Blocks: 100, Ffree: 10, Files: 100}},
+		{name: "critical bytes", fs: unix.Statfs_t{Bavail: 9, Blocks: 100, Ffree: 10, Files: 100}, want: true},
+		{name: "critical inodes", fs: unix.Statfs_t{Bavail: 20, Blocks: 100, Ffree: 4, Files: 100}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := store.underCriticalWatermark(test.fs); got != test.want {
+				t.Fatalf("underCriticalWatermark() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestForceDeletePolicyRequiresCriticalPressure(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		policy   string
+		critical bool
+		want     bool
+	}{
+		{name: "default remains unused", policy: "", critical: true},
+		{name: "eviction policy stays PDB respecting", policy: PressurePolicyEvict, critical: true},
+		{name: "force policy above critical watermark", policy: PressurePolicyForceDelete},
+		{name: "force policy at critical watermark", policy: PressurePolicyForceDelete, critical: true, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shouldForceDelete(test.policy, test.critical); got != test.want {
+				t.Fatalf("shouldForceDelete() = %t, want %t", got, test.want)
 			}
 		})
 	}
@@ -1343,13 +1405,13 @@ func TestAcquireDoesNotDiscardGenerationsWhenMetadataIsMissing(t *testing.T) {
 
 func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
 	t.Parallel()
-	policy := Policy{SharingPolicy: SharingPolicyExclusive, EvictRunning: true}
-	store, identity, _, target, oldPath := pressureLease(t, "exclusive-cache", policy, 1)
+	policy := Policy{SharingPolicy: SharingPolicyExclusive, PressurePolicy: PressurePolicyEvict}
+	store, identity, _, target, oldPath := pressureLease(t, "exclusive-cache", policy, 1, true)
 	victims, err := store.PressureVictims()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(victims) != 1 || victims[0].ID != firstLeaseID {
+	if len(victims) != 1 || victims[0].Lease.ID != firstLeaseID || victims[0].ForceDelete {
 		t.Fatalf("pressure victims = %+v, want the active exclusive lease", victims)
 	}
 	_, _, err = store.Acquire(AcquireOptions{
@@ -1384,8 +1446,8 @@ func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
 
 func TestRecoveryVerifierReceivesRetiredGenerationSourceAndPolicy(t *testing.T) {
 	t.Parallel()
-	policy := Policy{NoExec: true, SharingPolicy: SharingPolicyExclusive, EvictRunning: true}
-	store, identity, _, target, oldPath := pressureLease(t, "recovery-retired-cache", policy, 1)
+	policy := Policy{NoExec: true, SharingPolicy: SharingPolicyExclusive, PressurePolicy: PressurePolicyEvict}
+	store, identity, _, target, oldPath := pressureLease(t, "recovery-retired-cache", policy, 1, true)
 	if _, err := store.PressureVictims(); err != nil {
 		t.Fatal(err)
 	}
@@ -1518,7 +1580,7 @@ func TestTrashCleanupSkipsFailedEntriesAcrossBatches(t *testing.T) {
 
 func TestPressureVictimsRemainAvailableWhenTrashDeletionFails(t *testing.T) {
 	t.Parallel()
-	store, _, _, _, _ := pressureLease(t, "blocked-trash-victim", Policy{EvictRunning: true}, 1)
+	store, _, _, _, _ := pressureLease(t, "blocked-trash-victim", Policy{PressurePolicy: PressurePolicyEvict}, 1, true)
 	if err := store.CleanupTrash(t.Context()); err != nil {
 		t.Fatalf("wait for initial trash cleanup: %v", err)
 	}
@@ -1540,19 +1602,19 @@ func TestPressureVictimsRemainAvailableWhenTrashDeletionFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(victims) != 1 || victims[0].ID != firstLeaseID {
+	if len(victims) != 1 || victims[0].Lease.ID != firstLeaseID || victims[0].ForceDelete {
 		t.Fatalf("pressure victims with undeleted trash = %+v, want active lease", victims)
 	}
 }
 
 func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
 	t.Parallel()
-	store, identity, policy, target, oldPath := pressureLease(t, "pressure-cache", Policy{EvictRunning: true}, 0)
+	store, identity, policy, target, oldPath := pressureLease(t, "pressure-cache", Policy{PressurePolicy: PressurePolicyEvict}, 0, true)
 	victims, err := store.PressureVictims()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(victims) != 1 || victims[0].ID != firstLeaseID {
+	if len(victims) != 1 || victims[0].Lease.ID != firstLeaseID || victims[0].ForceDelete {
 		t.Fatalf("pressure victims = %+v, want the active lease", victims)
 	}
 	if err := store.BeginPublish(firstLeaseID, target); !errors.Is(err, ErrLeaseGenerationRetired) {
@@ -1579,7 +1641,7 @@ func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(retries) != 1 || retries[0].ID != firstLeaseID {
+	if len(retries) != 1 || retries[0].Lease.ID != firstLeaseID || retries[0].ForceDelete {
 		t.Fatalf("pressure retry victims = %+v, want the retired lease", retries)
 	}
 	meta, err = store.readMetadata(filepath.Join(store.Root(), identity))
@@ -1606,7 +1668,7 @@ func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
 
 func TestRetiredGenerationReservesProjectIDUntilDeleted(t *testing.T) {
 	t.Parallel()
-	store, identity, policy, target, _ := pressureLease(t, "pressure-quota-cache", Policy{EvictRunning: true, QuotaEnabled: true, MaxBytes: 1024}, 2)
+	store, identity, policy, target, _ := pressureLease(t, "pressure-quota-cache", Policy{PressurePolicy: PressurePolicyEvict, QuotaEnabled: true, MaxBytes: 1024}, 2, false)
 	oldProjectID, _, _, err := store.QuotaState(identity, policy.MaxBytes)
 	if err != nil {
 		t.Fatal(err)
@@ -1636,7 +1698,7 @@ func TestRetiredGenerationReservesProjectIDUntilDeleted(t *testing.T) {
 	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
 		t.Fatal("detached generation's project ID was reused before physical deletion")
 	}
-	if err := store.CleanupTrash(t.Context()); err != nil {
+	if err := store.cleanupTrashBatch(); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err != nil {
@@ -1644,15 +1706,15 @@ func TestRetiredGenerationReservesProjectIDUntilDeleted(t *testing.T) {
 	}
 }
 
-func pressureLease(t *testing.T, name string, policy Policy, projectIDCount uint32) (*Store, string, Policy, string, string) {
+func pressureLease(t *testing.T, name string, policy Policy, projectIDCount uint32, startTrashCollector bool) (*Store, string, Policy, string, string) {
 	t.Helper()
 	if projectIDCount == 0 {
 		projectIDCount = 1
 	}
-	store, err := NewStore(t.TempDir(), StoreOptions{
+	store, err := newStore(t.TempDir(), StoreOptions{
 		ProjectIDStart: 32000,
 		ProjectIDCount: projectIDCount,
-	})
+	}, startTrashCollector)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -48,6 +48,9 @@ jobs:
       - name: Run XFS project quota integration test
         run: mise run test:xfs-quota
 
+      - name: Run Kind cache lifecycle E2E
+        run: mise run test:e2e:kind
+
       - name: Verify generated API manifests
         run: |
           mise run manifests
