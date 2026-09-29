@@ -22,54 +22,77 @@ description = "Node-only CSI capability checks with csi-sanity"
 run = """
 set -euo pipefail
 tmp_dir="$(mktemp -d)"
-driver_pid=""
+container_name="cache-csi-sanity-$$"
 cleanup() {
-  if [ -n "$driver_pid" ]; then
-    kill "$driver_pid" 2>/dev/null || true
-    wait "$driver_pid" 2>/dev/null || true
+  if docker container inspect "$container_name" >/dev/null 2>&1; then
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
   fi
   rm -rf "$tmp_dir"
 }
 trap cleanup EXIT
 
-go build -trimpath -o "$tmp_dir/cache-csi-node" ./cmd/cache-csi-node
-endpoint="unix://$tmp_dir/csi.sock"
-"$tmp_dir/cache-csi-node" \
-  -endpoint "$endpoint" \
-  -cache-root "$tmp_dir/cache" \
-  -fallback-root "$tmp_dir/fallback" \
-  -kubelet-root "$tmp_dir/kubelet" \
-  -node-id csi-sanity-test >"$tmp_dir/driver.log" 2>&1 &
-driver_pid=$!
-
-socket_path="$tmp_dir/csi.sock"
-for _ in $(seq 1 100); do
-  if [ -S "$socket_path" ]; then
-    break
-  fi
-  if ! kill -0 "$driver_pid" 2>/dev/null; then
-    cat "$tmp_dir/driver.log"
-    exit 1
-  fi
-  sleep 0.1
-done
-if [ ! -S "$socket_path" ]; then
-  cat "$tmp_dir/driver.log"
-  echo "CSI node plugin did not create its socket" >&2
+go_arch="$(go env GOARCH)"
+GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 go build -trimpath -o "$tmp_dir/cache-csi-node" ./cmd/cache-csi-node
+csi_test_module="$(go env GOMODCACHE)/github.com/kubernetes-csi/csi-test/v5@v5.6.0"
+if [ ! -f "$csi_test_module/go.mod" ]; then
+  echo "csi-sanity v5.6.0 source is missing from the Go module cache" >&2
   exit 1
 fi
+(
+  cd "$csi_test_module"
+  GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 go build -trimpath -o "$tmp_dir/csi-sanity" ./cmd/csi-sanity
+)
 
-csi-sanity \
-  --csi.endpoint="$endpoint" \
-  --csi.mountdir="$tmp_dir/mount" \
-  --csi.stagingdir="$tmp_dir/staging" \
-  --ginkgo.focus='NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo' \
-  --ginkgo.v
+docker run --rm --privileged --platform "linux/$go_arch" --name "$container_name" \
+  -v "$tmp_dir:/tmp/csi-sanity" \
+  --entrypoint /bin/bash \
+  ubuntu:26.04 \
+  -lc 'set -euo pipefail
+    /tmp/csi-sanity/cache-csi-node \
+      -endpoint unix:///tmp/csi-sanity/csi.sock \
+      -cache-root /tmp/csi-sanity/cache \
+      -fallback-root /tmp/csi-sanity/fallback \
+      -kubelet-root /tmp/csi-sanity/kubelet \
+      -node-id csi-sanity-test &
+    driver_pid=$!
+    trap "kill $driver_pid 2>/dev/null || true; wait $driver_pid 2>/dev/null || true" EXIT
+    for _ in $(seq 1 100); do
+      if [ -S /tmp/csi-sanity/csi.sock ]; then
+        break
+      fi
+      if ! kill -0 "$driver_pid" 2>/dev/null; then
+        wait "$driver_pid"
+      fi
+      sleep 0.1
+    done
+    if [ ! -S /tmp/csi-sanity/csi.sock ]; then
+      echo "CSI node plugin did not create its socket" >&2
+      exit 1
+    fi
+    /tmp/csi-sanity/csi-sanity \
+      --csi.endpoint=unix:///tmp/csi-sanity/csi.sock \
+      --csi.mountdir=/tmp/csi-sanity/mount \
+      --csi.stagingdir=/tmp/csi-sanity/staging \
+      --ginkgo.focus="NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo" \
+      --ginkgo.v'
 """
 
 [tasks."test:mount-api"]
-description = "Linux mount API integration coverage when CAP_SYS_ADMIN is available"
-run = "go test -v -count=1 -run '^TestMountUsesOpenTreeMountSetattrMoveMount$' ./internal/driver"
+description = "Linux mount API integration coverage in a privileged container"
+run = """
+set -euo pipefail
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+go_arch="$(go env GOARCH)"
+GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 go test -c -o "$tmp_dir/mount-api.test" ./internal/driver
+docker run --rm --privileged --platform "linux/$go_arch" \
+  --env CACHE_CSI_REQUIRE_MOUNT_API=1 \
+  -v "$tmp_dir:/tmp/cache-csi-mount-api:ro" \
+  --entrypoint /tmp/cache-csi-mount-api/mount-api.test \
+  ubuntu:26.04 \
+  -test.v -test.count=1 -test.run '^TestMountUsesOpenTreeMountSetattrMoveMount$'
+"""
 
 [tasks.manifests]
 description = "Generate CacheClass API code and CRD manifests"

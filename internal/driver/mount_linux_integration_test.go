@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestMountUsesOpenTreeMountSetattrMoveMountはdriverが使用するLinux mount APIを実際に呼び出して検証する。ubuntu-26.04の標準runnerではテスト実行プロセスに`CAP_SYS_ADMIN`が付与されないためスキップし、この権限を持つLinux環境ではmountまで実行する。
+// TestMountUsesOpenTreeMountSetattrMoveMountはdriverが使用するLinux mount APIを実際に呼び出して検証する。通常のunit testではmount権限がない環境をskipし、専用integration taskではCACHE_CSI_REQUIRE_MOUNT_APIで実mountを必須にする。
 func TestMountUsesOpenTreeMountSetattrMoveMount(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
@@ -25,18 +25,20 @@ func TestMountUsesOpenTreeMountSetattrMoveMount(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "entry"), []byte("cache data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := mount(source, target, true, true); err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
+			if os.Getenv("CACHE_CSI_REQUIRE_MOUNT_API") == "1" {
+				t.Fatalf("required Linux mount API integration failed: %v", err)
+			}
+			t.Skipf("open_tree/mount_setattr/move_mount integration requires Linux mount API support and CAP_SYS_ADMIN: %v", err)
+		}
+		t.Fatalf("mount cache with the Linux mount API: %v", err)
+	}
 	t.Cleanup(func() {
 		if err := unmount(target); err != nil && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOENT) {
 			t.Errorf("unmount integration target: %v", err)
 		}
 	})
-
-	if err := mount(source, target, true, true); err != nil {
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
-			t.Skipf("open_tree/mount_setattr/move_mount integration requires Linux mount API support and CAP_SYS_ADMIN: %v", err)
-		}
-		t.Fatalf("mount cache with the Linux mount API: %v", err)
-	}
 
 	same, err := sameCacheMount(source, target, true, true)
 	if err != nil {
