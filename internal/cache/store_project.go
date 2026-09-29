@@ -20,6 +20,7 @@ type projectReservation struct {
 }
 
 type projectReservationDocument struct {
+	FormatVersion       int                         `json:"formatVersion"`
 	Reservations        []projectIDReservation      `json:"reservations"`
 	UnknownReservations []unknownProjectReservation `json:"unknownReservations,omitempty"`
 }
@@ -47,6 +48,10 @@ func (s *Store) loadProjectRegistry() bool {
 	}
 	var document projectReservationDocument
 	if err := json.Unmarshal(data, &document); err != nil {
+		s.projectRegistryDamaged = true
+		return false
+	}
+	if document.FormatVersion != 0 && document.FormatVersion != storeFormatVersion {
 		s.projectRegistryDamaged = true
 		return false
 	}
@@ -257,7 +262,11 @@ func (s *Store) persistProjectReservations() error {
 		}
 		return reservations[i].ProjectID < reservations[j].ProjectID
 	})
-	data, err := json.Marshal(projectReservationDocument{Reservations: reservations, UnknownReservations: unknownReservations})
+	data, err := json.Marshal(projectReservationDocument{
+		FormatVersion:       storeFormatVersion,
+		Reservations:        reservations,
+		UnknownReservations: unknownReservations,
+	})
 	if err != nil {
 		return err
 	}
