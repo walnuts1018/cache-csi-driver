@@ -11,6 +11,8 @@ cacheRootDir: /var/lib/cache-csi
 fallbackRootDir: /run/cache-csi/fallback
 fallbackMaxBytes: 1Gi
 fallbackVolumeMaxBytes: 128Mi
+metrics:
+  port: 9807
 kubeletRootDir: /var/lib/kubelet
 gcInterval: 30s
 pressure:
@@ -25,13 +27,14 @@ projectIDRange:
   count: 1000000
 
 csiDriver:
+  # CSI-aware schedulingを有効にしたCluster Autoscalerではtrueを推奨します。KarpenterなどではCSI-aware schedulingへの対応を確認してから有効化してください。
   preventPodSchedulingIfMissing: false
 
 admissionPolicy:
   enabled: true
 
 rbac:
-  createPodEvictions: true
+  createPodEvictions: false
   deletePodsAtCriticalPressure: false
 
 serviceAccount:

@@ -23,6 +23,23 @@ func (s *Server) validateTarget(target string) error {
 	return nil
 }
 
+func (s *Server) validatePublishTarget(target, podUID string) error {
+	if err := s.validateTarget(target); err != nil {
+		return err
+	}
+	if podUID == "" {
+		return errors.New("pod UID is required")
+	}
+	targetPodUID, _, ok := inlineVolumeTargetParts(s.options.KubeletRoot, target)
+	if !ok {
+		return errors.New("target path must identify an inline CSI volume mount")
+	}
+	if targetPodUID != podUID {
+		return errors.New("target path pod UID does not match pod information")
+	}
+	return nil
+}
+
 func isSingleNodeAccessMode(mode *csi.VolumeCapability_AccessMode) bool {
 	if mode == nil {
 		return false
@@ -80,19 +97,24 @@ func fallbackPath(root, volumeID string) string {
 }
 
 func matchesInlineVolumeIDTarget(volumeID, kubeletRoot, target string) bool {
+	podUID, volumeName, ok := inlineVolumeTargetParts(kubeletRoot, target)
+	return ok && volumeID == inlineVolumeID(podUID, volumeName)
+}
+
+func inlineVolumeTargetParts(kubeletRoot, target string) (podUID, volumeName string, ok bool) {
 	if !filepath.IsAbs(kubeletRoot) || !filepath.IsAbs(target) || filepath.Clean(target) != target {
-		return false
+		return "", "", false
 	}
 	podsRoot := filepath.Join(filepath.Clean(kubeletRoot), "pods")
 	relative, err := filepath.Rel(podsRoot, target)
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
-		return false
+		return "", "", false
 	}
 	parts := strings.Split(relative, string(filepath.Separator))
 	if len(parts) != 5 || parts[0] == "" || parts[1] != "volumes" || parts[2] != "kubernetes.io~csi" || parts[3] == "" || parts[4] != "mount" {
-		return false
+		return "", "", false
 	}
-	return volumeID == inlineVolumeID(parts[0], parts[3])
+	return parts[0], parts[3], true
 }
 
 // inlineVolumeIDはKubeletがPod UIDとvolume nameから作るinline CSI volume IDを再現する。

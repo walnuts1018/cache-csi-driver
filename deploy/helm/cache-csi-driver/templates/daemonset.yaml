@@ -15,12 +15,13 @@ spec:
     metadata:
       labels:
         {{- include "cache-csi-driver.selectorLabels" . | nindent 8 }}
-      {{- with .Values.podAnnotations }}
+      {{- $podAnnotations := dict "prometheus.io/scrape" "true" "prometheus.io/path" "/metrics" "prometheus.io/port" (toString .Values.metrics.port) }}
+      {{- $podAnnotations = mergeOverwrite $podAnnotations (.Values.podAnnotations | default dict) }}
       annotations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- toYaml $podAnnotations | nindent 8 }}
     spec:
       serviceAccountName: {{ include "cache-csi-driver.serviceAccountName" . }}
+      automountServiceAccountToken: false
       priorityClassName: {{ .Values.priorityClassName | quote }}
       terminationGracePeriodSeconds: 30
       {{- with .Values.imagePullSecrets }}
@@ -35,6 +36,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --endpoint=unix:///csi/csi.sock
+            - --metrics-address=:{{ .Values.metrics.port }}
             - --cache-root={{ .Values.cacheRootDir }}
             - --fallback-root={{ .Values.fallbackRootDir }}
             - --fallback-max-bytes={{ .Values.fallbackMaxBytes }}
@@ -66,13 +68,13 @@ spec:
           resources:
             {{- toYaml .Values.driver.resources | nindent 12 }}
           ports:
-            - name: liveness
-              containerPort: 9808
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
               protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
-              port: liveness
+              port: 9808
             initialDelaySeconds: {{ .Values.driver.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.driver.livenessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.driver.livenessProbe.timeoutSeconds }}
@@ -80,7 +82,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /healthz
-              port: liveness
+              port: 9808
             periodSeconds: 10
             timeoutSeconds: 5
           volumeMounts:
@@ -96,6 +98,9 @@ spec:
               mountPropagation: Bidirectional
             - name: tmp
               mountPath: /tmp
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
         - name: csi-node-driver-registrar
           image: "{{ .Values.registrar.image.repository }}:{{ .Values.registrar.image.tag }}"
           imagePullPolicy: {{ .Values.registrar.image.pullPolicy }}
@@ -162,6 +167,23 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Mi
+        - name: kube-api-access
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

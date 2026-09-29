@@ -84,6 +84,60 @@ func TestNodePublishRejectsUnsupportedFilesystemAndMountFlags(t *testing.T) {
 	}
 }
 
+func TestNodePublishValidatesTargetPodIdentityAndShape(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	validTarget := filepath.Join(server.options.KubeletRoot, "pods", testPodUID, "volumes", "kubernetes.io~csi", "volume-name", "mount")
+	cases := []struct {
+		name       string
+		target     string
+		podUID     string
+		wantReject bool
+	}{
+		{
+			name:   "valid target without requiring kubelet volume ID reconstruction",
+			target: validTarget,
+			podUID: testPodUID,
+		},
+		{
+			name:       "target belongs to another pod",
+			target:     filepath.Join(server.options.KubeletRoot, "pods", "other-pod", "volumes", "kubernetes.io~csi", "volume-name", "mount"),
+			podUID:     testPodUID,
+			wantReject: true,
+		},
+		{
+			name:       "target is not an inline CSI volume mount",
+			target:     filepath.Join(server.options.KubeletRoot, "pods", testPodUID, "volumes", "other-driver", "volume-name", "mount"),
+			podUID:     testPodUID,
+			wantReject: true,
+		},
+		{
+			name:       "target has a noncanonical path",
+			target:     validTarget + "/../mount",
+			podUID:     testPodUID,
+			wantReject: true,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			request := newPublishRequest(t, server.options.KubeletRoot, "volume-id")
+			request.TargetPath = test.target
+			request.VolumeContext["csi.storage.k8s.io/pod.uid"] = test.podUID
+
+			_, err := server.validatePublishRequest(request)
+			if test.wantReject {
+				if status.Code(err) != codes.InvalidArgument {
+					t.Fatalf("publish validation error = %v, want InvalidArgument", err)
+				}
+			} else if err != nil {
+				t.Fatalf("publish validation: %v", err)
+			}
+		})
+	}
+}
+
 func TestNodePublishIsIdempotentForAnExistingMatchingMount(t *testing.T) {
 	t.Parallel()
 
