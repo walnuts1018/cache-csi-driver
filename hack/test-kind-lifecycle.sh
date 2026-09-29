@@ -2,7 +2,8 @@
 set -euo pipefail
 
 cluster_name="cache-csi-lifecycle-$$"
-image="cache-csi-driver:e2e"
+image_tag="e2e-$$"
+image="cache-csi-driver:$image_tag"
 app_image="busybox:1.37.0"
 tmp_dir="$(mktemp -d)"
 selector='app.kubernetes.io/name=cache-csi-driver,app.kubernetes.io/instance=cache-csi-driver'
@@ -36,7 +37,7 @@ helm upgrade --install cache-csi-driver deploy/helm/cache-csi-driver \
   --kube-context "$context" \
   --namespace kube-system \
   --set image.repository=cache-csi-driver \
-  --set image.tag=e2e \
+  --set image.tag="$image_tag" \
   --set image.pullPolicy=IfNotPresent \
   --wait \
   --timeout 5m
@@ -129,7 +130,7 @@ helm upgrade --install cache-csi-driver deploy/helm/cache-csi-driver \
   --kube-context "$context" \
   --namespace kube-system \
   --set image.repository=cache-csi-driver \
-  --set image.tag=e2e \
+  --set image.tag="$image_tag" \
   --set image.pullPolicy=IfNotPresent \
   --wait \
   --timeout 5m
