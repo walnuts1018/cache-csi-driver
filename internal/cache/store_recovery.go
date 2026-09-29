@@ -39,6 +39,7 @@ func (s *Store) rebuildIndexes() error {
 			continue
 		}
 		if err := validateMetadata(entry.Name(), meta); err != nil {
+			s.indexDegradedLeaseIDs(entry.Name(), meta)
 			s.markDegraded(entry.Name(), err)
 			continue
 		}
@@ -53,9 +54,16 @@ func (s *Store) rebuildIndexes() error {
 		if !entry.IsDir() {
 			continue
 		}
-		meta, err := s.readMetadata(filepath.Join(s.root, trashDirectoryName, entry.Name()))
+		trashPath := filepath.Join(s.root, trashDirectoryName, entry.Name())
+		meta, err := s.readMetadata(trashPath)
+		if err == nil {
+			err = validateMetadata(meta.Identity, meta)
+		}
 		if err != nil {
 			s.markDegraded(filepath.Join(trashDirectoryName, entry.Name()), err)
+			if validIdentity(meta.Identity) {
+				s.addUnknownProjectReservation(meta.Identity, entry.Name())
+			}
 			continue
 		}
 		s.trashMetadata[entry.Name()] = meta
@@ -318,6 +326,7 @@ func (s *Store) recoverMissingMetadataObject(path, identity string, verifyMount 
 
 func (s *Store) recoverValidObjectLeases(path, identity string, meta Metadata, verifyMount func(string, Lease, Policy) (bool, error)) error {
 	wasDirty := meta.Dirty
+	hadPreparingLease := slices.ContainsFunc(meta.Leases, func(lease Lease) bool { return lease.Preparing })
 	active, uncertain := s.verifyRecoveredLeases(path, identity, meta, verifyMount)
 	if uncertain {
 		return nil
@@ -338,7 +347,14 @@ func (s *Store) recoverValidObjectLeases(path, identity string, meta Metadata, v
 	}
 	allLeasesActive := len(active) == len(meta.Leases)
 	if allLeasesActive && (len(active) > 0 || !wasDirty || meta.Policy.CrashRecoveryReuse) {
-		s.indexObjectMetadata(meta)
+		meta.Leases = active
+		if hadPreparingLease {
+			if err := s.writeMetadata(path, meta); err != nil {
+				s.markDegraded(identity, err)
+			}
+		} else {
+			s.indexObjectMetadata(meta)
+		}
 		return nil
 	}
 	if len(active) == 0 && wasDirty && !meta.Policy.CrashRecoveryReuse {
@@ -380,6 +396,7 @@ func (s *Store) verifyRecoveredLeases(path, identity string, meta Metadata, veri
 			return nil, true
 		}
 		if mounted {
+			lease.Preparing = false
 			active = append(active, lease)
 		}
 	}

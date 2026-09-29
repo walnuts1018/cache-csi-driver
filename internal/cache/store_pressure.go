@@ -43,21 +43,21 @@ func (s *Store) Collect(now time.Time) error {
 	var candidates []candidate
 	for _, identity := range identities {
 		indexed := s.metadataByIdentity[identity]
-		if len(indexed.Leases) != 0 || indexed.Policy.Retention < 0 || now.Sub(indexed.LastUsed) < indexed.Policy.Retention {
+		if len(indexed.Leases) != 0 || indexed.Policy.Retention <= 0 || now.Sub(indexed.LastUsed) < indexed.Policy.Retention {
 			continue
 		}
 		meta, err := s.readObjectMetadata(identity)
 		if err != nil {
 			continue
 		}
-		if len(meta.Leases) == 0 && meta.Policy.Retention >= 0 && now.Sub(meta.LastUsed) >= meta.Policy.Retention {
+		if len(meta.Leases) == 0 && meta.Policy.Retention > 0 && now.Sub(meta.LastUsed) >= meta.Policy.Retention {
 			candidates = append(candidates, candidate{identity: identity, path: filepath.Join(s.root, identity), meta: meta})
 		}
 	}
 	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
 	for _, item := range candidates[:min(len(candidates), trashBatchSize)] {
 		meta, err := s.readObjectMetadata(item.identity)
-		if err != nil || len(meta.Leases) != 0 || meta.Policy.Retention < 0 || now.Sub(meta.LastUsed) < meta.Policy.Retention {
+		if err != nil || len(meta.Leases) != 0 || meta.Policy.Retention <= 0 || now.Sub(meta.LastUsed) < meta.Policy.Retention {
 			continue
 		}
 		if err := s.detachToTrash(item.path); err != nil {
@@ -196,6 +196,9 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 	}
 	var candidates []candidate
 	underPressure := s.updatePressure(fs)
+	if !underPressure {
+		return nil, nil
+	}
 	identities := make([]string, 0, len(s.metadataByIdentity))
 	for identity := range s.metadataByIdentity {
 		identities = append(identities, identity)
@@ -210,13 +213,16 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 				return nil, nil
 			}
 		}
-		if meta.Policy.EvictRunning && s.activeLeaseCount(meta) > 0 {
+		if meta.Policy.EvictRunning && s.activeLeaseCount(meta) > 0 && !s.hasPreparingGenerationLease(meta, meta.Generation) {
 			candidates = append(candidates, candidate{identity: identity, meta: meta, path: filepath.Join(s.root, identity)})
 		}
 	}
 	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
 	if underPressure {
 		for _, candidate := range candidates {
+			if s.hasPreparingGenerationLease(candidate.meta, candidate.meta.Generation) {
+				continue
+			}
 			leases := make([]Lease, 0, len(candidate.meta.Leases))
 			for index := range candidate.meta.Leases {
 				if candidate.meta.Leases[index].Generation == "" || candidate.meta.Leases[index].Generation == candidate.meta.Generation {
@@ -259,9 +265,12 @@ func (s *Store) PressureVictims() ([]Lease, error) {
 				if !retired.Policy.EvictRunning {
 					continue
 				}
+				if s.hasPreparingGenerationLease(meta, retired.Generation) {
+					continue
+				}
 				leases := make([]Lease, 0)
 				for _, lease := range meta.Leases {
-					if lease.Generation == retired.Generation {
+					if lease.Generation == retired.Generation && !lease.Preparing {
 						leases = append(leases, lease)
 					}
 				}

@@ -11,6 +11,8 @@ import (
 	"uuid"
 )
 
+var ErrLeaseGenerationRetired = errors.New("cache lease belongs to a retired generation")
+
 type AcquireOptions struct {
 	Identity string
 	Lease    Lease
@@ -40,6 +42,7 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 	if err := validateAcquireOptions(options); err != nil {
 		return "", false, err
 	}
+	options.Lease.Preparing = true
 	if err := s.degraded[options.Identity]; err != nil {
 		return "", false, err
 	}
@@ -122,6 +125,15 @@ func (s *Store) existingLeasePath(options AcquireOptions) (string, bool, error) 
 	if err != nil {
 		return "", true, err
 	}
+	if generation != existing.Generation {
+		return "", true, ErrLeaseGenerationRetired
+	}
+	if !existing.Leases[leaseIndex].Preparing {
+		existing.Leases[leaseIndex].Preparing = true
+		if err := s.writeMetadata(filepath.Join(s.root, options.Identity), existing); err != nil {
+			return "", true, fmt.Errorf("mark cache lease as preparing: %w", err)
+		}
+	}
 	return filepath.Join(s.root, options.Identity, "generations", generation), true, nil
 }
 
@@ -184,6 +196,12 @@ func (s *Store) activeLeaseCount(meta Metadata) int {
 	return count
 }
 
+func (s *Store) hasPreparingGenerationLease(meta Metadata, generation string) bool {
+	return slices.ContainsFunc(meta.Leases, func(lease Lease) bool {
+		return lease.Preparing && (lease.Generation == generation || lease.Generation == "" && generation == meta.Generation)
+	})
+}
+
 func (s *Store) createLease(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
 	generationPath := filepath.Join(entry, "generations", meta.Generation)
 	if err := s.ensureDirectory(generationPath); err != nil {
@@ -200,12 +218,57 @@ func (s *Store) createLease(entry string, options AcquireOptions, meta Metadata)
 	}
 	meta.LastUsed = time.Now().UTC()
 	options.Lease.Generation = meta.Generation
+	options.Lease.Preparing = true
 	meta.Leases = append(meta.Leases, options.Lease)
 	meta.Dirty = true
 	if err := s.writeMetadata(entry, meta); err != nil {
 		return "", false, fmt.Errorf("persist cache lease: %w", err)
 	}
 	return generationPath, true, nil
+}
+
+// BeginPublish はleaseをPreparing状態にし、pressure reclaimからgenerationを保護します。
+func (s *Store) BeginPublish(leaseID, target string) error {
+	return s.setLeasePreparing(leaseID, target, true)
+}
+
+// CommitPublish はmount成功後にleaseをPublished状態へ変更します。
+func (s *Store) CommitPublish(leaseID, target string) error {
+	return s.setLeasePreparing(leaseID, target, false)
+}
+
+func (s *Store) setLeasePreparing(leaseID, target string, preparing bool) error {
+	if leaseID == "" || !filepath.IsAbs(target) {
+		return errors.New("valid cache lease ID and absolute target path are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	identity, meta, found, err := s.findLease(leaseID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errors.New("cache lease does not exist")
+	}
+	index := slices.IndexFunc(meta.Leases, func(lease Lease) bool { return lease.ID == leaseID })
+	if index < 0 || meta.Leases[index].Target != target {
+		return errors.New("cache lease target does not match")
+	}
+	generation, _, err := leaseGenerationAndPolicy(meta, meta.Leases[index])
+	if err != nil {
+		return err
+	}
+	if generation != meta.Generation {
+		return ErrLeaseGenerationRetired
+	}
+	if meta.Leases[index].Preparing == preparing {
+		return nil
+	}
+	meta.Leases[index].Preparing = preparing
+	if !preparing {
+		meta.LastUsed = time.Now().UTC()
+	}
+	return s.writeMetadata(filepath.Join(s.root, identity), meta)
 }
 
 func (s *Store) LeaseDetails(leaseID string) (string, Lease, string, Policy, bool, error) {

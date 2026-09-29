@@ -1,10 +1,12 @@
 package cache
 
 import (
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -42,6 +44,9 @@ func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if meta.FormatVersion != storeFormatVersion {
+		t.Fatalf("metadata format version = %d, want %d", meta.FormatVersion, storeFormatVersion)
 	}
 	if meta.Policy.Retention != policy.Retention {
 		t.Fatalf("persisted retention = %s, want %s", meta.Policy.Retention, policy.Retention)
@@ -184,7 +189,61 @@ func TestFallbackRecoveryDiscardsUnmountedOrphan(t *testing.T) {
 	}
 }
 
-func TestCollectsCacheWithZeroRetentionOnNextScan(t *testing.T) {
+func TestRecoveryCommitsPreparingLeaseWhenMountIsVerified(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := NewStore(root, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := stableIdentity("recovered-preparing-lease")
+	target := filepath.Join(t.TempDir(), "mount")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "recover-preparing", Target: target},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewStore(root, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := recovered.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	verified := false
+	if err := recovered.RecoverLeases(func(_ string, lease Lease, _ Policy) (bool, error) {
+		if lease.ID != "recover-preparing" || !lease.Preparing {
+			t.Errorf("recovery verifier lease = %+v, want preparing lease", lease)
+		}
+		verified = true
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !verified {
+		t.Fatal("recovery mount verifier was not called")
+	}
+	_, lease, _, _, found, err := recovered.LeaseDetails("recover-preparing")
+	if err != nil || !found || lease.Preparing {
+		t.Fatalf("recovered lease = (%+v, %t, %v), want published lease", lease, found, err)
+	}
+	meta, err := recovered.readMetadata(filepath.Join(root, identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.FormatVersion != storeFormatVersion || len(meta.Leases) != 1 || meta.Leases[0].Preparing {
+		t.Fatalf("persisted recovered metadata = %+v, want format 1 and published lease", meta)
+	}
+}
+
+func TestZeroRetentionDisablesTTLCollectionButKeepsPressureEligibility(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
 	if err != nil {
@@ -210,8 +269,176 @@ func TestCollectsCacheWithZeroRetentionOnNextScan(t *testing.T) {
 	if err := store.Collect(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("zero-retention cache remains after the next scan: %v", err)
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); err != nil {
+		t.Fatalf("zero-retention cache was removed by TTL collection: %v", err)
+	}
+	store.mu.Lock()
+	candidates := store.unusedPressureCandidates(nil)
+	store.mu.Unlock()
+	if !slices.ContainsFunc(candidates, func(candidate pressureCandidate) bool { return candidate.identity == identity }) {
+		t.Fatal("zero-retention cache was excluded from pressure reclaim")
+	}
+}
+
+func TestPressureVictimsSkipsMetadataScanWhenPressureIsOff(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(t.TempDir(), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	identity := stableIdentity("pressure-off-metadata-scan")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "pressure-off", Target: filepath.Join(t.TempDir(), "target")},
+		Policy:   Policy{EvictRunning: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadataPath := filepath.Join(store.Root(), identity, metadataName)
+	if err := os.WriteFile(metadataPath, []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if victims, err := store.PressureVictims(); err != nil || len(victims) != 0 {
+		t.Fatalf("pressure-off victims = %+v, error = %v", victims, err)
+	}
+	if _, degraded := store.degraded[identity]; degraded {
+		t.Fatal("pressure-off victim lookup read and degraded cache metadata")
+	}
+}
+
+func TestPressureDoesNotRetirePreparingLeaseBeforePublishCommit(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "pressure-used-block"), make([]byte, 8192), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(root, StoreOptions{
+		Pressure: PressureConfig{
+			HighFreePercent:      100,
+			LowFreePercent:       99,
+			HighInodeFreePercent: 100,
+			LowInodeFreePercent:  99,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	store.pressureActive = true
+	identity := stableIdentity("preparing-pressure-lease")
+	publishedTarget := filepath.Join(t.TempDir(), "published-mount")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "published", Target: publishedTarget},
+		Policy:   Policy{EvictRunning: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPublish("published", publishedTarget); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "mount")
+	options := AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "preparing", Target: target},
+		Policy:   Policy{EvictRunning: true},
+	}
+	var source string
+	for attempt := range 2 {
+		barrier := startAcquireBarrier(store, options)
+		t.Cleanup(barrier.release)
+		result := <-barrier.result
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if attempt == 0 && !result.created {
+			t.Fatal("initial publish did not create a new lease")
+		}
+		if attempt == 1 && (result.created || result.source != source) {
+			t.Fatalf("same-volume retry = (%q, %t), want existing source %q", result.source, result.created, source)
+		}
+		if attempt == 0 {
+			source = result.source
+		}
+		assertPreparingGenerationProtected(t, store, identity, result.source, options.Lease.ID, target)
+		barrier.release()
+		if err := store.CommitPublish(options.Lease.ID, target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	victims, err := store.PressureVictims()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(victims) != 2 {
+		t.Fatalf("pressure victims after all leases are published = %+v, want both shared-generation leases", victims)
+	}
+}
+
+type acquireBarrierResult struct {
+	source  string
+	created bool
+	err     error
+}
+
+type acquireBarrier struct {
+	result chan acquireBarrierResult
+	resume chan struct{}
+	done   chan struct{}
+	once   sync.Once
+}
+
+func startAcquireBarrier(store *Store, options AcquireOptions) *acquireBarrier {
+	barrier := &acquireBarrier{
+		result: make(chan acquireBarrierResult, 1),
+		resume: make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	go func() {
+		defer close(barrier.done)
+		source, created, err := store.Acquire(options)
+		barrier.result <- acquireBarrierResult{source: source, created: created, err: err}
+		<-barrier.resume
+	}()
+	return barrier
+}
+
+func (barrier *acquireBarrier) release() {
+	barrier.once.Do(func() { close(barrier.resume) })
+	<-barrier.done
+}
+
+func assertPreparingGenerationProtected(t *testing.T, store *Store, identity, source, leaseID, target string) {
+	t.Helper()
+	victims, err := store.PressureVictims()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(victims) != 0 {
+		t.Fatalf("preparing lease pressure victims = %+v, want none", victims)
+	}
+	if !store.pressureActive {
+		t.Fatal("barrier test did not keep pressure active")
+	}
+	_, lease, currentSource, _, found, err := store.LeaseDetails(leaseID)
+	if err != nil || !found || !lease.Preparing || currentSource != source || lease.Target != target {
+		t.Fatalf("preparing lease details = (%+v, %q, %t, %v), want preparing source %q", lease, currentSource, found, err, source)
+	}
+	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Generation != filepath.Base(source) || len(meta.Retired) != 0 {
+		t.Fatalf("preparing generation state = (%q, %d retired), want unchanged generation %q", meta.Generation, len(meta.Retired), filepath.Base(source))
 	}
 }
 
@@ -387,6 +614,17 @@ func TestProjectIDAllocationStaysInsideConfiguredRange(t *testing.T) {
 	}
 	if projectID != 32000 {
 		t.Fatalf("project ID = %d, want 32000", projectID)
+	}
+	registry, err := os.ReadFile(filepath.Join(store.Root(), projectRegistryName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var registryDocument projectReservationDocument
+	if err := json.Unmarshal(registry, &registryDocument); err != nil {
+		t.Fatal(err)
+	}
+	if registryDocument.FormatVersion != storeFormatVersion {
+		t.Fatalf("project registry format version = %d, want %d", registryDocument.FormatVersion, storeFormatVersion)
 	}
 	if _, _, _, err := store.QuotaState(identities[1], 1024); err == nil {
 		t.Fatal("allocation exceeded the configured project ID range")
@@ -778,6 +1016,7 @@ func TestDamagedProjectRegistryDisablesOnlyQuotaAllocation(t *testing.T) {
 	}{
 		{name: "malformed JSON", data: []byte("{broken")},
 		{name: "invalid reservation", data: []byte(`{"unknownReservations":[{"identity":""}]}`)},
+		{name: "unknown format version", data: []byte(`{"formatVersion":2,"reservations":[]}`)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -836,6 +1075,170 @@ func TestDamagedProjectRegistryDisablesOnlyQuotaAllocation(t *testing.T) {
 	}
 }
 
+func TestUnknownMetadataFormatVersionIsIsolatedAndQuarantined(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := NewStore(root, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identities := []string{stableIdentity("format-good"), stableIdentity("format-unknown")}
+	leaseIDs := []string{"format-good", "format-unknown"}
+	for index, identity := range identities {
+		if _, _, err := store.Acquire(AcquireOptions{
+			Identity: identity,
+			Lease:    Lease{ID: leaseIDs[index], Target: filepath.Join(t.TempDir(), leaseIDs[index])},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unknownVersion := storeFormatVersion + 1
+	unknownMetadataPath := filepath.Join(root, identities[1], metadataName)
+	setDocumentFormatVersion(t, unknownMetadataPath, &unknownVersion)
+
+	recovered, err := NewStore(root, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := recovered.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, _, _, _, _, err := recovered.LeaseDetails(leaseIDs[1]); !errors.Is(err, ErrDegradedMetadata) {
+		t.Fatalf("unknown metadata version lookup error = %v, want degraded metadata", err)
+	}
+	if err := recovered.RecoverLeases(func(_ string, lease Lease, _ Policy) (bool, error) {
+		return lease.ID == leaseIDs[0], nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, found, err := recovered.LeaseDetails(leaseIDs[0]); err != nil || !found {
+		t.Fatalf("healthy object after unknown-version quarantine = found %t, error %v", found, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, identities[1])); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unknown-version object was not quarantined: %v", err)
+	}
+}
+
+func TestLegacyStoreDocumentVersionsAreAcceptedAndUpgradedOnWrite(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name            string
+		metadataVersion *int
+		registryVersion *int
+	}{
+		{name: "missing versions"},
+		{name: "zero versions", metadataVersion: new(0), registryVersion: new(0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			legacyStoreDocuments(t, test.metadataVersion, test.registryVersion)
+		})
+	}
+}
+
+func legacyStoreDocuments(t *testing.T, metadataVersion, registryVersion *int) {
+	t.Helper()
+	root := t.TempDir()
+	store, err := NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := stableIdentity("legacy-format")
+	target := filepath.Join(t.TempDir(), "legacy-target")
+	policy := Policy{QuotaEnabled: true, MaxBytes: 1024}
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "legacy-format", Target: target},
+		Policy:   policy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.QuotaState(identity, policy.MaxBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	setDocumentFormatVersion(t, filepath.Join(root, identity, metadataName), metadataVersion)
+	setDocumentFormatVersion(t, filepath.Join(root, projectRegistryName), registryVersion)
+
+	reopened, err := NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 10})
+	if err != nil {
+		t.Fatalf("open legacy store documents: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, _, _, _, found, err := reopened.LeaseDetails("legacy-format"); err != nil || !found {
+		t.Fatalf("legacy metadata lease = found %t, error %v", found, err)
+	}
+	if err := reopened.CommitPublish("legacy-format", target); err != nil {
+		t.Fatalf("upgrade legacy metadata on write: %v", err)
+	}
+	otherIdentity := stableIdentity("legacy-format-other")
+	if _, _, err := reopened.Acquire(AcquireOptions{
+		Identity: otherIdentity,
+		Lease:    Lease{ID: "legacy-format-other", Target: filepath.Join(t.TempDir(), "other")},
+		Policy:   policy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := reopened.QuotaState(otherIdentity, policy.MaxBytes); err != nil {
+		t.Fatalf("upgrade legacy project registry on write: %v", err)
+	}
+	assertDocumentFormatVersion(t, filepath.Join(root, identity, metadataName), storeFormatVersion)
+	assertDocumentFormatVersion(t, filepath.Join(root, projectRegistryName), storeFormatVersion)
+}
+
+func setDocumentFormatVersion(t *testing.T, path string, version *int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if version == nil {
+		delete(document, "formatVersion")
+	} else {
+		document["formatVersion"] = *version
+	}
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertDocumentFormatVersion(t *testing.T, path string, want int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		FormatVersion int `json:"formatVersion"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.FormatVersion != want {
+		t.Fatalf("%s format version = %d, want %d", path, document.FormatVersion, want)
+	}
+}
+
 func TestAcquireDoesNotDiscardGenerationsWhenMetadataIsMissing(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
@@ -878,13 +1281,16 @@ func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
 	if len(victims) != 1 || victims[0].ID != firstLeaseID {
 		t.Fatalf("pressure victims = %+v, want the active exclusive lease", victims)
 	}
-	retryPath, created, err := store.Acquire(AcquireOptions{
+	_, _, err = store.Acquire(AcquireOptions{
 		Identity: identity,
 		Lease:    Lease{ID: firstLeaseID, Target: target},
 		Policy:   policy,
 	})
-	if err != nil || created || retryPath != oldPath {
-		t.Fatalf("same lease retry = (%q, %v, %v), want original retired generation", retryPath, created, err)
+	if !errors.Is(err, ErrLeaseGenerationRetired) {
+		t.Fatalf("same lease retry = %v, want ErrLeaseGenerationRetired", err)
+	}
+	if _, _, source, _, found, err := store.LeaseDetails(firstLeaseID); err != nil || !found || source != oldPath {
+		t.Fatalf("retired lease details = source %q, found %v, error %v; want %q", source, found, err, oldPath)
 	}
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
@@ -1079,6 +1485,16 @@ func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
 	if len(victims) != 1 || victims[0].ID != firstLeaseID {
 		t.Fatalf("pressure victims = %+v, want the active lease", victims)
 	}
+	if err := store.BeginPublish(firstLeaseID, target); !errors.Is(err, ErrLeaseGenerationRetired) {
+		t.Fatalf("begin publish for retired lease = %v, want ErrLeaseGenerationRetired", err)
+	}
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: firstLeaseID, Target: target},
+		Policy:   policy,
+	}); !errors.Is(err, ErrLeaseGenerationRetired) {
+		t.Fatalf("retry acquire for retired lease = %v, want ErrLeaseGenerationRetired", err)
+	}
 	_, _, retiredPath, _, found, err := store.LeaseDetails(firstLeaseID)
 	if err != nil || !found || retiredPath != oldPath {
 		t.Fatalf("retired lease resolves to %q, found %v, error %v; want %q", retiredPath, found, err, oldPath)
@@ -1185,6 +1601,9 @@ func pressureLease(t *testing.T, name string, policy Policy, projectIDCount uint
 	target := filepath.Join(t.TempDir(), firstLeaseID)
 	oldPath, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: Lease{ID: firstLeaseID, Target: target}, Policy: policy})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPublish(firstLeaseID, target); err != nil {
 		t.Fatal(err)
 	}
 	store.pressureActive = true

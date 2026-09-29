@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 	"uuid"
 )
 
 const metadataName = ".cache-csi.json"
+const storeFormatVersion = 1
 
 const SharingPolicyShared = "Shared"
 
@@ -28,6 +30,7 @@ type Lease struct {
 	PodUID     string `json:"podUID"`
 	ReadOnly   bool   `json:"readOnly,omitempty"`
 	NoExec     bool   `json:"noExec,omitempty"`
+	Preparing  bool   `json:"preparing,omitzero"`
 }
 
 type RetiredGeneration struct {
@@ -74,6 +77,7 @@ func (policy *Policy) UnmarshalJSON(data []byte) error {
 }
 
 type Metadata struct {
+	FormatVersion   int                 `json:"formatVersion"`
 	Identity        string              `json:"identity"`
 	Generation      string              `json:"generation"`
 	CreatedAt       time.Time           `json:"createdAt"`
@@ -88,9 +92,17 @@ type Metadata struct {
 }
 
 func (s *Store) indexObjectMetadata(meta Metadata) {
+	_, recoveringDegraded := s.degraded[meta.Identity]
 	if previous, exists := s.metadataByIdentity[meta.Identity]; exists {
 		for _, lease := range previous.Leases {
 			delete(s.leaseIndex, lease.ID)
+		}
+	} else if recoveringDegraded {
+		for leaseID, identity := range s.leaseIndex {
+			if identity != meta.Identity || slices.ContainsFunc(meta.Leases, func(lease Lease) bool { return lease.ID == leaseID }) {
+				continue
+			}
+			delete(s.leaseIndex, leaseID)
 		}
 	}
 	s.metadataByIdentity[meta.Identity] = meta
@@ -124,16 +136,26 @@ func (s *Store) indexObjectMetadata(meta Metadata) {
 }
 
 func (s *Store) markDegraded(identity string, cause error) {
-	if meta, exists := s.metadataByIdentity[identity]; exists {
-		for _, lease := range meta.Leases {
-			delete(s.leaseIndex, lease.ID)
-		}
-	}
 	delete(s.metadataByIdentity, identity)
 	s.degraded[identity] = fmt.Errorf("%w: %v", ErrDegradedMetadata, cause)
 }
 
+func (s *Store) indexDegradedLeaseIDs(identity string, meta Metadata) {
+	if meta.Identity != identity {
+		return
+	}
+	for _, lease := range meta.Leases {
+		if lease.ID == "" || len(lease.ID) > 1024 || strings.ContainsRune(lease.ID, '\x00') {
+			continue
+		}
+		s.leaseIndex[lease.ID] = identity
+	}
+}
+
 func validateMetadata(identity string, meta Metadata) error {
+	if meta.FormatVersion != 0 && meta.FormatVersion != storeFormatVersion {
+		return fmt.Errorf("unsupported cache metadata format version %d", meta.FormatVersion)
+	}
 	if meta.Identity != identity || meta.Generation == "" {
 		return errors.New("cache metadata identity or generation is inconsistent")
 	}
@@ -189,6 +211,7 @@ func (s *Store) readMetadata(entry string) (Metadata, error) {
 }
 
 func (s *Store) writeMetadata(entry string, meta Metadata) error {
+	meta.FormatVersion = storeFormatVersion
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return err

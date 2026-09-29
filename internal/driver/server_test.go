@@ -48,6 +48,40 @@ func TestNodeGetCapabilitiesAdvertisesImplementedRPCs(t *testing.T) {
 	}
 }
 
+func TestNodePublishRejectsUnsupportedFilesystemAndMountFlags(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		configure func(*csi.VolumeCapability_MountVolume)
+	}{
+		{
+			name: "filesystem type",
+			configure: func(mount *csi.VolumeCapability_MountVolume) {
+				mount.FsType = "xfs"
+			},
+		},
+		{
+			name: "mount flags",
+			configure: func(mount *csi.VolumeCapability_MountVolume) {
+				mount.MountFlags = []string{"noexec"}
+			},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+			request := newPublishRequest(t, server.options.KubeletRoot, test.name)
+			test.configure(request.GetVolumeCapability().GetMount())
+
+			if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("publish with unsupported %s error = %v, want InvalidArgument", test.name, err)
+			}
+		})
+	}
+}
+
 func TestNodePublishIsIdempotentForAnExistingMatchingMount(t *testing.T) {
 	t.Parallel()
 
@@ -88,6 +122,37 @@ func TestNodePublishPassesReadonlyAndNoExecMountOptions(t *testing.T) {
 	state, mounted := mounts.mounts[request.GetTargetPath()]
 	if !mounted || !state.readOnly || !state.noExec {
 		t.Fatalf("published mount = %+v, present=%t; want readonly and noexec", state, mounted)
+	}
+}
+
+func TestNodePublishRetryUsesPersistedQuotaPolicy(t *testing.T) {
+	t.Parallel()
+
+	spec := cachev1alpha1.CacheClassSpec{
+		Backend: cachev1alpha1.BackendXFSProject,
+		Quota: cachev1alpha1.QuotaPolicy{
+			Enabled:         true,
+			DefaultMaxBytes: resource.MustParse("1Mi"),
+		},
+	}
+	server, mounts, _ := newTestServer(t, spec, nil)
+	quota := &recordingQuota{}
+	server.quota = quota
+	request := newPublishRequest(t, server.options.KubeletRoot, "quota-policy-retry")
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := server.resolver.(*testResolver)
+	resolver.spec.Quota.DefaultMaxBytes = resource.MustParse("2Mi")
+	delete(mounts.mounts, request.GetTargetPath())
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatalf("retry after CacheClass quota change: %v", err)
+	}
+
+	wantLimit := resource.MustParse("1Mi")
+	if len(quota.limits) != 1 || quota.limits[0] != wantLimit.Value() {
+		t.Fatalf("configured quota limits = %v, want only the persisted 1Mi policy", quota.limits)
 	}
 }
 
@@ -374,6 +439,11 @@ func TestFallbackRejectsHardResolutionErrorsLimitsAndCancellation(t *testing.T) 
 			name:       "CacheClass forbidden",
 			resolver:   &testResolver{err: apierrors.NewForbidden(schema.GroupResource{Resource: "cacheclasses"}, testDefault, errors.New("denied"))},
 			wantStatus: codes.FailedPrecondition,
+		},
+		{
+			name:       "informer cache has not synced",
+			resolver:   &testResolver{err: kube.ErrResolverNotSynced},
+			wantStatus: codes.Unavailable,
 		},
 		{
 			name:       "maxBytes has no resolved quota policy",
@@ -708,6 +778,15 @@ type testQuota struct {
 
 func (quota *testQuota) Configure(context.Context, string, string, uint32, int64) error {
 	return quota.err
+}
+
+type recordingQuota struct {
+	limits []int64
+}
+
+func (quota *recordingQuota) Configure(_ context.Context, _, _ string, _ uint32, limit int64) error {
+	quota.limits = append(quota.limits, limit)
+	return nil
 }
 
 type testMount struct {
