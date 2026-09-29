@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	policyv1 "k8s.io/api/policy/v1"
@@ -15,6 +16,58 @@ import (
 
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 )
+
+const (
+	initialEvictionBackoff = 5 * time.Second
+	maximumEvictionBackoff = 5 * time.Minute
+	acceptedEvictionDelay  = 30 * time.Second
+)
+
+type evictionKey struct {
+	namespace string
+	podUID    string
+}
+
+type evictionState struct {
+	nextAttempt time.Time
+	attempts    int
+	gone        bool
+}
+
+func (s evictionState) shouldSkip(now time.Time) bool {
+	return s.gone || now.Before(s.nextAttempt)
+}
+
+func evictionRetryDelay(err error, attempts int) time.Duration {
+	if retryAfter, ok := apierrors.SuggestsClientDelay(err); ok && retryAfter > 0 {
+		return time.Duration(retryAfter) * time.Second
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+	delay := initialEvictionBackoff
+	for i := 1; i < attempts && delay < maximumEvictionBackoff; i++ {
+		if delay > maximumEvictionBackoff/2 {
+			return maximumEvictionBackoff
+		}
+		delay *= 2
+	}
+	return min(delay, maximumEvictionBackoff)
+}
+
+func nextEvictionState(now time.Time, previous evictionState, err error) evictionState {
+	if apierrors.IsNotFound(err) {
+		return evictionState{gone: true}
+	}
+	if err == nil {
+		return evictionState{nextAttempt: now.Add(acceptedEvictionDelay)}
+	}
+	attempts := previous.attempts + 1
+	return evictionState{
+		nextAttempt: now.Add(evictionRetryDelay(err, attempts)),
+		attempts:    attempts,
+	}
+}
 
 type MountInspector func(source string, lease cache.Lease, policy cache.Policy) (bool, error)
 
@@ -34,6 +87,8 @@ type Manager struct {
 	client           kubernetes.Interface
 	inspectMount     MountInspector
 	logger           *slog.Logger
+	evictionMu       sync.Mutex
+	evictions        map[evictionKey]evictionState
 }
 
 func New(store *cache.Store, options Options) *Manager {
@@ -57,6 +112,7 @@ func New(store *cache.Store, options Options) *Manager {
 		client:           options.Client,
 		inspectMount:     options.InspectMount,
 		logger:           options.Logger,
+		evictions:        make(map[evictionKey]evictionState),
 	}
 }
 
@@ -140,41 +196,94 @@ func (m *Manager) pressure(ctx context.Context) {
 		return
 	}
 	var victims []cache.Lease
+	victimsComplete := true
 	for _, store := range m.stores {
 		storeVictims, err := store.PressureVictims()
 		if err != nil {
 			m.logger.ErrorContext(ctx, "inspect cache pressure victims failed", "root", store.Root(), "error", err)
+			victimsComplete = false
 			continue
 		}
 		victims = append(victims, storeVictims...)
 	}
-	if len(victims) == 0 {
-		return
-	}
-	seen := make(map[string]struct{}, len(victims))
+	seen := make(map[evictionKey]struct{}, len(victims))
+	active := make(map[evictionKey]struct{}, len(victims))
+	uniqueVictims := make([]cache.Lease, 0, len(victims))
 	for _, lease := range victims {
 		if lease.Namespace == "" || lease.PodName == "" || lease.PodUID == "" {
 			m.logger.WarnContext(ctx, "skipping Pod eviction because lease Pod identity is incomplete", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID)
 			continue
 		}
-		key := lease.Namespace + "\x00" + lease.PodUID
+		key := evictionKey{namespace: lease.Namespace, podUID: lease.PodUID}
+		active[key] = struct{}{}
 		if _, ok := seen[key]; ok {
 			continue
 		}
 		seen[key] = struct{}{}
-		if err := m.evict(ctx, lease); err != nil {
-			if apierrors.IsNotFound(err) {
-				m.logger.DebugContext(ctx, "cache pressure victim Pod no longer exists", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID)
-				continue
-			}
-			if apierrors.IsTooManyRequests(err) {
-				m.logger.WarnContext(ctx, "Pod eviction was blocked, possibly by a PodDisruptionBudget", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "error", err)
-				continue
-			}
-			m.logger.WarnContext(ctx, "Pod eviction for cache pressure failed", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "error", err)
-			continue
+		uniqueVictims = append(uniqueVictims, lease)
+	}
+	m.pruneEvictions(active, victimsComplete)
+	for _, lease := range uniqueVictims {
+		m.evictWithBackoff(ctx, lease)
+	}
+}
+
+func (m *Manager) evictWithBackoff(ctx context.Context, lease cache.Lease) {
+	if ctx.Err() != nil {
+		return
+	}
+	key := evictionKey{namespace: lease.Namespace, podUID: lease.PodUID}
+	now := time.Now()
+	state, found := m.evictionState(key)
+	if found && state.shouldSkip(now) {
+		return
+	}
+
+	err := m.evict(ctx, lease)
+	if apierrors.IsNotFound(err) {
+		m.setEvictionState(key, nextEvictionState(now, state, err))
+		m.logger.DebugContext(ctx, "cache pressure victim Pod no longer exists", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID)
+		return
+	}
+	state = nextEvictionState(now, state, err)
+	m.setEvictionState(key, state)
+	if err != nil {
+		if apierrors.IsTooManyRequests(err) {
+			m.logger.WarnContext(ctx, "Pod eviction was blocked, possibly by a PodDisruptionBudget", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
+			return
 		}
-		m.logger.InfoContext(ctx, "requested Pod eviction for cache pressure", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID)
+		m.logger.WarnContext(ctx, "Pod eviction for cache pressure failed", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
+		return
+	}
+	m.logger.InfoContext(ctx, "requested Pod eviction for cache pressure", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", acceptedEvictionDelay)
+}
+
+func (m *Manager) evictionState(key evictionKey) (evictionState, bool) {
+	m.evictionMu.Lock()
+	defer m.evictionMu.Unlock()
+	state, ok := m.evictions[key]
+	return state, ok
+}
+
+func (m *Manager) setEvictionState(key evictionKey, state evictionState) {
+	m.evictionMu.Lock()
+	defer m.evictionMu.Unlock()
+	if m.evictions == nil {
+		m.evictions = make(map[evictionKey]evictionState)
+	}
+	m.evictions[key] = state
+}
+
+func (m *Manager) pruneEvictions(active map[evictionKey]struct{}, complete bool) {
+	if !complete {
+		return
+	}
+	m.evictionMu.Lock()
+	defer m.evictionMu.Unlock()
+	for key := range m.evictions {
+		if _, ok := active[key]; !ok {
+			delete(m.evictions, key)
+		}
 	}
 }
 

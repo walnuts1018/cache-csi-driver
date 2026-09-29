@@ -5,9 +5,61 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+func TestEvictionRetryDelay(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		err      error
+		attempts int
+		want     time.Duration
+	}{
+		{name: "server retry after", err: apierrors.NewTooManyRequests("rate limited", 17), attempts: 4, want: 17 * time.Second},
+		{name: "first failure", err: errors.New("temporary API failure"), attempts: 1, want: 5 * time.Second},
+		{name: "exponential delay", err: errors.New("temporary API failure"), attempts: 3, want: 20 * time.Second},
+		{name: "zero retry after uses backoff", err: apierrors.NewTooManyRequests("rate limited", 0), attempts: 2, want: 10 * time.Second},
+		{name: "maximum delay", err: errors.New("temporary API failure"), attempts: 20, want: 5 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := evictionRetryDelay(tt.err, tt.attempts); got != tt.want {
+				t.Fatalf("evictionRetryDelay() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAcceptedEvictionWaitsBeforeRetry(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.September, 29, 0, 0, 0, 0, time.UTC)
+	state := nextEvictionState(now, evictionState{attempts: 3}, nil)
+	if state.gone || state.attempts != 0 {
+		t.Fatalf("accepted eviction state = %+v, want pending cooldown with reset attempts", state)
+	}
+	if want := now.Add(acceptedEvictionDelay); !state.nextAttempt.Equal(want) {
+		t.Fatalf("accepted eviction retry time = %s, want %s", state.nextAttempt, want)
+	}
+	if !state.shouldSkip(now) || state.shouldSkip(state.nextAttempt) {
+		t.Fatalf("accepted eviction cooldown did not suppress retries until its deadline: %+v", state)
+	}
+}
+
+func TestNotFoundEvictionStateWaitsForVictimPruning(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.September, 29, 0, 0, 0, 0, time.UTC)
+	state := nextEvictionState(now, evictionState{}, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "gone"))
+	if !state.gone || !state.shouldSkip(now) {
+		t.Fatalf("not-found eviction state = %+v, want terminal state until victim pruning", state)
+	}
+}
 
 func TestPressureReclaimsRuntimeDegradedCacheWithoutKubernetesClient(t *testing.T) {
 	t.Parallel()
