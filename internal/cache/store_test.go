@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
@@ -1498,6 +1499,16 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	if meta.Policy != initialPolicy {
 		t.Fatalf("shared generation policy = %+v, want immutable snapshot %+v", meta.Policy, initialPolicy)
 	}
+	_, secondLease, _, secondPolicy, found, err := store.LeaseDetails("second-shared-lease")
+	if err != nil || !found {
+		t.Fatalf("second shared lease found = %t, error = %v", found, err)
+	}
+	if secondLease.NoExec != initialPolicy.NoExec {
+		t.Fatalf("second shared lease noexec = %t, want generation snapshot %t", secondLease.NoExec, initialPolicy.NoExec)
+	}
+	if secondPolicy != initialPolicy {
+		t.Fatalf("second shared lease policy = %+v, want generation snapshot %+v", secondPolicy, initialPolicy)
+	}
 	if len(meta.Leases) != 2 || meta.Leases[0].Generation != meta.Leases[1].Generation {
 		t.Fatalf("shared leases = %+v, want both leases on the same generation", meta.Leases)
 	}
@@ -1511,6 +1522,151 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	if err := store.Release(firstLeaseID, firstTarget); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestAcquireWaitsForCollectionOfSameIdentity(t *testing.T) {
+	enteredDetach := make(chan struct{})
+	continueDetach := make(chan struct{})
+	var enteredOnce sync.Once
+	var continueOnce sync.Once
+	releaseDetach := func() { continueOnce.Do(func() { close(continueDetach) }) }
+	store, err := newStore(t.TempDir(), StoreOptions{UnmountGeneration: func(string) error {
+		enteredOnce.Do(func() { close(enteredDetach) })
+		<-continueDetach
+		return nil
+	}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		releaseDetach()
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	identity := stableIdentity("acquire-collect-serialization")
+	firstTarget := filepath.Join(t.TempDir(), "first")
+	policy := Policy{Retention: time.Hour}
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "collect-source", Target: firstTarget},
+		Policy:   policy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Release("collect-source", firstTarget); err != nil {
+		t.Fatal(err)
+	}
+
+	collectDone := make(chan error, 1)
+	go func() { collectDone <- store.Collect(time.Now().Add(2 * time.Hour)) }()
+	select {
+	case <-enteredDetach:
+	case <-time.After(5 * time.Second):
+		t.Fatal("collection did not reach generation detach")
+	}
+
+	type acquireResult struct {
+		path string
+		err  error
+	}
+	acquireDone := make(chan acquireResult, 1)
+	newTarget := filepath.Join(t.TempDir(), "new")
+	go func() {
+		path, _, err := store.Acquire(AcquireOptions{
+			Identity: identity,
+			Lease:    Lease{ID: "concurrent-acquire", Target: newTarget},
+			Policy:   policy,
+		})
+		acquireDone <- acquireResult{path: path, err: err}
+	}()
+	waitForKeyedLockReferences(t, &store.identityLocks, identity, 2)
+	select {
+	case result := <-acquireDone:
+		t.Fatalf("Acquire completed while collection held the identity lock: %+v", result)
+	default:
+	}
+
+	releaseDetach()
+	if err := <-collectDone; err != nil {
+		t.Fatal(err)
+	}
+	result := <-acquireDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if _, err := os.Stat(result.path); err != nil {
+		t.Fatalf("new generation path after collection = %q: %v", result.path, err)
+	}
+	_, lease, source, _, found, err := store.LeaseDetails("concurrent-acquire")
+	if err != nil || !found || lease.Target != newTarget || source != result.path {
+		t.Fatalf("acquired lease after collection = (%+v, %q, %t, %v)", lease, source, found, err)
+	}
+}
+
+func TestAcquireClaimsLeaseIDAcrossIdentities(t *testing.T) {
+	store, err := newStore(t.TempDir(), StoreOptions{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	type acquireResult struct {
+		identity string
+		target   string
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan acquireResult, 2)
+	for _, name := range []string{"first", "second"} {
+		identity := stableIdentity("lease-claim-" + name)
+		target := filepath.Join(t.TempDir(), name)
+		go func() {
+			<-start
+			_, _, err := store.Acquire(AcquireOptions{
+				Identity: identity,
+				Lease:    Lease{ID: "globally-claimed-volume", Target: target},
+			})
+			results <- acquireResult{identity: identity, target: target, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if (first.err == nil) == (second.err == nil) {
+		t.Fatalf("Acquire results = (%v, %v), want exactly one global lease ID claim", first.err, second.err)
+	}
+	winner := first
+	if winner.err != nil {
+		winner = second
+	}
+	identity, lease, _, _, found, err := store.LeaseDetails("globally-claimed-volume")
+	if err != nil || !found || identity != winner.identity || lease.Target != winner.target {
+		t.Fatalf("globally claimed lease = (%q, %+v, %t, %v), winner = %+v", identity, lease, found, err, winner)
+	}
+}
+
+func waitForKeyedLockReferences(t *testing.T, locks *keyedMutexes, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		locks.mu.Lock()
+		lock := locks.locks[key]
+		refs := 0
+		if lock != nil {
+			refs = lock.refs
+		}
+		locks.mu.Unlock()
+		if refs >= want {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("keyed lock references for %q did not reach %d", key, want)
 }
 
 func TestRecoveryVerifierReceivesRetiredGenerationSourceAndPolicy(t *testing.T) {

@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -450,6 +451,19 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 		}
 		return status.Errorf(code, "acquire cache: %v", err)
 	}
+	_, storedLease, storedSource, storedPolicy, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	if err != nil || !found {
+		if err == nil {
+			err = errors.New("cache lease disappeared after acquisition")
+		}
+		if releaseErr := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
+			err = errors.Join(err, fmt.Errorf("release cache lease after reading its generation policy: %w", releaseErr))
+		}
+		return s.useFallback(ctx, req, policy.MaxBytes, true, cache.PressurePolicyUnusedOnly, unexpectedFallbackCause("cache_acquire_failed"), err)
+	}
+	source = storedSource
+	policy = storedPolicy
+	policy.NoExec = storedLease.NoExec
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {
 		if err := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); err != nil {
 			s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("quota_setup_failed"), err)

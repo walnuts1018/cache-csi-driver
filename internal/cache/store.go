@@ -83,17 +83,17 @@ type Store struct {
 	indexReady                 atomic.Bool
 	ready                      atomic.Bool
 	// lease lockを取得してからidentity lockを取得し、project registry lockの後にmuを取得します。muはfilesystem I/O中に保持しません。
-	identityLocks              keyedMutexes
-	leaseLocks                 keyedMutexes
+	identityLocks keyedMutexes
+	leaseLocks    keyedMutexes
 	// project IDはcache root全体で一意なため、registry fileの更新を直列化します。
-	projectRegistryMu          sync.Mutex
-	fallbackMu                 sync.Mutex
+	projectRegistryMu sync.Mutex
+	fallbackMu        sync.Mutex
 	// trashのdetach中にcollectorが作成途中のentryをsnapshotしないようにします。
-	trashMu                    sync.Mutex
-	recoveryMu                 sync.Mutex
-	collectorMu                sync.Mutex
-	collectorStarted           bool
-	collectorFinished          bool
+	trashMu           sync.Mutex
+	recoveryMu        sync.Mutex
+	collectorMu       sync.Mutex
+	collectorStarted  bool
+	collectorFinished bool
 }
 
 type keyedMutexes struct {

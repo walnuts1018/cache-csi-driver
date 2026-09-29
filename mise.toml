@@ -48,9 +48,8 @@ if [ "$host_os" = Darwin ]; then
   go_mod_cache="$(go env GOMODCACHE)"
   unset GOBIN
   GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 GOPATH="$tmp_dir" GOMODCACHE="$go_mod_cache" go install -trimpath github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
-  csi_sanity_bin="$tmp_dir/bin/csi-sanity"
+  csi_sanity_bin="$tmp_dir/bin/linux_$go_arch/csi-sanity"
 fi
-mkdir -p "$tmp_dir/mount" "$tmp_dir/staging"
 
 docker run --detach --privileged --platform "linux/$go_arch" --name "$container_name" \
   -v "$tmp_dir:/tmp/csi-sanity" \
@@ -85,7 +84,7 @@ if [ ! -S "$tmp_dir/csi.sock" ]; then
 fi
 
 if [ "$host_os" = Darwin ]; then
-  docker exec "$container_name" /tmp/csi-sanity/csi-sanity \
+  docker exec "$container_name" "/tmp/csi-sanity/bin/linux_$go_arch/csi-sanity" \
     --csi.endpoint=unix:///tmp/csi-sanity/csi.sock \
     --csi.mountdir=/tmp/csi-sanity/mount \
     --csi.stagingdir=/tmp/csi-sanity/staging \

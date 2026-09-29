@@ -340,7 +340,7 @@ func (s *Store) writeMetadata(entry string, meta Metadata) error {
 	s.mu.Unlock()
 	if registryDirty {
 		if err := s.persistProjectReservationsLocked(); err != nil {
-		return fmt.Errorf("persist project ID registry after metadata update: %w", err)
+			return fmt.Errorf("persist project ID registry after metadata update: %w", err)
 		}
 	}
 	return nil

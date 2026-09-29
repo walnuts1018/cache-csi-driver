@@ -446,7 +446,6 @@ func (s *Store) restoreProjectReservationLocked(projectID uint32, identity, gene
 	return nil
 }
 
-
 func (s *Store) projectID(identity, generation string) (uint32, error) {
 	s.projectRegistryMu.Lock()
 	defer s.projectRegistryMu.Unlock()
