@@ -56,8 +56,13 @@ func FallbackIdentity(volumeID string) (string, error) {
 }
 
 func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := validateAcquireOptions(options); err != nil {
+		return "", false, err
+	}
+	unlockLease := s.leaseLocks.lock(options.Lease.ID)
+	defer unlockLease()
+	unlockIdentity := s.identityLocks.lock(options.Identity)
+	defer unlockIdentity()
 	return s.acquireLocked(options)
 }
 
@@ -66,8 +71,11 @@ func (s *Store) acquireLocked(options AcquireOptions) (string, bool, error) {
 		return "", false, err
 	}
 	options.Lease.Preparing = true
-	if err := s.degraded[options.Identity]; err != nil {
-		return "", false, err
+	s.mu.Lock()
+	degradedErr := s.degraded[options.Identity]
+	s.mu.Unlock()
+	if degradedErr != nil {
+		return "", false, degradedErr
 	}
 	if path, found, err := s.existingLeasePath(options); found || err != nil {
 		return path, false, err
@@ -135,8 +143,12 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 			return "", false, ErrExclusivePolicyConflict
 		}
 	}
-	if s.activeLeaseCount(meta) > 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes) {
-		return "", false, ErrQuotaPolicyConflict
+	if s.activeLeaseCount(meta) > 0 {
+		if meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes {
+			return "", false, ErrQuotaPolicyConflict
+		}
+		options.Policy = meta.Policy
+		options.Lease.NoExec = meta.Policy.NoExec
 	}
 	if len(meta.Retired) == 0 && s.activeLeaseCount(meta) == 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
 		if err := s.rejectUnderPressure(); err != nil {
@@ -163,10 +175,13 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 }
 
 func (s *Store) rejectUnderPressure() error {
-	pressureActive, err := s.pressureActiveLocked()
+	usage, err := filesystemUsage(s.root)
 	if err != nil {
 		return fmt.Errorf("inspect cache pool pressure: %w", err)
 	}
+	s.mu.Lock()
+	pressureActive := s.updatePressure(usage)
+	s.mu.Unlock()
 	if pressureActive {
 		return ErrPressureActive
 	}
@@ -174,14 +189,18 @@ func (s *Store) rejectUnderPressure() error {
 }
 
 func (s *Store) AcquireFallback(options AcquireOptions, requestedBytes, perVolumeMaxBytes, totalMaxBytes int64) (FallbackAllocation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := validateAcquireOptions(options); err != nil {
 		return FallbackAllocation{}, err
 	}
 	if perVolumeMaxBytes <= 0 || totalMaxBytes <= 0 {
 		return FallbackAllocation{}, errors.New("fallback cache limits must be positive")
 	}
+	unlockLease := s.leaseLocks.lock(options.Lease.ID)
+	defer unlockLease()
+	unlockIdentity := s.identityLocks.lock(options.Identity)
+	defer unlockIdentity()
+	s.fallbackMu.Lock()
+	defer s.fallbackMu.Unlock()
 
 	if identity, meta, found, err := s.findLease(options.Lease.ID); err != nil {
 		return FallbackAllocation{}, err
@@ -206,10 +225,13 @@ func (s *Store) AcquireFallback(options AcquireOptions, requestedBytes, perVolum
 		path, _, err := s.acquireLocked(options)
 		return FallbackAllocation{Source: path, MaxBytes: storedPolicy.MaxBytes, NoExec: storedLease.NoExec}, err
 	}
-	if len(s.degraded) != 0 {
+	s.mu.Lock()
+	degradedCount := len(s.degraded)
+	reserved := s.fallbackReservedBytes
+	s.mu.Unlock()
+	if degradedCount != 0 {
 		return FallbackAllocation{}, ErrDegradedMetadata
 	}
-	reserved := s.fallbackReservedBytes
 	if reserved < 0 || reserved > totalMaxBytes {
 		return FallbackAllocation{}, errors.New("fallback cache reservations exceed the configured aggregate limit")
 	}
@@ -288,6 +310,7 @@ func leaseGenerationAndPolicy(meta Metadata, lease Lease) (string, Policy, error
 
 func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
 	generationPath := filepath.Join(entry, "generations", meta.Generation)
+	newGeneration := false
 	if statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
 		meta.Leases = slices.DeleteFunc(meta.Leases, func(lease Lease) bool {
 			return lease.Generation == "" || lease.Generation == meta.Generation
@@ -298,6 +321,7 @@ func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metad
 		meta.QuotaBytes = 0
 		meta.Leases = nil
 		meta.Dirty = false
+		newGeneration = true
 	} else if statErr != nil {
 		return "", false, fmt.Errorf("inspect cache generation: %w", statErr)
 	}
@@ -306,7 +330,6 @@ func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metad
 			if lease.Target != options.Lease.Target {
 				return "", false, errors.New("cache lease already exists for a different target")
 			}
-			meta.Policy = options.Policy
 			index := slices.IndexFunc(meta.Leases, func(existing Lease) bool { return existing.ID == options.Lease.ID })
 			meta.Leases[index] = options.Lease
 			if err := s.writeMetadata(entry, meta); err != nil {
@@ -315,7 +338,9 @@ func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metad
 			return filepath.Join(entry, "generations", meta.Generation), false, nil
 		}
 	}
-	meta.Policy = options.Policy
+	if newGeneration {
+		meta.Policy = options.Policy
+	}
 	return s.createLease(entry, options, meta)
 }
 
@@ -374,8 +399,14 @@ func (s *Store) setLeasePreparing(leaseID, target string, preparing bool) error 
 	if leaseID == "" || !filepath.IsAbs(target) {
 		return errors.New("valid cache lease ID and absolute target path are required")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlockLease := s.leaseLocks.lock(leaseID)
+	defer unlockLease()
+	identity, exists := s.identityForLease(leaseID)
+	if !exists {
+		return errors.New("cache lease does not exist")
+	}
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	identity, meta, found, err := s.findLease(leaseID)
 	if err != nil {
 		return err
@@ -405,8 +436,14 @@ func (s *Store) setLeasePreparing(leaseID, target string, preparing bool) error 
 }
 
 func (s *Store) LeaseDetails(leaseID string) (string, Lease, string, Policy, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlockLease := s.leaseLocks.lock(leaseID)
+	defer unlockLease()
+	identity, exists := s.identityForLease(leaseID)
+	if !exists {
+		return "", Lease{}, "", Policy{}, false, nil
+	}
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	identity, meta, found, err := s.findLease(leaseID)
 	if err != nil || !found {
 		return "", Lease{}, "", Policy{}, found, err
@@ -426,11 +463,11 @@ func (s *Store) LeaseDetails(leaseID string) (string, Lease, string, Policy, boo
 }
 
 func (s *Store) QuotaState(identity string, maxBytes int64) (uint32, bool, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !validIdentity(identity) || maxBytes <= 0 {
 		return 0, false, false, errors.New("valid cache identity and positive quota limit are required")
 	}
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	entry := filepath.Join(s.root, identity)
 	meta, err := s.readObjectMetadata(identity)
 	if err != nil {
@@ -440,13 +477,17 @@ func (s *Store) QuotaState(identity string, maxBytes int64) (uint32, bool, bool,
 		return 0, false, false, err
 	}
 	if meta.ProjectID == 0 {
-		projectID, err := s.projectIDLocked(identity, meta.Generation)
+		projectID, err := s.projectID(identity, meta.Generation)
 		if err != nil {
 			return 0, false, false, err
 		}
 		meta.ProjectID = projectID
 	} else {
+		s.projectRegistryMu.Lock()
+		s.mu.Lock()
 		s.addProjectReservation(meta.ProjectID, projectReservation{Identity: identity, Generation: meta.Generation})
+		s.mu.Unlock()
+		s.projectRegistryMu.Unlock()
 	}
 	if err := s.writeMetadata(entry, meta); err != nil {
 		return 0, false, false, err
@@ -455,11 +496,11 @@ func (s *Store) QuotaState(identity string, maxBytes int64) (uint32, bool, bool,
 }
 
 func (s *Store) Expose(identity string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !validIdentity(identity) {
 		return "", errors.New("invalid cache identity")
 	}
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	entry := filepath.Join(s.root, identity)
 	meta, err := s.readObjectMetadata(identity)
 	if err != nil {
@@ -484,8 +525,8 @@ func (s *Store) Expose(identity string) (string, error) {
 }
 
 func (s *Store) MarkQuotaApplied(identity string, maxBytes int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	entry := filepath.Join(s.root, identity)
 	meta, err := s.readObjectMetadata(identity)
 	if err != nil {
@@ -496,8 +537,8 @@ func (s *Store) MarkQuotaApplied(identity string, maxBytes int64) error {
 }
 
 func (s *Store) MarkProjectAssigned(identity string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	entry := filepath.Join(s.root, identity)
 	meta, err := s.readObjectMetadata(identity)
 	if err != nil {
@@ -508,8 +549,14 @@ func (s *Store) MarkProjectAssigned(identity string) error {
 }
 
 func (s *Store) Release(leaseID, target string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlockLease := s.leaseLocks.lock(leaseID)
+	defer unlockLease()
+	identity, exists := s.identityForLease(leaseID)
+	if !exists {
+		return nil
+	}
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	identity, meta, found, err := s.findLease(leaseID)
 	if err != nil || !found {
 		return err
@@ -556,7 +603,7 @@ func (s *Store) hasGenerationLeases(meta Metadata, generation string) bool {
 }
 
 func (s *Store) findLease(leaseID string) (string, Metadata, bool, error) {
-	identity, exists := s.leaseIndex[leaseID]
+	identity, exists := s.identityForLease(leaseID)
 	if !exists {
 		return "", Metadata{}, false, nil
 	}
@@ -570,9 +617,22 @@ func (s *Store) findLease(leaseID string) (string, Metadata, bool, error) {
 	return "", Metadata{}, false, nil
 }
 
-func (s *Store) ReleaseTarget(leaseID string) (string, bool, error) {
+func (s *Store) identityForLease(leaseID string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	identity, exists := s.leaseIndex[leaseID]
+	return identity, exists
+}
+
+func (s *Store) ReleaseTarget(leaseID string) (string, bool, error) {
+	unlockLease := s.leaseLocks.lock(leaseID)
+	defer unlockLease()
+	identity, exists := s.identityForLease(leaseID)
+	if !exists {
+		return "", false, nil
+	}
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	_, meta, found, err := s.findLease(leaseID)
 	if err != nil || !found {
 		return "", found, err

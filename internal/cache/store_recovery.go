@@ -43,7 +43,7 @@ func (s *Store) rebuildIndexes() error {
 			s.markDegraded(entry.Name(), err)
 			continue
 		}
-		s.indexObjectMetadata(meta)
+		s.indexMetadata(meta)
 	}
 
 	trashEntries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
@@ -66,13 +66,27 @@ func (s *Store) rebuildIndexes() error {
 			}
 			continue
 		}
+		s.projectRegistryMu.Lock()
+		s.mu.Lock()
 		s.trashMetadata[entry.Name()] = meta
 		s.addMetadataReservations(meta, entry.Name())
+		s.mu.Unlock()
+		s.projectRegistryMu.Unlock()
 	}
-	if registryMissing && len(s.degraded) > 0 {
-		for identity := range s.degraded {
+	s.mu.Lock()
+	degradedIdentities := make([]string, 0, len(s.degraded))
+	for identity := range s.degraded {
+		degradedIdentities = append(degradedIdentities, identity)
+	}
+	s.mu.Unlock()
+	if registryMissing {
+		for _, identity := range degradedIdentities {
 			if filepath.Dir(identity) == "." {
+				s.projectRegistryMu.Lock()
+				s.mu.Lock()
 				s.addUnknownProjectReservation(identity, "")
+				s.mu.Unlock()
+				s.projectRegistryMu.Unlock()
 			}
 		}
 	}
@@ -134,16 +148,28 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 		return "", "", false, errors.New("absolute target path and source matcher are required")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	var matchedIdentity, matchedSource string
+	identities := make([]string, 0, len(s.degraded))
 	for identity := range s.degraded {
-		if !validIdentity(identity) {
+		if validIdentity(identity) {
+			identities = append(identities, identity)
+		}
+	}
+	s.mu.Unlock()
+	var matchedIdentity, matchedSource string
+	for _, identity := range identities {
+		unlockIdentity := s.identityLocks.lock(identity)
+		s.mu.Lock()
+		_, degraded := s.degraded[identity]
+		s.mu.Unlock()
+		if !degraded {
+			unlockIdentity()
 			continue
 		}
 		generations, err := s.readDir(filepath.Join(s.root, identity, "generations"))
 		if errors.Is(err, os.ErrNotExist) {
 			generations = nil
 		} else if err != nil {
+			unlockIdentity()
 			return "", "", false, fmt.Errorf("inspect degraded cache generations: %w", err)
 		}
 		for _, generation := range generations {
@@ -156,12 +182,14 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 				continue
 			}
 			if err != nil {
+				unlockIdentity()
 				return "", "", false, fmt.Errorf("match degraded cache generation: %w", err)
 			}
 			if !matches {
 				continue
 			}
 			if matchedIdentity != "" {
+				unlockIdentity()
 				return "", "", false, errors.New("target matches multiple degraded cache generations")
 			}
 			matchedIdentity = identity
@@ -174,16 +202,19 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 				continue
 			}
 			if err != nil {
+				unlockIdentity()
 				return "", "", false, fmt.Errorf("match degraded cache object: %w", err)
 			}
 			if matches {
 				if matchedIdentity != "" {
+					unlockIdentity()
 					return "", "", false, errors.New("target matches multiple degraded cache generations")
 				}
 				matchedIdentity = identity
 				matchedSource = source
 			}
 		}
+		unlockIdentity()
 	}
 	return matchedIdentity, matchedSource, matchedIdentity != "", nil
 }
@@ -192,11 +223,14 @@ func (s *Store) CleanupDegradedObject(identity string, sourceMounted func(source
 	if !validIdentity(identity) || sourceMounted == nil {
 		return errors.New("valid degraded cache identity and mount inspector are required")
 	}
+	unlockIdentity := s.identityLocks.lock(identity)
+	defer unlockIdentity()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, degraded := s.degraded[identity]; !degraded {
+		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Unlock()
 	objectPath := filepath.Join(s.root, identity)
 	generations, err := s.readDir(filepath.Join(objectPath, "generations"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -249,14 +283,17 @@ func (s *Store) RecoverDegraded(ctx context.Context, verifyMount func(source str
 		if err := ctx.Err(); err != nil {
 			return errors.Join(recoveryErr, err)
 		}
+		unlockIdentity := s.identityLocks.lock(identity)
 		s.mu.Lock()
-		if _, degraded := s.degraded[identity]; degraded {
+		_, degraded := s.degraded[identity]
+		s.mu.Unlock()
+		if degraded {
 			path := filepath.Join(s.root, identity)
 			if err := s.quarantineDegradedObjectChecked(ctx, path, identity, verifyMount); err != nil {
 				recoveryErr = errors.Join(recoveryErr, fmt.Errorf("recover degraded cache %s: %w", identity, err))
 			}
 		}
-		s.mu.Unlock()
+		unlockIdentity()
 	}
 	return recoveryErr
 }
@@ -269,8 +306,8 @@ func (s *Store) RecoverLeasesContext(ctx context.Context, verifyMount func(sourc
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
 	if verifyMount == nil {
 		return errors.New("mount verifier is not configured")
 	}
@@ -283,9 +320,12 @@ func (s *Store) RecoverLeasesContext(ctx context.Context, verifyMount func(sourc
 			return err
 		}
 		if entry.IsDir() && entry.Name() != trashDirectoryName {
+			unlockIdentity := s.identityLocks.lock(entry.Name())
 			if err := s.recoverObjectLeases(ctx, filepath.Join(s.root, entry.Name()), entry.Name(), verifyMount); err != nil {
+				unlockIdentity()
 				return err
 			}
+			unlockIdentity()
 		}
 	}
 	s.ready.Store(true)
@@ -370,7 +410,7 @@ func (s *Store) recoverValidObjectLeases(ctx context.Context, path, identity str
 				s.markDegraded(identity, err)
 			}
 		} else {
-			s.indexObjectMetadata(meta)
+			s.indexMetadata(meta)
 		}
 		return nil
 	}

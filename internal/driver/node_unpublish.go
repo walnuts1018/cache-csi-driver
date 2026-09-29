@@ -9,6 +9,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
+	"github.com/walnuts1018/cache-csi-driver/internal/kubeletcompat"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -17,8 +18,8 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	if req.GetVolumeId() == "" || !filepath.IsAbs(req.GetTargetPath()) {
 		return nil, status.Error(codes.InvalidArgument, "volume ID and absolute target path are required")
 	}
-	if err := s.validateTarget(req.GetTargetPath()); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	if _, _, ok := kubeletcompat.ParseInlineCSITarget(s.options.KubeletRoot, req.GetTargetPath()); !ok {
+		return nil, status.Error(codes.InvalidArgument, "target path must identify an inline CSI volume mount")
 	}
 	unlock := s.locks.Lock(req.GetTargetPath())
 	defer unlock()
@@ -41,7 +42,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 	if mounted {
-		handled, err := s.unpublishDegradedMount(req.GetVolumeId(), req.GetTargetPath())
+		handled, err := s.unpublishDegradedMount(req.GetTargetPath())
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "unpublish degraded cache: %v", err)
 		}
@@ -80,8 +81,8 @@ func (s *Server) unpublishCacheLease(req *csi.NodeUnpublishVolumeRequest, lease 
 	return nil
 }
 
-func (s *Server) unpublishDegradedMount(volumeID, target string) (bool, error) {
-	if !matchesInlineVolumeIDTarget(volumeID, s.options.KubeletRoot, target) {
+func (s *Server) unpublishDegradedMount(target string) (bool, error) {
+	if _, _, ok := kubeletcompat.ParseInlineCSITarget(s.options.KubeletRoot, target); !ok {
 		return false, nil
 	}
 	for _, store := range []*cache.Store{s.store, s.fallbackStore} {

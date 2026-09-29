@@ -82,9 +82,53 @@ type Store struct {
 	initErr                    error
 	indexReady                 atomic.Bool
 	ready                      atomic.Bool
+	// lease lockを取得してからidentity lockを取得し、project registry lockの後にmuを取得します。muはfilesystem I/O中に保持しません。
+	identityLocks              keyedMutexes
+	leaseLocks                 keyedMutexes
+	// project IDはcache root全体で一意なため、registry fileの更新を直列化します。
+	projectRegistryMu          sync.Mutex
+	fallbackMu                 sync.Mutex
+	// trashのdetach中にcollectorが作成途中のentryをsnapshotしないようにします。
+	trashMu                    sync.Mutex
+	recoveryMu                 sync.Mutex
 	collectorMu                sync.Mutex
 	collectorStarted           bool
 	collectorFinished          bool
+}
+
+type keyedMutexes struct {
+	mu    sync.Mutex
+	locks map[string]*keyedMutex
+}
+
+type keyedMutex struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (m *keyedMutexes) lock(key string) func() {
+	m.mu.Lock()
+	if m.locks == nil {
+		m.locks = make(map[string]*keyedMutex)
+	}
+	lock := m.locks[key]
+	if lock == nil {
+		lock = &keyedMutex{}
+		m.locks[key] = lock
+	}
+	lock.refs++
+	m.mu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		m.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(m.locks, key)
+		}
+		m.mu.Unlock()
+	}
 }
 
 type RuntimeStats struct {
@@ -303,9 +347,17 @@ func (s *Store) initializeIndexes() {
 		if s.stopRequested() {
 			return
 		}
+		s.trashMu.Lock()
+		s.projectRegistryMu.Lock()
 		s.mu.Lock()
 		s.resetIndexState()
+		s.mu.Unlock()
+		s.projectRegistryMu.Unlock()
+		s.trashMu.Unlock()
+
 		err := s.rebuildIndexes()
+
+		s.mu.Lock()
 		s.initErr = err
 		s.indexReady.Store(err == nil)
 		s.mu.Unlock()

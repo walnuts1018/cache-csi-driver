@@ -11,6 +11,7 @@ import (
 	cachev1alpha1 "github.com/walnuts1018/cache-csi-driver/api/v1alpha1"
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 	"github.com/walnuts1018/cache-csi-driver/internal/kube"
+	"github.com/walnuts1018/cache-csi-driver/internal/kubeletcompat"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -99,10 +100,7 @@ func (s *Server) validatePublishRequest(req *csi.NodePublishVolumeRequest) (podV
 	}
 	accessMode := req.GetVolumeCapability().GetAccessMode()
 	if !isSingleNodeAccessMode(accessMode) {
-		return podVolumeContext{}, status.Error(codes.InvalidArgument, "a single-node access mode is required")
-	}
-	if accessMode.GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY && !req.GetReadonly() {
-		return podVolumeContext{}, status.Error(codes.InvalidArgument, "single-node reader-only access requires a readonly volume publish")
+		return podVolumeContext{}, status.Error(codes.InvalidArgument, "SINGLE_NODE_WRITER access mode is required")
 	}
 	attributes := req.GetVolumeContext()
 	volumeContext := podVolumeContext{
@@ -198,7 +196,7 @@ func (s *Server) handleExistingPublish(req *csi.NodePublishVolumeRequest) (strin
 }
 
 func (s *Server) verifyExistingDegradedMount(req *csi.NodePublishVolumeRequest) (bool, error) {
-	if !matchesInlineVolumeIDTarget(req.GetVolumeId(), s.options.KubeletRoot, req.GetTargetPath()) {
+	if _, _, ok := kubeletcompat.ParseInlineCSITarget(s.options.KubeletRoot, req.GetTargetPath()); !ok {
 		return false, nil
 	}
 	for _, store := range []*cache.Store{s.store, s.fallbackStore} {
@@ -323,8 +321,7 @@ func (s *Server) publishAfterResolutionFailure(ctx context.Context, req *csi.Nod
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
 	}
-	canFallback := errors.Is(resolveErr, kube.ErrAPIResolverUnavailable) || errors.Is(resolveErr, kube.ErrResolverNotSynced) ||
-		errors.Is(resolveErr, kube.ErrServiceAccountNotCached) || kube.IsTemporaryAPIError(resolveErr)
+	canFallback := errors.Is(resolveErr, kube.ErrAPIResolverUnavailable) || errors.Is(resolveErr, kube.ErrResolverNotSynced) || kube.IsTemporaryAPIError(resolveErr)
 	if !canFallback {
 		return status.Errorf(codes.FailedPrecondition, "resolve CacheClass %q: %v", volumeContext.cacheClass, resolveErr)
 	}

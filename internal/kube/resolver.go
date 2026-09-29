@@ -8,8 +8,11 @@ import (
 	"net"
 	"sync"
 	"syscall"
+	"time"
 
 	cachev1alpha1 "github.com/walnuts1018/cache-csi-driver/api/v1alpha1"
+	"golang.org/x/sync/singleflight"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -17,9 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
 )
@@ -28,9 +29,11 @@ var cacheClassGVR = schema.GroupVersionResource{Group: cachev1alpha1.GroupVersio
 
 var ErrAPIResolverUnavailable = errors.New("the Kubernetes API resolver is unavailable")
 
-var ErrResolverNotSynced = errors.New("the Kubernetes API informer cache is not synchronized")
+var ErrResolverNotSynced = errors.New("the CacheClass informer cache is not synchronized")
 
-var ErrServiceAccountNotCached = errors.New("the Kubernetes API informer cache does not contain the ServiceAccount")
+var ErrServiceAccountNotFound = errors.New("the ServiceAccount was not found")
+
+const identityLookupTimeout = 5 * time.Second
 
 func IsTemporaryAPIError(err error) bool {
 	if err == nil {
@@ -50,15 +53,12 @@ func IsTemporaryAPIError(err error) bool {
 }
 
 type Resolver struct {
-	namespaceLister        corelisters.NamespaceLister
-	serviceAccountLister   corelisters.ServiceAccountLister
-	classLister            toolscache.GenericLister
-	namespaceInformer      toolscache.SharedIndexInformer
-	serviceAccountInformer toolscache.SharedIndexInformer
-	classInformer          toolscache.SharedIndexInformer
-	kubernetesFactory      informers.SharedInformerFactory
-	dynamicFactory         dynamicinformer.DynamicSharedInformerFactory
-	startOnce              sync.Once
+	kubernetesClient kubernetes.Interface
+	classLister      toolscache.GenericLister
+	classInformer    toolscache.SharedIndexInformer
+	dynamicFactory   dynamicinformer.DynamicSharedInformerFactory
+	apiGets          singleflight.Group
+	startOnce        sync.Once
 }
 
 type ResolvedClass struct {
@@ -79,32 +79,24 @@ func NewResolver(config *rest.Config) (*Resolver, error) {
 }
 
 func newResolver(kubernetesClient kubernetes.Interface, dynamicClient dynamic.Interface) *Resolver {
-	kubernetesFactory := informers.NewSharedInformerFactory(kubernetesClient, 0)
-	namespaceInformer := kubernetesFactory.Core().V1().Namespaces()
-	serviceAccountInformer := kubernetesFactory.Core().V1().ServiceAccounts()
 	dynamicFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
 	classInformer := dynamicFactory.ForResource(cacheClassGVR)
 	return &Resolver{
-		namespaceLister:        namespaceInformer.Lister(),
-		serviceAccountLister:   serviceAccountInformer.Lister(),
-		classLister:            classInformer.Lister(),
-		namespaceInformer:      namespaceInformer.Informer(),
-		serviceAccountInformer: serviceAccountInformer.Informer(),
-		classInformer:          classInformer.Informer(),
-		kubernetesFactory:      kubernetesFactory,
-		dynamicFactory:         dynamicFactory,
+		kubernetesClient: kubernetesClient,
+		classLister:      classInformer.Lister(),
+		classInformer:    classInformer.Informer(),
+		dynamicFactory:   dynamicFactory,
 	}
 }
 
 func (r *Resolver) Start(ctx context.Context) {
 	r.startOnce.Do(func() {
-		r.kubernetesFactory.StartWithContext(ctx)
 		r.dynamicFactory.Start(ctx.Done())
 	})
 }
 
 func (r *Resolver) HasSynced() bool {
-	return r.namespaceInformer.HasSynced() && r.serviceAccountInformer.HasSynced() && r.classInformer.HasSynced()
+	return r.classInformer.HasSynced()
 }
 
 func (r *Resolver) Resolve(ctx context.Context, namespace, className, serviceAccountName string) (string, string, ResolvedClass, error) {
@@ -113,10 +105,6 @@ func (r *Resolver) Resolve(ctx context.Context, namespace, className, serviceAcc
 	}
 	if !r.HasSynced() {
 		return "", "", ResolvedClass{}, ErrResolverNotSynced
-	}
-	namespaceObject, err := r.namespaceLister.Get(namespace)
-	if err != nil {
-		return "", "", ResolvedClass{}, fmt.Errorf("get pod namespace: %w", err)
 	}
 	object, err := r.classLister.Get(className)
 	if err != nil {
@@ -134,6 +122,13 @@ func (r *Resolver) Resolve(ctx context.Context, namespace, className, serviceAcc
 		return "", "", ResolvedClass{}, fmt.Errorf("CacheClass %q is invalid: %w", className, err)
 	}
 	class.UID = unstructuredClass.GetUID()
+	namespaceObject, err := r.getNamespace(ctx, namespace)
+	if err != nil {
+		return "", "", ResolvedClass{}, fmt.Errorf("get pod namespace: %w", err)
+	}
+	if namespaceObject.UID == "" {
+		return "", "", ResolvedClass{}, fmt.Errorf("namespace %q has no UID", namespace)
+	}
 	serviceAccountUID := ""
 	scope := class.Spec.Scope
 	if scope == "" {
@@ -143,10 +138,10 @@ func (r *Resolver) Resolve(ctx context.Context, namespace, className, serviceAcc
 		if serviceAccountName == "" {
 			serviceAccountName = "default"
 		}
-		serviceAccount, err := r.serviceAccountLister.ServiceAccounts(namespace).Get(serviceAccountName)
+		serviceAccount, err := r.getServiceAccount(ctx, namespace, serviceAccountName)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				err = fmt.Errorf("%w: ServiceAccount %s/%s: %w", ErrServiceAccountNotCached, namespace, serviceAccountName, err)
+				err = fmt.Errorf("%w: ServiceAccount %s/%s: %w", ErrServiceAccountNotFound, namespace, serviceAccountName, err)
 			}
 			return "", "", ResolvedClass{}, fmt.Errorf("get ServiceAccount: %w", err)
 		}
@@ -156,6 +151,48 @@ func (r *Resolver) Resolve(ctx context.Context, namespace, className, serviceAcc
 		serviceAccountUID = string(serviceAccount.UID)
 	}
 	return string(namespaceObject.UID), serviceAccountUID, ResolvedClass{Object: class, UID: string(unstructuredClass.GetUID())}, nil
+}
+
+func (r *Resolver) getNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {
+	resultCh := r.apiGets.DoChan("namespace/"+name, func() (any, error) {
+		requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), identityLookupTimeout)
+		defer cancel()
+		return r.kubernetesClient.CoreV1().Namespaces().Get(requestCtx, name, metav1.GetOptions{})
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		namespace, ok := result.Val.(*corev1.Namespace)
+		if !ok {
+			return nil, fmt.Errorf("namespace GET returned unexpected object %T", result.Val)
+		}
+		return namespace, nil
+	}
+}
+
+func (r *Resolver) getServiceAccount(ctx context.Context, namespace, name string) (*corev1.ServiceAccount, error) {
+	resultCh := r.apiGets.DoChan("serviceaccount/"+namespace+"/"+name, func() (any, error) {
+		requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), identityLookupTimeout)
+		defer cancel()
+		return r.kubernetesClient.CoreV1().ServiceAccounts(namespace).Get(requestCtx, name, metav1.GetOptions{})
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		serviceAccount, ok := result.Val.(*corev1.ServiceAccount)
+		if !ok {
+			return nil, fmt.Errorf("ServiceAccount GET returned unexpected object %T", result.Val)
+		}
+		return serviceAccount, nil
+	}
 }
 
 func Unstructured(class *cachev1alpha1.CacheClass) (*unstructured.Unstructured, error) {

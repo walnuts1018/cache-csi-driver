@@ -38,18 +38,21 @@ cleanup() {
 trap cleanup EXIT
 
 go_arch="$(go env GOARCH)"
+host_os="$(uname -s)"
 GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 go build -trimpath -o "$tmp_dir/cache-csi-node" ./cmd/cache-csi-node
-csi_test_module="$(go env GOMODCACHE)/github.com/kubernetes-csi/csi-test/v5@v5.6.0"
-if [ ! -f "$csi_test_module/go.mod" ]; then
-  echo "csi-sanity v5.6.0 source is missing from the Go module cache" >&2
+if ! csi_sanity_bin="$(command -v csi-sanity)"; then
+  echo "csi-sanity is not available on PATH; run this task through mise" >&2
   exit 1
 fi
-(
-  cd "$csi_test_module"
-  GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 go build -trimpath -o "$tmp_dir/csi-sanity" ./cmd/csi-sanity
-)
+if [ "$host_os" = Darwin ]; then
+  go_mod_cache="$(go env GOMODCACHE)"
+  unset GOBIN
+  GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 GOPATH="$tmp_dir" GOMODCACHE="$go_mod_cache" go install -trimpath github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
+  csi_sanity_bin="$tmp_dir/bin/csi-sanity"
+fi
+mkdir -p "$tmp_dir/mount" "$tmp_dir/staging"
 
-docker run --rm --privileged --platform "linux/$go_arch" --name "$container_name" \
+docker run --detach --privileged --platform "linux/$go_arch" --name "$container_name" \
   -v "$tmp_dir:/tmp/csi-sanity" \
   --entrypoint /bin/bash \
   ubuntu:26.04 \
@@ -62,25 +65,40 @@ docker run --rm --privileged --platform "linux/$go_arch" --name "$container_name
       -node-id csi-sanity-test &
     driver_pid=$!
     trap "kill $driver_pid 2>/dev/null || true; wait $driver_pid 2>/dev/null || true" EXIT
-    for _ in $(seq 1 100); do
-      if [ -S /tmp/csi-sanity/csi.sock ]; then
-        break
-      fi
-      if ! kill -0 "$driver_pid" 2>/dev/null; then
-        wait "$driver_pid"
-      fi
-      sleep 0.1
-    done
-    if [ ! -S /tmp/csi-sanity/csi.sock ]; then
-      echo "CSI node plugin did not create its socket" >&2
-      exit 1
-    fi
-    /tmp/csi-sanity/csi-sanity \
-      --csi.endpoint=unix:///tmp/csi-sanity/csi.sock \
-      --csi.mountdir=/tmp/csi-sanity/mount \
-      --csi.stagingdir=/tmp/csi-sanity/staging \
-      --ginkgo.focus="NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo" \
-      --ginkgo.v'
+    wait "$driver_pid"'
+
+for _ in $(seq 1 100); do
+  if [ -S "$tmp_dir/csi.sock" ]; then
+    break
+  fi
+  if ! docker container inspect "$container_name" 2>/dev/null | grep -q '"Running": true'; then
+    docker logs "$container_name" >&2 || true
+    echo "CSI node plugin stopped before creating its socket" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+if [ ! -S "$tmp_dir/csi.sock" ]; then
+  docker logs "$container_name" >&2 || true
+  echo "CSI node plugin did not create its socket" >&2
+  exit 1
+fi
+
+if [ "$host_os" = Darwin ]; then
+  docker exec "$container_name" /tmp/csi-sanity/csi-sanity \
+    --csi.endpoint=unix:///tmp/csi-sanity/csi.sock \
+    --csi.mountdir=/tmp/csi-sanity/mount \
+    --csi.stagingdir=/tmp/csi-sanity/staging \
+    --ginkgo.focus="NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo" \
+    --ginkgo.v
+else
+  "$csi_sanity_bin" \
+    --csi.endpoint="unix://$tmp_dir/csi.sock" \
+    --csi.mountdir="$tmp_dir/mount" \
+    --csi.stagingdir="$tmp_dir/staging" \
+    --ginkgo.focus="NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo" \
+    --ginkgo.v
+fi
 """
 
 [tasks."test:mount-api"]

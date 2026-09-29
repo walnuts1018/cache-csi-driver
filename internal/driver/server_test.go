@@ -36,7 +36,6 @@ func TestNodeGetCapabilitiesAdvertisesImplementedRPCs(t *testing.T) {
 	}
 
 	want := []csi.NodeServiceCapability_RPC_Type{
-		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
 		csi.NodeServiceCapability_RPC_GET_VOLUME_HEALTH,
 		csi.NodeServiceCapability_RPC_GET_STORAGE_HEALTH,
 	}
@@ -180,29 +179,16 @@ func TestNodePublishResolvesServiceAccountFromKubeletVolumeContext(t *testing.T)
 	}
 }
 
-func TestNodePublishRequiresReadonlyForReaderOnlyAccessMode(t *testing.T) {
+func TestNodePublishRejectsReaderOnlyAccessMode(t *testing.T) {
 	t.Parallel()
 
-	t.Run("rejects writable request", func(t *testing.T) {
-		t.Parallel()
-		server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
-		request := newPublishRequest(t, server.options.KubeletRoot, "reader-only-writable")
-		request.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
-		if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.InvalidArgument {
-			t.Fatalf("reader-only writable publish error = %v, want InvalidArgument", err)
-		}
-	})
-
-	t.Run("accepts readonly request", func(t *testing.T) {
-		t.Parallel()
-		server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
-		request := newPublishRequest(t, server.options.KubeletRoot, "reader-only-readonly")
-		request.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
-		request.Readonly = true
-		if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
-			t.Fatalf("reader-only readonly publish error = %v", err)
-		}
-	})
+	server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request := newPublishRequest(t, server.options.KubeletRoot, "reader-only-readonly")
+	request.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
+	request.Readonly = true
+	if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("reader-only publish error = %v, want InvalidArgument", err)
+	}
 }
 
 func TestNodePublishUsesBoundedFallbackUntilCacheStoreRecoveryCompletes(t *testing.T) {
@@ -606,10 +592,9 @@ func TestFallbackClassificationForResolutionErrorsAndCancellation(t *testing.T) 
 			wantFallback: true,
 		},
 		{
-			name:         "ServiceAccount has not reached its informer cache",
-			resolver:     &testResolver{err: kube.ErrServiceAccountNotCached},
-			wantStatus:   codes.OK,
-			wantFallback: true,
+			name:       "ServiceAccount does not exist",
+			resolver:   &testResolver{err: kube.ErrServiceAccountNotFound},
+			wantStatus: codes.FailedPrecondition,
 		},
 		{
 			name:         "maxBytes uses a bounded fallback when resolver is unavailable",
@@ -703,25 +688,21 @@ func TestNodeUnpublishRejectsForeignMountBesideDegradedGeneration(t *testing.T) 
 	}
 }
 
-func TestNodeUnpublishRejectsWrongVolumeIDForDegradedMount(t *testing.T) {
+func TestNodeUnpublishCleansDegradedMountWithoutKubeletVolumeIDDerivation(t *testing.T) {
 	t.Parallel()
 
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 	request, identity, _ := prepareDamagedMountedCache(t, server, mounts, store, "damaged-volume")
-	wrongVolumeID := inlineVolumeID(testPodUID, "other-volume")
+	request.VolumeId = "opaque-volume-id"
 
-	_, err := server.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
-		VolumeId:   wrongVolumeID,
-		TargetPath: request.GetTargetPath(),
-	})
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("unpublish error = %v, want FailedPrecondition", err)
+	if _, err := server.NodeUnpublishVolume(t.Context(), request); err != nil {
+		t.Fatalf("unpublish degraded cache by its verified target and source: %v", err)
 	}
-	if mounts.unmountCalls != 0 {
-		t.Fatalf("unmount calls = %d, want 0 for a mismatched volume ID", mounts.unmountCalls)
+	if mounts.unmountCalls != 1 {
+		t.Fatalf("unmount calls = %d, want one verified cache unmount", mounts.unmountCalls)
 	}
-	if _, err := os.Stat(filepath.Join(store.Root(), identity)); err != nil {
-		t.Fatalf("degraded cache object was removed: %v", err)
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("degraded cache object remains after unpublish: %v", err)
 	}
 }
 
@@ -772,7 +753,6 @@ func TestNodeHealthKeepsObjectMetadataFailureScopedToVolume(t *testing.T) {
 
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 	request := newPublishRequest(t, server.options.KubeletRoot, "unreadable-metadata-volume")
-	request.VolumeId = inlineVolumeID(testPodUID, "unreadable-metadata-volume")
 	identity, err := cache.IdentityWithServiceAccount("namespace-uid", "service-account-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)
@@ -1155,7 +1135,6 @@ func newPublishRequest(t *testing.T, kubeletRoot, volumeID string) *csi.NodePubl
 func prepareDamagedMountedCache(t *testing.T, server *Server, mounts *testMounter, store *cache.Store, volumeID string) (*csi.NodeUnpublishVolumeRequest, string, string) {
 	t.Helper()
 	request := newPublishRequest(t, server.options.KubeletRoot, volumeID)
-	request.VolumeId = inlineVolumeID(testPodUID, volumeID)
 	identity, err := cache.IdentityWithServiceAccount("namespace-uid", "service-account-uid", testDefault, "class-uid", "cache-key", "v1")
 	if err != nil {
 		t.Fatal(err)

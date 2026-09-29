@@ -37,7 +37,6 @@ func validWatermarks(high, low int) bool {
 
 func (s *Store) Collect(now time.Time) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	identities := make([]string, 0, len(s.metadataByIdentity))
 	for identity := range s.metadataByIdentity {
 		identities = append(identities, identity)
@@ -53,44 +52,53 @@ func (s *Store) Collect(now time.Time) error {
 		if len(indexed.Leases) != 0 || indexed.Policy.Retention <= 0 || now.Sub(indexed.LastUsed) < indexed.Policy.Retention {
 			continue
 		}
-		meta, err := s.readObjectMetadata(identity)
-		if err != nil {
-			continue
-		}
-		if len(meta.Leases) == 0 && meta.Policy.Retention > 0 && now.Sub(meta.LastUsed) >= meta.Policy.Retention {
-			candidates = append(candidates, candidate{identity: identity, path: filepath.Join(s.root, identity), meta: meta})
-		}
+		candidates = append(candidates, candidate{identity: identity, path: filepath.Join(s.root, identity), meta: indexed})
 	}
+	s.mu.Unlock()
 	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
 	for _, item := range candidates[:min(len(candidates), trashBatchSize)] {
+		unlockIdentity := s.identityLocks.lock(item.identity)
 		meta, err := s.readObjectMetadata(item.identity)
 		if err != nil || len(meta.Leases) != 0 || meta.Policy.Retention <= 0 || now.Sub(meta.LastUsed) < meta.Policy.Retention {
+			unlockIdentity()
 			continue
 		}
 		if err := s.detachToTrash(item.path); err != nil {
+			unlockIdentity()
 			return fmt.Errorf("remove cache object: %w", err)
 		}
+		unlockIdentity()
 	}
 	return nil
 }
 
 func (s *Store) ReclaimPressure(ctx context.Context) error {
 	attemptedTrash := make(map[string]struct{})
-	excluded := make(map[string]struct{})
 	var incomplete error
 	s.mu.Lock()
 	clear(s.pressureDetachFailed)
 	s.mu.Unlock()
+	usage, err := filesystemUsage(s.root)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if !s.updatePressure(usage) {
+		s.mu.Unlock()
+		return nil
+	}
+	candidates := s.unusedPressureCandidates()
+	s.mu.Unlock()
+	nextCandidate := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		s.mu.Lock()
-		usage, err := filesystemUsage(s.root)
+		usage, err = filesystemUsage(s.root)
 		if err != nil {
-			s.mu.Unlock()
 			return err
 		}
+		s.mu.Lock()
 		if !s.updatePressure(usage) {
 			s.mu.Unlock()
 			return pressureCleanupResult(incomplete)
@@ -104,30 +112,49 @@ func (s *Store) ReclaimPressure(ctx context.Context) error {
 			incomplete = errors.Join(incomplete, err)
 		}
 
-		s.mu.Lock()
 		usage, err = filesystemUsage(s.root)
 		if err != nil {
-			s.mu.Unlock()
 			return err
 		}
+		s.mu.Lock()
 		if !s.updatePressure(usage) {
 			s.mu.Unlock()
 			return pressureCleanupResult(incomplete)
 		}
-		candidates := s.unusedPressureCandidates(excluded)
-		if len(candidates) == 0 {
+		if nextCandidate >= len(candidates) {
 			s.mu.Unlock()
 			return pressureCleanupResult(incomplete)
 		}
-		item := candidates[0]
-		if err := s.detachToTrash(item.path); err != nil {
-			excluded[item.identity] = struct{}{}
-			s.pressureDetachFailed[item.identity] = struct{}{}
-			incomplete = errors.Join(incomplete, fmt.Errorf("detach unused cache during pressure reclaim: %w", err))
-			s.mu.Unlock()
+		item := candidates[nextCandidate]
+		nextCandidate++
+		s.mu.Unlock()
+		unlockIdentity := s.identityLocks.lock(item.identity)
+		meta, err := s.readObjectMetadata(item.identity)
+		if err != nil || len(meta.Leases) != 0 || !meta.LastUsed.Equal(item.lastUsed) {
+			unlockIdentity()
 			continue
 		}
+		usage, err = filesystemUsage(s.root)
+		if err != nil {
+			unlockIdentity()
+			return err
+		}
+		s.mu.Lock()
+		if !s.updatePressure(usage) {
+			s.mu.Unlock()
+			unlockIdentity()
+			return pressureCleanupResult(incomplete)
+		}
 		s.mu.Unlock()
+		if err := s.detachToTrash(item.path); err != nil {
+			s.mu.Lock()
+			s.pressureDetachFailed[item.identity] = struct{}{}
+			s.mu.Unlock()
+			incomplete = errors.Join(incomplete, fmt.Errorf("detach unused cache during pressure reclaim: %w", err))
+			unlockIdentity()
+			continue
+		}
+		unlockIdentity()
 	}
 }
 
@@ -137,14 +164,10 @@ type pressureCandidate struct {
 	lastUsed time.Time
 }
 
-func (s *Store) unusedPressureCandidates(excluded map[string]struct{}) []pressureCandidate {
-	candidates := make([]pressureCandidate, 0)
-	for identity := range s.metadataByIdentity {
-		if _, skip := excluded[identity]; skip {
-			continue
-		}
-		meta, err := s.readObjectMetadata(identity)
-		if err != nil || len(meta.Leases) != 0 {
+func (s *Store) unusedPressureCandidates() []pressureCandidate {
+	candidates := make([]pressureCandidate, 0, len(s.metadataByIdentity))
+	for identity, meta := range s.metadataByIdentity {
+		if len(meta.Leases) != 0 {
 			continue
 		}
 		candidates = append(candidates, pressureCandidate{identity: identity, path: filepath.Join(s.root, identity), lastUsed: meta.LastUsed})
@@ -169,6 +192,8 @@ func (s *Store) pressureActiveLocked() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.updatePressure(usage), nil
 }
 
@@ -215,12 +240,11 @@ func (s *Store) MetadataError() error {
 }
 
 func (s *Store) PressureVictims() ([]PressureVictim, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	fs, err := filesystemUsage(s.root)
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
 	type candidate struct {
 		identity string
 		meta     Metadata
@@ -229,20 +253,16 @@ func (s *Store) PressureVictims() ([]PressureVictim, error) {
 	var candidates []candidate
 	underPressure := s.updatePressure(fs)
 	if !underPressure {
+		s.mu.Unlock()
 		return nil, nil
 	}
 	criticalPressure := s.underCriticalWatermark(fs)
 	identities := make([]string, 0, len(s.metadataByIdentity))
-	for identity := range s.metadataByIdentity {
+	for identity, meta := range s.metadataByIdentity {
 		identities = append(identities, identity)
-	}
-	for _, identity := range identities {
-		meta, err := s.readObjectMetadata(identity)
-		if err != nil {
-			continue
-		}
 		if underPressure && len(meta.Leases) == 0 {
 			if _, detachFailed := s.pressureDetachFailed[identity]; !detachFailed {
+				s.mu.Unlock()
 				return nil, nil
 			}
 		}
@@ -251,47 +271,70 @@ func (s *Store) PressureVictims() ([]PressureVictim, error) {
 		}
 	}
 	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
+	s.mu.Unlock()
 	if underPressure {
 		for _, candidate := range candidates {
-			if s.hasPreparingGenerationLease(candidate.meta, candidate.meta.Generation) {
+			unlockIdentity := s.identityLocks.lock(candidate.identity)
+			meta, err := s.readObjectMetadata(candidate.identity)
+			if err != nil || len(meta.Leases) == 0 || !policyAllowsPressureTermination(meta.Policy.PressurePolicy) || s.hasPreparingGenerationLease(meta, meta.Generation) {
+				unlockIdentity()
 				continue
 			}
-			victims := make([]PressureVictim, 0, len(candidate.meta.Leases))
-			for index := range candidate.meta.Leases {
-				if candidate.meta.Leases[index].Generation == "" || candidate.meta.Leases[index].Generation == candidate.meta.Generation {
-					candidate.meta.Leases[index].Generation = candidate.meta.Generation
-					victims = append(victims, PressureVictim{Lease: candidate.meta.Leases[index], ForceDelete: shouldForceDelete(candidate.meta.Policy.PressurePolicy, criticalPressure)})
+			fs, err := filesystemUsage(s.root)
+			if err != nil {
+				unlockIdentity()
+				return nil, err
+			}
+			s.mu.Lock()
+			underPressure = s.updatePressure(fs)
+			criticalPressure = s.underCriticalWatermark(fs)
+			s.mu.Unlock()
+			if !underPressure {
+				unlockIdentity()
+				return nil, nil
+			}
+			victims := make([]PressureVictim, 0, len(meta.Leases))
+			for index := range meta.Leases {
+				if meta.Leases[index].Generation == "" || meta.Leases[index].Generation == meta.Generation {
+					meta.Leases[index].Generation = meta.Generation
+					victims = append(victims, PressureVictim{Lease: meta.Leases[index], ForceDelete: shouldForceDelete(meta.Policy.PressurePolicy, criticalPressure)})
 				}
 			}
 			if len(victims) == 0 {
+				unlockIdentity()
 				continue
 			}
-			candidate.meta.Retired = append(candidate.meta.Retired, RetiredGeneration{
-				Generation:      candidate.meta.Generation,
-				ProjectID:       candidate.meta.ProjectID,
-				ProjectAssigned: candidate.meta.ProjectAssigned,
-				QuotaBytes:      candidate.meta.QuotaBytes,
-				Policy:          candidate.meta.Policy,
+			meta.Retired = append(meta.Retired, RetiredGeneration{
+				Generation:      meta.Generation,
+				ProjectID:       meta.ProjectID,
+				ProjectAssigned: meta.ProjectAssigned,
+				QuotaBytes:      meta.QuotaBytes,
+				Policy:          meta.Policy,
 			})
-			candidate.meta.Generation = uuid.NewV7().String()
-			candidate.meta.CreatedAt = time.Now().UTC()
-			replacementPath := filepath.Join(candidate.path, "generations", candidate.meta.Generation)
+			meta.Generation = uuid.NewV7().String()
+			meta.CreatedAt = time.Now().UTC()
+			replacementPath := filepath.Join(candidate.path, "generations", meta.Generation)
 			if err := s.ensureDirectory(replacementPath); err != nil {
+				unlockIdentity()
 				return nil, fmt.Errorf("create replacement cache generation before Pod eviction: %w", err)
 			}
-			candidate.meta.ProjectID = 0
-			candidate.meta.ProjectAssigned = false
-			candidate.meta.QuotaBytes = 0
-			candidate.meta.Dirty = false
-			if err := s.writeMetadata(candidate.path, candidate.meta); err != nil {
+			meta.ProjectID = 0
+			meta.ProjectAssigned = false
+			meta.QuotaBytes = 0
+			meta.Dirty = false
+			if err := s.writeMetadata(candidate.path, meta); err != nil {
 				_ = s.detachToTrash(replacementPath)
+				unlockIdentity()
 				return nil, fmt.Errorf("retire cache generation before Pod eviction: %w", err)
 			}
+			unlockIdentity()
 			return victims, nil
 		}
 		for _, identity := range identities {
+			unlockIdentity := s.identityLocks.lock(identity)
 			meta, err := s.readObjectMetadata(identity)
 			if err != nil {
+				unlockIdentity()
 				continue
 			}
 			for _, retired := range meta.Retired {
@@ -308,9 +351,11 @@ func (s *Store) PressureVictims() ([]PressureVictim, error) {
 					}
 				}
 				if len(victims) > 0 {
+					unlockIdentity()
 					return victims, nil
 				}
 			}
+			unlockIdentity()
 		}
 	}
 	return nil, nil

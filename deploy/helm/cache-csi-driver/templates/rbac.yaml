@@ -20,8 +20,6 @@ rules:
       - serviceaccounts
     verbs:
       - get
-      - list
-      - watch
   {{- if .Values.rbac.createPodEvictions }}
   - apiGroups:
       - ""

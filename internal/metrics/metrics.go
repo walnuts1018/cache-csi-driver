@@ -218,7 +218,6 @@ func fallbackReason(value string) string {
 	return oneOf(value,
 		"api_unavailable",
 		"resolver_not_synced",
-		"service_account_not_cached",
 		"store_recovering",
 		"metadata_degraded",
 		"exclusive_conflict",

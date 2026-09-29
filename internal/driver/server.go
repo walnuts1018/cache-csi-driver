@@ -119,7 +119,6 @@ func (s *Server) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.Nod
 
 func (*Server) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	types := []csi.NodeServiceCapability_RPC_Type{
-		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
 		csi.NodeServiceCapability_RPC_GET_VOLUME_HEALTH,
 		csi.NodeServiceCapability_RPC_GET_STORAGE_HEALTH,
 	}

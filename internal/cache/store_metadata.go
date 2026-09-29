@@ -153,7 +153,21 @@ func (s *Store) indexObjectMetadata(meta Metadata) {
 	}
 }
 
+func (s *Store) indexMetadata(meta Metadata) {
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.indexObjectMetadata(meta)
+}
+
 func (s *Store) markDegraded(identity string, cause error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markDegradedLocked(identity, cause)
+}
+
+func (s *Store) markDegradedLocked(identity string, cause error) {
 	if previous, exists := s.metadataByIdentity[identity]; exists {
 		s.removeFallbackReservation(previous)
 		s.retiredGenerationCount -= len(previous.Retired)
@@ -178,6 +192,8 @@ func (s *Store) indexDegradedLeaseIDs(identity string, meta Metadata) {
 	if meta.Identity != identity {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, lease := range meta.Leases {
 		if lease.ID == "" || len(lease.ID) > 1024 || strings.ContainsRune(lease.ID, '\x00') {
 			continue
@@ -219,19 +235,28 @@ func validSharingPolicy(policy string) bool {
 }
 
 func (s *Store) readObjectMetadata(identity string) (Metadata, error) {
+	s.mu.Lock()
 	if err := s.degraded[identity]; err != nil {
+		s.mu.Unlock()
 		return Metadata{}, err
 	}
+	s.mu.Unlock()
 	meta, err := s.readMetadata(filepath.Join(s.root, identity))
 	if err != nil {
 		s.markDegraded(identity, err)
-		return Metadata{}, fmt.Errorf("read cache metadata: %w", s.degraded[identity])
+		s.mu.Lock()
+		degradedErr := s.degraded[identity]
+		s.mu.Unlock()
+		return Metadata{}, fmt.Errorf("read cache metadata: %w", degradedErr)
 	}
 	if err := validateMetadata(identity, meta); err != nil {
 		s.markDegraded(identity, err)
-		return Metadata{}, s.degraded[identity]
+		s.mu.Lock()
+		degradedErr := s.degraded[identity]
+		s.mu.Unlock()
+		return Metadata{}, degradedErr
 	}
-	s.indexObjectMetadata(meta)
+	s.indexMetadata(meta)
 	return meta, nil
 }
 
@@ -296,9 +321,13 @@ func (s *Store) writeMetadata(entry string, meta Metadata) error {
 	if closeErr != nil {
 		return closeErr
 	}
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
+	s.mu.Lock()
 	switch {
 	case filepath.Dir(relative) == "." && filepath.Base(relative) != trashDirectoryName:
 		if filepath.Base(relative) != meta.Identity || meta.Generation == "" {
+			s.mu.Unlock()
 			return errors.New("cache metadata identity or generation is inconsistent")
 		}
 		s.indexObjectMetadata(meta)
@@ -307,8 +336,12 @@ func (s *Store) writeMetadata(entry string, meta Metadata) error {
 		s.trashMetadata[trashID] = meta
 		s.addMetadataReservations(meta, trashID)
 	}
-	if err := s.persistProjectReservations(); err != nil {
+	registryDirty := s.projectRegistryDirty
+	s.mu.Unlock()
+	if registryDirty {
+		if err := s.persistProjectReservationsLocked(); err != nil {
 		return fmt.Errorf("persist project ID registry after metadata update: %w", err)
+		}
 	}
 	return nil
 }

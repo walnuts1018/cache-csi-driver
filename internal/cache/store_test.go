@@ -347,7 +347,7 @@ func TestZeroRetentionDisablesTTLCollectionButKeepsPressureEligibility(t *testin
 		t.Fatalf("zero-retention cache was removed by TTL collection: %v", err)
 	}
 	store.mu.Lock()
-	candidates := store.unusedPressureCandidates(nil)
+	candidates := store.unusedPressureCandidates()
 	store.mu.Unlock()
 	if !slices.ContainsFunc(candidates, func(candidate pressureCandidate) bool { return candidate.identity == identity }) {
 		t.Fatal("zero-retention cache was excluded from pressure reclaim")
@@ -1441,6 +1441,75 @@ func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
 		Policy:   policy,
 	}); !errors.Is(err, ErrPressureActive) {
 		t.Fatalf("new lease after old generation release error = %v, want ErrPressureActive", err)
+	}
+}
+
+func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
+	t.Parallel()
+
+	initialPolicy := Policy{
+		SharingPolicy:  SharingPolicyShared,
+		PressurePolicy: PressurePolicyUnusedOnly,
+		Retention:      time.Hour,
+		NoExec:         true,
+	}
+	store, err := newStore(t.TempDir(), StoreOptions{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	identity := stableIdentity("shared-policy-snapshot")
+	firstTarget := filepath.Join(t.TempDir(), "first-shared")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: firstLeaseID, Target: firstTarget},
+		Policy:   initialPolicy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPublish(firstLeaseID, firstTarget); err != nil {
+		t.Fatal(err)
+	}
+	updatedPolicy := initialPolicy
+	updatedPolicy.PressurePolicy = PressurePolicyForceDelete
+	updatedPolicy.Retention = 2 * time.Hour
+	updatedPolicy.NoExec = false
+	secondTarget := filepath.Join(t.TempDir(), "second-shared")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "second-shared-lease", Target: secondTarget},
+		Policy:   updatedPolicy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPublish("second-shared-lease", secondTarget); err != nil {
+		t.Fatal(err)
+	}
+	store.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
+	store.pressureActive = true
+	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Policy != initialPolicy {
+		t.Fatalf("shared generation policy = %+v, want immutable snapshot %+v", meta.Policy, initialPolicy)
+	}
+	if len(meta.Leases) != 2 || meta.Leases[0].Generation != meta.Leases[1].Generation {
+		t.Fatalf("shared leases = %+v, want both leases on the same generation", meta.Leases)
+	}
+	victims, err := store.PressureVictims()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(victims) != 0 {
+		t.Fatalf("pressure victims = %+v, want no victim under the generation snapshot policy", victims)
+	}
+	if err := store.Release(firstLeaseID, firstTarget); err != nil {
+		t.Fatal(err)
 	}
 }
 

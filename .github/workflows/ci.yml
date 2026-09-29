@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Verify
+  unit-static:
+    name: Unit and static checks
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -39,18 +39,6 @@ jobs:
       - name: Run Go race tests
         run: mise run test:race
 
-      - name: Run CSI conformance checks for node capabilities
-        run: mise run test:csi-sanity
-
-      - name: Run Linux mount API integration test
-        run: mise run test:mount-api
-
-      - name: Run XFS project quota integration test
-        run: mise run test:xfs-quota
-
-      - name: Run Kind cache lifecycle E2E
-        run: mise run test:e2e:kind
-
       - name: Verify generated API manifests
         run: |
           mise run manifests
@@ -67,3 +55,33 @@ jobs:
 
       - name: Check generated chart CRD
         run: cmp config/crd/bases/cache.storage.walnuts.dev_cacheclasses.yaml deploy/helm/cache-csi-driver/crds/cache.storage.walnuts.dev_cacheclasses.yaml
+
+  privileged-integration:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: CSI sanity
+            task: test:csi-sanity
+          - name: Linux mount API integration
+            task: test:mount-api
+          - name: XFS project quota integration
+            task: test:xfs-quota
+          - name: Kind cache lifecycle E2E
+            task: test:e2e:kind
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up mise tools
+        uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          cache: true
+
+      - name: Run privileged integration
+        run: mise run "${{ matrix.task }}"

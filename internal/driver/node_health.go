@@ -7,6 +7,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
+	"github.com/walnuts1018/cache-csi-driver/internal/kubeletcompat"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -40,6 +41,9 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 		if !filepath.IsAbs(req.GetVolumePublishPath()) {
 			return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeLeaseMissing", "cache volume lease is missing")}, nil
 		}
+		if _, _, ok := kubeletcompat.ParseInlineCSITarget(s.options.KubeletRoot, req.GetVolumePublishPath()); !ok {
+			return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeLeaseMissing", "cache volume publish path is invalid")}, nil
+		}
 		lease.Target = req.GetVolumePublishPath()
 		source = fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
 	}
@@ -54,18 +58,16 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if found {
 		same, err = s.mounter.sameCacheMount(source, lease.Target, lease.ReadOnly, lease.NoExec)
 	} else {
-		if matchesInlineVolumeIDTarget(req.GetVolumeId(), s.options.KubeletRoot, lease.Target) {
-			for _, store := range []*cache.Store{s.store, s.fallbackStore} {
-				if store == nil {
-					continue
-				}
-				_, _, degraded, err := store.FindDegradedGenerationForTarget(lease.Target, s.mounter.sameCacheSource)
-				if err != nil {
-					return nil, status.Errorf(codes.Internal, "inspect degraded cache mount: %v", err)
-				}
-				if degraded {
-					return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
-				}
+		for _, store := range []*cache.Store{s.store, s.fallbackStore} {
+			if store == nil {
+				continue
+			}
+			_, _, degraded, err := store.FindDegradedGenerationForTarget(lease.Target, s.mounter.sameCacheSource)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "inspect degraded cache mount: %v", err)
+			}
+			if degraded {
+				return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
 			}
 		}
 		same, err = s.mounter.sameCacheSource(source, lease.Target)

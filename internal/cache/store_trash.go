@@ -61,10 +61,10 @@ func (s *Store) cleanupTrashBatch() error {
 
 func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]struct{}, error) {
 	// detach処理と同じmutex下でsnapshotし、作成途中のtrash entryを削除対象に含めない。
-	s.mu.Lock()
+	s.trashMu.Lock()
 	entries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
 	if err != nil {
-		s.mu.Unlock()
+		s.trashMu.Unlock()
 		return nil, err
 	}
 	trashIDs := make([]string, 0, min(len(entries), trashBatchSize))
@@ -84,7 +84,7 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 			s.trashCursor = trashIDs[len(trashIDs)-1]
 		}
 	}
-	s.mu.Unlock()
+	s.trashMu.Unlock()
 
 	attempted := make(map[string]struct{}, len(trashIDs))
 	var cleanupErr error
@@ -94,6 +94,7 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue
 		}
+		s.projectRegistryMu.Lock()
 		s.mu.Lock()
 		s.trashDeleted++
 		reservationsBeforeCleanup := make(map[uint32][]projectReservation, len(s.projectReservations))
@@ -134,14 +135,17 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 				s.projectRegistryDirty = true
 			}
 		}
-		if err := s.persistProjectReservations(); err != nil {
+		s.mu.Unlock()
+		if err := s.persistProjectReservationsLocked(); err != nil {
+			s.mu.Lock()
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("persist project ID registry after trash cleanup: %w", err))
 			s.projectReservations = reservationsBeforeCleanup
 			s.unknownProjectReservations = unknownReservationsBeforeCleanup
 			s.rebuildProjectReservationIndexes()
 			s.projectRegistryDirty = true
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
+		s.projectRegistryMu.Unlock()
 	}
 	return attempted, cleanupErr
 }
@@ -176,6 +180,8 @@ func (s *Store) cleanupTrashUntilAttempted(ctx context.Context, attempted map[st
 }
 
 func (s *Store) detachToTrash(path string) error {
+	s.trashMu.Lock()
+	defer s.trashMu.Unlock()
 	relative, err := s.relative(path)
 	if err != nil {
 		return err
@@ -203,7 +209,9 @@ func (s *Store) detachToTrash(path string) error {
 		return err
 	}
 	if isObject {
+		s.mu.Lock()
 		s.indexObjectInTrash(identity, trashID, meta)
+		s.mu.Unlock()
 	}
 	return errors.Join(s.syncDirectory(filepath.Dir(path)), s.syncDirectory(filepath.Join(s.root, trashDirectoryName)))
 }
@@ -242,6 +250,9 @@ func (s *Store) unmountGenerationMounts(path string) error {
 }
 
 func (s *Store) reserveObjectForTrash(identity, trashID string, meta Metadata) error {
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
+	s.mu.Lock()
 	for projectID, reservations := range s.projectReservations {
 		for index, reservation := range reservations {
 			if reservation.Identity == identity && reservation.TrashID != trashID {
@@ -255,13 +266,17 @@ func (s *Store) reserveObjectForTrash(identity, trashID string, meta Metadata) e
 	if _, damaged := s.degraded[identity]; damaged || meta.Identity != identity {
 		s.addUnknownProjectReservation(identity, trashID)
 	}
-	if err := s.persistProjectReservations(); err != nil {
+	s.mu.Unlock()
+	if err := s.persistProjectReservationsLocked(); err != nil {
 		return fmt.Errorf("persist project ID reservation before cache quarantine: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) restoreObjectTrashReservation(identity, trashID string) error {
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
+	s.mu.Lock()
 	for projectID, reservations := range s.projectReservations {
 		for index, reservation := range reservations {
 			if reservation.Identity == identity && reservation.TrashID == trashID {
@@ -275,7 +290,8 @@ func (s *Store) restoreObjectTrashReservation(identity, trashID string) error {
 	if s.unknownProjectReservations[identity] == trashID {
 		s.addUnknownProjectReservation(identity, "")
 	}
-	if err := s.persistProjectReservations(); err != nil {
+	s.mu.Unlock()
+	if err := s.persistProjectReservationsLocked(); err != nil {
 		return fmt.Errorf("restore project ID reservation after failed cache quarantine: %w", err)
 	}
 	return nil
@@ -309,6 +325,8 @@ func (s *Store) syncDirectory(path string) error {
 }
 
 func (s *Store) detachGenerationToTrash(path string, identity string, retired RetiredGeneration) error {
+	s.trashMu.Lock()
+	defer s.trashMu.Unlock()
 	if err := s.stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
@@ -322,12 +340,17 @@ func (s *Store) detachGenerationToTrash(path string, identity string, retired Re
 	var previous projectReservation
 	var hadPrevious bool
 	if retired.ProjectID != 0 {
-		previous, hadPrevious = s.projectReservation(retired.ProjectID, identity, retired.Generation)
+		s.projectRegistryMu.Lock()
+		s.mu.Lock()
+		previous, hadPrevious = s.projectReservationLocked(retired.ProjectID, identity, retired.Generation)
 		s.addProjectReservation(retired.ProjectID, projectReservation{Identity: identity, Generation: retired.Generation, TrashID: trashID})
-		if err := s.persistProjectReservations(); err != nil {
-			restoreErr := s.restoreProjectReservation(retired.ProjectID, identity, retired.Generation, previous, hadPrevious)
+		s.mu.Unlock()
+		if err := s.persistProjectReservationsLocked(); err != nil {
+			restoreErr := s.restoreProjectReservationLocked(retired.ProjectID, identity, retired.Generation, previous, hadPrevious)
+			s.projectRegistryMu.Unlock()
 			return errors.Join(fmt.Errorf("persist project ID reservation before retired generation detach: %w", err), restoreErr)
 		}
+		s.projectRegistryMu.Unlock()
 	}
 	if err := s.ensureDirectory(trashPath); err != nil {
 		return errors.Join(err, s.restoreProjectReservation(retired.ProjectID, identity, retired.Generation, previous, hadPrevious))

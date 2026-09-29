@@ -52,14 +52,10 @@ func fallbackCauseForError(err error, backendReason string) (fallbackCause, bool
 }
 
 func fallbackCauseForResolution(err error) fallbackCause {
-	switch {
-	case errors.Is(err, kube.ErrResolverNotSynced):
+	if errors.Is(err, kube.ErrResolverNotSynced) {
 		return expectedFallbackCause("resolver_not_synced")
-	case errors.Is(err, kube.ErrServiceAccountNotCached):
-		return expectedFallbackCause("service_account_not_cached")
-	default:
-		return expectedFallbackCause("api_unavailable")
 	}
+	return expectedFallbackCause("api_unavailable")
 }
 
 func (s *Server) useFallback(ctx context.Context, req *csi.NodePublishVolumeRequest, requestedBytes int64, noExec bool, pressurePolicy string, cause fallbackCause, trigger error) error {

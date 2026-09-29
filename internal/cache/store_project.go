@@ -43,23 +43,33 @@ type unknownProjectReservation struct {
 }
 
 func (s *Store) loadProjectRegistry() bool {
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
 	data, err := s.rootFS.ReadFile(projectRegistryName)
 	if errors.Is(err, os.ErrNotExist) {
 		return true
 	}
 	if err != nil {
+		s.mu.Lock()
 		s.projectRegistryDamaged = true
+		s.mu.Unlock()
 		return false
 	}
 	var document projectReservationDocument
 	if err := json.Unmarshal(data, &document); err != nil {
+		s.mu.Lock()
 		s.projectRegistryDamaged = true
+		s.mu.Unlock()
 		return false
 	}
 	if document.FormatVersion != 0 && document.FormatVersion != storeFormatVersion {
+		s.mu.Lock()
 		s.projectRegistryDamaged = true
+		s.mu.Unlock()
 		return false
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, item := range document.Reservations {
 		if item.ProjectID == 0 || !validIdentity(item.Identity) || item.Generation == "" {
 			s.projectRegistryDamaged = true
@@ -92,6 +102,9 @@ func (s *Store) reconcileProjectReservations(entries, trashEntries []os.DirEntry
 		}
 	}
 
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
+	s.mu.Lock()
 	for projectID, reservations := range s.projectReservations {
 		kept := make([]projectReservation, 0, len(reservations))
 		for _, reservation := range reservations {
@@ -133,7 +146,8 @@ func (s *Store) reconcileProjectReservations(entries, trashEntries []os.DirEntry
 	for _, meta := range s.metadataByIdentity {
 		s.addMetadataReservations(meta, "")
 	}
-	if err := s.persistProjectReservations(); err != nil {
+	s.mu.Unlock()
+	if err := s.persistProjectReservationsLocked(); err != nil {
 		return fmt.Errorf("persist rebuilt project ID registry: %w", err)
 	}
 	return nil
@@ -293,7 +307,15 @@ func (s *Store) addUnknownProjectReservation(identity, trashID string) {
 }
 
 func (s *Store) persistProjectReservations() error {
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
+	return s.persistProjectReservationsLocked()
+}
+
+func (s *Store) persistProjectReservationsLocked() error {
+	s.mu.Lock()
 	if s.projectRegistryDamaged || !s.projectRegistryDirty {
+		s.mu.Unlock()
 		return nil
 	}
 	reservations := make([]projectIDReservation, 0)
@@ -306,6 +328,7 @@ func (s *Store) persistProjectReservations() error {
 	for identity, trashID := range s.unknownProjectReservations {
 		unknownReservations = append(unknownReservations, unknownProjectReservation{Identity: identity, TrashID: trashID})
 	}
+	s.mu.Unlock()
 	sort.Slice(unknownReservations, func(i, j int) bool { return unknownReservations[i].Identity < unknownReservations[j].Identity })
 	sort.Slice(reservations, func(i, j int) bool {
 		if reservations[i].ProjectID == reservations[j].ProjectID {
@@ -359,11 +382,19 @@ func (s *Store) persistProjectReservations() error {
 	if closeErr != nil {
 		return closeErr
 	}
+	s.mu.Lock()
 	s.projectRegistryDirty = false
+	s.mu.Unlock()
 	return nil
 }
 
 func (s *Store) projectReservation(projectID uint32, identity, generation string) (projectReservation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.projectReservationLocked(projectID, identity, generation)
+}
+
+func (s *Store) projectReservationLocked(projectID uint32, identity, generation string) (projectReservation, bool) {
 	for _, reservation := range s.projectReservations[projectID] {
 		if reservation.Identity == identity && reservation.Generation == generation {
 			return reservation, true
@@ -376,6 +407,13 @@ func (s *Store) restoreProjectReservation(projectID uint32, identity, generation
 	if projectID == 0 {
 		return nil
 	}
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
+	return s.restoreProjectReservationLocked(projectID, identity, generation, previous, hadPrevious)
+}
+
+func (s *Store) restoreProjectReservationLocked(projectID uint32, identity, generation string, previous projectReservation, hadPrevious bool) error {
+	s.mu.Lock()
 	reservations := s.projectReservations[projectID]
 	index := slices.IndexFunc(reservations, func(reservation projectReservation) bool {
 		return reservation.Identity == identity && reservation.Generation == generation
@@ -401,38 +439,56 @@ func (s *Store) restoreProjectReservation(projectID uint32, identity, generation
 		}
 	}
 	s.rebuildProjectReservationIndexes()
-	if err := s.persistProjectReservations(); err != nil {
+	s.mu.Unlock()
+	if err := s.persistProjectReservationsLocked(); err != nil {
 		return fmt.Errorf("restore project ID reservation after failed retired generation detach: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) projectIDLocked(identity, generation string) (uint32, error) {
+
+func (s *Store) projectID(identity, generation string) (uint32, error) {
+	s.projectRegistryMu.Lock()
+	defer s.projectRegistryMu.Unlock()
+
+	s.mu.Lock()
 	if s.projectRegistryDamaged {
+		s.mu.Unlock()
 		return 0, errors.New("project ID allocation is disabled because the reservation registry is damaged")
 	}
 	if len(s.unknownProjectReservations) > 0 {
+		s.mu.Unlock()
 		return 0, errors.New("project ID allocation is unavailable while damaged cache projects are quarantined")
 	}
-	if s.projectRegistryDirty {
-		if err := s.persistProjectReservations(); err != nil {
+	dirty := s.projectRegistryDirty
+	s.mu.Unlock()
+	if dirty {
+		if err := s.persistProjectReservationsLocked(); err != nil {
 			return 0, fmt.Errorf("persist pending project ID registry update: %w", err)
 		}
+	}
+	key := projectReservationKey{identity: identity, generation: generation}
+	s.mu.Lock()
+	existingProjectID, hasReservation := s.projectIDByGeneration[key]
+	s.mu.Unlock()
+	if hasReservation {
+		return existingProjectID, nil
 	}
 	hash, _ := hex.DecodeString(identity[:8])
 	hashValue := uint32(hash[0])<<24 | uint32(hash[1])<<16 | uint32(hash[2])<<8 | uint32(hash[3])
 	offset := hashValue % s.projectIDCount
 	projectID := s.projectIDStart + offset
 	for range s.projectIDCount {
+		s.mu.Lock()
 		if _, exists := s.projectReservations[projectID]; !exists {
-			previous, hadPrevious := s.projectReservation(projectID, identity, generation)
 			s.addProjectReservation(projectID, projectReservation{Identity: identity, Generation: generation})
-			if err := s.persistProjectReservations(); err != nil {
-				restoreErr := s.restoreProjectReservation(projectID, identity, generation, previous, hadPrevious)
-				return 0, errors.Join(fmt.Errorf("reserve XFS project ID: %w", err), restoreErr)
+			s.mu.Unlock()
+			if err := s.persistProjectReservationsLocked(); err != nil {
+				return 0, fmt.Errorf("reserve XFS project ID: %w", err)
 			}
 			return projectID, nil
 		}
+		s.mu.Unlock()
 		offset = (offset + 1) % s.projectIDCount
 		projectID = s.projectIDStart + offset
 	}
