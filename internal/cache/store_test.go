@@ -81,6 +81,140 @@ func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 	}
 }
 
+func TestFallbackObjectIsExclusiveAndDiscardedAfterLastRelease(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(t.TempDir(), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	identity, err := FallbackIdentity("fallback-volume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherIdentity, err := FallbackIdentity("other-fallback-volume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity == otherIdentity {
+		t.Fatal("different fallback volume IDs share an identity")
+	}
+	policy := Policy{SharingPolicy: SharingPolicyExclusive, DiscardOnLastRelease: true, NoExec: true}
+	target := filepath.Join(t.TempDir(), "mount")
+	lease := Lease{ID: "fallback-volume", Target: target, NoExec: true}
+	source, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "private"), []byte("fallback data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "second-fallback-lease", Target: filepath.Join(t.TempDir(), "second")},
+		Policy:   policy,
+	}); !errors.Is(err, ErrExclusivePolicyConflict) {
+		t.Fatalf("second lease error = %v, want exclusive policy conflict", err)
+	}
+	if err := store.Release(lease.ID, lease.Target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released fallback object remains in the object namespace: %v", err)
+	}
+	if _, found, err := store.ReleaseTarget(lease.ID); err != nil || found {
+		t.Fatalf("released fallback lease found = %t, error = %v", found, err)
+	}
+	newSource, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSource == source {
+		t.Fatal("fallback object reused the generation from the previous volume lifecycle")
+	}
+	if _, err := os.Stat(filepath.Join(newSource, "private")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("previous fallback data is visible after a new lifecycle: %v", err)
+	}
+}
+
+func TestFallbackRecoveryDiscardsUnmountedOrphan(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := NewStore(root, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := FallbackIdentity("fallback-orphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := Policy{SharingPolicy: SharingPolicyExclusive, DiscardOnLastRelease: true, NoExec: true}
+	lease := Lease{ID: "fallback-orphan", Target: filepath.Join(t.TempDir(), "mount"), NoExec: true}
+	if _, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: lease, Policy: policy}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewStore(root, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := recovered.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := recovered.RecoverLeases(func(source string, recoveredLease Lease, recoveredPolicy Policy) (bool, error) {
+		if source != filepath.Join(root, identity, "generations", recoveredLease.Generation) || recoveredLease.ID != lease.ID || recoveredPolicy != policy {
+			t.Errorf("recovery verifier arguments = (%q, %+v, %+v)", source, recoveredLease, recoveredPolicy)
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, identity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unmounted fallback orphan remains after recovery: %v", err)
+	}
+}
+
+func TestCollectsCacheWithZeroRetentionOnNextScan(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(t.TempDir(), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	identity := stableIdentity("zero-retention")
+	target := filepath.Join(t.TempDir(), "mount")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "zero-retention", Target: target},
+		Policy:   Policy{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Release("zero-retention", target); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Collect(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("zero-retention cache remains after the next scan: %v", err)
+	}
+}
+
 func TestAcquireRejectsQuotaChangeWhileGenerationIsActive(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})

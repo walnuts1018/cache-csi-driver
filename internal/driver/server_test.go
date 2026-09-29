@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,7 +14,9 @@ import (
 	"github.com/walnuts1018/cache-csi-driver/internal/kube"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 const (
@@ -109,6 +112,9 @@ func TestNodePublishRollsBackLeaseWhenQuotaConfigurationFails(t *testing.T) {
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(request.GetVolumeId()); leaseErr != nil || found {
 		t.Fatalf("cache lease found = %t, error = %v; want the failed lease rolled back", found, leaseErr)
 	}
+	if _, _, _, _, found, leaseErr := server.fallbackStore.LeaseDetails(request.GetVolumeId()); leaseErr != nil || found {
+		t.Fatalf("fallback lease found = %t, error = %v; quota failure must not create fallback state", found, leaseErr)
+	}
 	if mounts.mountCalls != 0 {
 		t.Fatalf("mount calls = %d, want 0 after quota failure", mounts.mountCalls)
 	}
@@ -133,25 +139,110 @@ func TestNodePublishRollsBackLeaseWhenDetachedMountSetupFails(t *testing.T) {
 	}
 }
 
-func TestNodePublishMapsExclusiveSharingConflictToFailedPrecondition(t *testing.T) {
+func TestNodePublishUsesFallbackForExclusiveSharingConflict(t *testing.T) {
 	t.Parallel()
 
-	server, _, store := newTestServer(t, cachev1alpha1.CacheClassSpec{SharingPolicy: cachev1alpha1.SharingPolicyExclusive}, nil)
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{SharingPolicy: cachev1alpha1.SharingPolicyExclusive, EvictRunning: true}, nil)
 	first := newPublishRequest(t, server.options.KubeletRoot, "exclusive-first")
 	if _, err := server.NodePublishVolume(t.Context(), first); err != nil {
 		t.Fatal(err)
 	}
 	second := newPublishRequest(t, server.options.KubeletRoot, "exclusive-second")
 
-	_, err := server.NodePublishVolume(t.Context(), second)
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("second publish error = %v, want FailedPrecondition", err)
+	if _, err := server.NodePublishVolume(t.Context(), second); err != nil {
+		t.Fatalf("publish with conflicting shared identity: %v", err)
 	}
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(first.GetVolumeId()); leaseErr != nil || !found {
 		t.Fatalf("first cache lease found = %t, error = %v; want the active lease preserved", found, leaseErr)
 	}
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(second.GetVolumeId()); leaseErr != nil || found {
-		t.Fatalf("second cache lease found = %t, error = %v; want the conflicting lease absent", found, leaseErr)
+		t.Fatalf("second cache lease found = %t, error = %v; want the conflicting lease absent from the shared cache", found, leaseErr)
+	}
+	if _, _, source, policy, found, err := server.fallbackStore.LeaseDetails(second.GetVolumeId()); err != nil || !found {
+		t.Fatalf("fallback lease found = %t, error = %v; want an isolated fallback lease", found, err)
+	} else if !policy.EvictRunning || !policy.NoExec {
+		t.Fatalf("fallback policy = %+v, want evictRunning and noexec preserved", policy)
+	} else if mounts.mounts[second.GetTargetPath()].source != source {
+		t.Fatalf("second target source = %q, want fallback source %q", mounts.mounts[second.GetTargetPath()].source, source)
+	}
+}
+
+func TestNodePublishUsesFallbackForDegradedMetadataWithoutQuota(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request := newPublishRequest(t, server.options.KubeletRoot, "degraded-unmounted-volume")
+	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.Acquire(cache.AcquireOptions{
+		Identity: identity,
+		Lease: cache.Lease{
+			ID:        request.GetVolumeId(),
+			Target:    request.GetTargetPath(),
+			Namespace: testDefault,
+			PodName:   testPodName,
+			PodUID:    testPodUID,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.Root(), identity, ".cache-csi.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatalf("publish after local metadata corruption: %v", err)
+	}
+	if _, _, source, policy, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId()); err != nil || !found {
+		t.Fatalf("fallback lease found = %t, error = %v; want an isolated fallback lease", found, err)
+	} else if !policy.NoExec || mounts.mounts[request.GetTargetPath()].source != source {
+		t.Fatalf("fallback mount source or policy = %q, %+v; want a noexec isolated cache", mounts.mounts[request.GetTargetPath()].source, policy)
+	}
+}
+
+func TestNodePublishKeepsVerifiedDegradedMountAvailable(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	volumeName := "degraded-active-volume"
+	unpublishRequest, _, _ := prepareDamagedMountedCache(t, server, mounts, store, volumeName)
+	request := newPublishRequest(t, server.options.KubeletRoot, volumeName)
+	request.VolumeId = unpublishRequest.GetVolumeId()
+
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatalf("idempotent publish for verified degraded mount: %v", err)
+	}
+	if mounts.mountCalls != 0 {
+		t.Fatalf("mount calls = %d, want no replacement mount", mounts.mountCalls)
+	}
+}
+
+func TestNodePublishKeepsQuotaIdentityConflictHard(t *testing.T) {
+	t.Parallel()
+
+	spec := cachev1alpha1.CacheClassSpec{
+		Backend:       cachev1alpha1.BackendXFSProject,
+		SharingPolicy: cachev1alpha1.SharingPolicyExclusive,
+		Quota: cachev1alpha1.QuotaPolicy{
+			Enabled:         true,
+			DefaultMaxBytes: resource.MustParse("1Mi"),
+		},
+	}
+	server, _, _ := newTestServer(t, spec, nil)
+	server.quota = &testQuota{}
+	first := newPublishRequest(t, server.options.KubeletRoot, "quota-exclusive-first")
+	if _, err := server.NodePublishVolume(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := newPublishRequest(t, server.options.KubeletRoot, "quota-exclusive-second")
+	if _, err := server.NodePublishVolume(t.Context(), second); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("second publish error = %v, want FailedPrecondition", err)
+	}
+	if _, _, _, _, found, err := server.fallbackStore.LeaseDetails(second.GetVolumeId()); err != nil || found {
+		t.Fatalf("fallback lease found = %t, error = %v; quota policy must not be bypassed", found, err)
 	}
 }
 
@@ -216,6 +307,23 @@ func TestResolverUnavailablePublishesRestrictedFallbackAndUnpublishes(t *testing
 	if !mounted || !state.readOnly || !state.noExec {
 		t.Fatalf("published mount = %+v, present=%t; want readonly and noexec", state, mounted)
 	}
+	identity, err := cache.FallbackIdentity(request.GetVolumeId())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, lease, source, policy, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId())
+	if err != nil || !found {
+		t.Fatalf("fallback lease found = %t, error = %v", found, err)
+	}
+	if lease.Target != request.GetTargetPath() || !lease.NoExec || !lease.ReadOnly || policy.SharingPolicy != cache.SharingPolicyExclusive || !policy.DiscardOnLastRelease {
+		t.Fatalf("fallback lease policy = (%+v, %+v), identity = %s", lease, policy, identity)
+	}
+	if filepath.Dir(filepath.Dir(filepath.Dir(source))) != server.fallbackStore.Root() {
+		t.Fatalf("fallback source %q is outside fallback Store root %q", source, server.fallbackStore.Root())
+	}
+	if err := os.WriteFile(filepath.Join(source, "private"), []byte("fallback data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := server.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
 		VolumeId:   request.GetVolumeId(),
@@ -225,6 +333,86 @@ func TestResolverUnavailablePublishesRestrictedFallbackAndUnpublishes(t *testing
 	}
 	if _, mounted := mounts.mounts[request.GetTargetPath()]; mounted {
 		t.Fatal("mount remains after cleanup")
+	}
+	if _, err := os.Stat(filepath.Join(server.fallbackStore.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fallback object remains in the object namespace after unpublish: %v", err)
+	}
+	if _, _, _, _, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId()); err != nil || found {
+		t.Fatalf("fallback lease after unpublish found = %t, error = %v", found, err)
+	}
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatalf("republish fallback volume: %v", err)
+	}
+	_, _, newSource, _, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId())
+	if err != nil || !found {
+		t.Fatalf("republished fallback lease found = %t, error = %v", found, err)
+	}
+	if newSource == source {
+		t.Fatal("fallback republish reused the prior generation")
+	}
+	if _, err := os.Stat(filepath.Join(newSource, "private")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("data from the previous fallback lifecycle is visible after republish: %v", err)
+	}
+}
+
+func TestFallbackRejectsHardResolutionErrorsLimitsAndCancellation(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		resolver   ClassResolver
+		maxBytes   string
+		cancel     bool
+		wantStatus codes.Code
+	}{
+		{
+			name:       "CacheClass not found",
+			resolver:   &testResolver{err: apierrors.NewNotFound(schema.GroupResource{Resource: "cacheclasses"}, testDefault)},
+			wantStatus: codes.FailedPrecondition,
+		},
+		{
+			name:       "CacheClass forbidden",
+			resolver:   &testResolver{err: apierrors.NewForbidden(schema.GroupResource{Resource: "cacheclasses"}, testDefault, errors.New("denied"))},
+			wantStatus: codes.FailedPrecondition,
+		},
+		{
+			name:       "maxBytes has no resolved quota policy",
+			resolver:   nil,
+			maxBytes:   "1Mi",
+			wantStatus: codes.FailedPrecondition,
+		},
+		{
+			name:       "cancelled request",
+			resolver:   nil,
+			cancel:     true,
+			wantStatus: codes.Canceled,
+		},
+	}
+	for index, test := range cases {
+		server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+		server.resolver = test.resolver
+		volumeID := fmt.Sprintf("fallback-rejected-%d", index)
+		request := newPublishRequest(t, server.options.KubeletRoot, volumeID)
+		if test.maxBytes != "" {
+			request.VolumeContext["maxBytes"] = test.maxBytes
+		}
+		ctx := t.Context()
+		if test.cancel {
+			cancelled, cancel := context.WithCancel(ctx)
+			cancel()
+			ctx = cancelled
+		}
+		_, err := server.NodePublishVolume(ctx, request)
+		if got := status.Code(err); got != test.wantStatus {
+			t.Errorf("%s: publish status = %s, want %s (error: %v)", test.name, got, test.wantStatus, err)
+		}
+		identity, err := cache.FallbackIdentity(volumeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(server.fallbackStore.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s: fallback object was created: %v", test.name, err)
+		}
 	}
 }
 
@@ -488,11 +676,26 @@ func TestPolicyForMapsSharingPolicy(t *testing.T) {
 	}
 }
 
+func TestPolicyForPreservesZeroRetention(t *testing.T) {
+	t.Parallel()
+	policy, err := policyFor(cachev1alpha1.CacheClassSpec{}, testDefault, "class-uid", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Retention != 0 {
+		t.Fatalf("zero retention was replaced with %s", policy.Retention)
+	}
+}
+
 type testResolver struct {
 	spec cachev1alpha1.CacheClassSpec
+	err  error
 }
 
 func (resolver *testResolver) Resolve(context.Context, string, string) (string, kube.ResolvedClass, error) {
+	if resolver.err != nil {
+		return "", kube.ResolvedClass{}, resolver.err
+	}
 	return "namespace-uid", kube.ResolvedClass{
 		Object: cachev1alpha1.CacheClass{Spec: resolver.spec},
 		UID:    "class-uid",
@@ -546,14 +749,24 @@ func newTestServer(t *testing.T, spec cachev1alpha1.CacheClassSpec, quotaError e
 			t.Error(err)
 		}
 	})
+	fallbackStore, err := cache.NewStore(filepath.Join(root, "fallback"), cache.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fallbackStore.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	resolver := &testResolver{spec: spec}
 	var quota ProjectQuota
 	if quotaError != nil {
 		quota = &testQuota{err: quotaError}
 	}
 	server := New(store, resolver, quota, Options{
-		KubeletRoot:  filepath.Join(root, "kubelet"),
-		FallbackRoot: filepath.Join(root, "fallback"),
+		KubeletRoot:   filepath.Join(root, "kubelet"),
+		FallbackRoot:  filepath.Join(root, "fallback"),
+		FallbackStore: fallbackStore,
 	})
 	mounts := &testMounter{mounts: make(map[string]testMount)}
 	server.mounter = mounts

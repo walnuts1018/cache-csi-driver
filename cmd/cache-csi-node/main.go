@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/walnuts1018/cache-csi-driver/internal/manager"
 	"github.com/walnuts1018/cache-csi-driver/internal/quota"
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -42,6 +45,7 @@ func run(logger *slog.Logger) error {
 	endpoint := flag.String("endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint")
 	cacheRoot := flag.String("cache-root", "/var/lib/cache-csi", "cache storage directory")
 	fallbackRoot := flag.String("fallback-root", "/run/cache-csi/fallback", "temporary cache directory used when Kubernetes API resolution fails")
+	fallbackMaxBytes := flag.String("fallback-max-bytes", "1Gi", "maximum total size of the fallback tmpfs filesystem")
 	nodeID := flag.String("node-id", os.Getenv("NODE_NAME"), "Kubernetes node name")
 	kubeletRoot := flag.String("kubelet-root", "/var/lib/kubelet", "kubelet root directory")
 	gcInterval := flag.Duration("gc-interval", 30*time.Second, "cache garbage collection interval")
@@ -62,10 +66,6 @@ func run(logger *slog.Logger) error {
 	if *nodeID == "" {
 		return fmt.Errorf("node ID must be configured")
 	}
-	socketPath, err := parseEndpoint(*endpoint)
-	if err != nil {
-		return err
-	}
 	for _, item := range []struct{ name, path string }{
 		{name: "cache root", path: *cacheRoot},
 		{name: "fallback root", path: *fallbackRoot},
@@ -75,14 +75,41 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("%s must be an absolute path", item.name)
 		}
 	}
+	fallbackSize, err := fallbackFilesystemSize(*fallbackMaxBytes)
+	if err != nil {
+		return err
+	}
+	canonicalCacheRoot, err := canonicalPath(*cacheRoot)
+	if err != nil {
+		return fmt.Errorf("resolve cache root: %w", err)
+	}
+	canonicalFallbackRoot, err := canonicalPath(*fallbackRoot)
+	if err != nil {
+		return fmt.Errorf("resolve fallback root: %w", err)
+	}
+	canonicalKubeletRoot, err := canonicalPath(*kubeletRoot)
+	if err != nil {
+		return fmt.Errorf("resolve kubelet root: %w", err)
+	}
+	if pathsOverlap(canonicalCacheRoot, canonicalFallbackRoot) || pathsOverlap(canonicalKubeletRoot, canonicalFallbackRoot) {
+		return fmt.Errorf("fallback root must not overlap the cache root or kubelet root")
+	}
+	socketPath, err := parseEndpoint(*endpoint)
+	if err != nil {
+		return err
+	}
+	if err := mountFallbackTmpfs(*fallbackRoot, fallbackSize); err != nil {
+		return fmt.Errorf("prepare bounded fallback filesystem: %w", err)
+	}
 
+	pressure := cache.PressureConfig{
+		HighFreePercent:      *highFreePercent,
+		LowFreePercent:       *lowFreePercent,
+		HighInodeFreePercent: *highInodeFreePercent,
+		LowInodeFreePercent:  *lowInodeFreePercent,
+	}
 	store, err := cache.NewStore(*cacheRoot, cache.StoreOptions{
-		Pressure: cache.PressureConfig{
-			HighFreePercent:      *highFreePercent,
-			LowFreePercent:       *lowFreePercent,
-			HighInodeFreePercent: *highInodeFreePercent,
-			LowInodeFreePercent:  *lowInodeFreePercent,
-		},
+		Pressure:       pressure,
 		ProjectIDStart: uint32(*projectIDStart),
 		ProjectIDCount: uint32(*projectIDCount),
 	})
@@ -90,12 +117,18 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("initialize cache store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	fallbackStore, err := cache.NewStore(*fallbackRoot, cache.StoreOptions{Pressure: pressure})
+	if err != nil {
+		return fmt.Errorf("initialize fallback cache store: %w", errors.Join(err, store.Close()))
+	}
+	defer func() { _ = fallbackStore.Close() }()
 	client, resolver := kubernetesClients(logger)
 	cacheManager := manager.New(store, manager.Options{
-		Interval:     *gcInterval,
-		Client:       client,
-		InspectMount: driver.VerifyCacheMount,
-		Logger:       logger,
+		Interval:      *gcInterval,
+		Client:        client,
+		InspectMount:  driver.VerifyCacheMount,
+		FallbackStore: fallbackStore,
+		Logger:        logger,
 	})
 	if err := cacheManager.Recover(); err != nil {
 		return err
@@ -108,6 +141,7 @@ func run(logger *slog.Logger) error {
 		NodeID:        *nodeID,
 		KubeletRoot:   *kubeletRoot,
 		FallbackRoot:  *fallbackRoot,
+		FallbackStore: fallbackStore,
 		VendorVersion: version,
 	})
 	grpcServer := grpc.NewServer()
@@ -161,6 +195,53 @@ func run(logger *slog.Logger) error {
 	}
 	<-managerDone
 	return nil
+}
+
+func fallbackFilesystemSize(value string) (int64, error) {
+	quantity, err := resource.ParseQuantity(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse fallback maximum size: %w", err)
+	}
+	size := quantity.Value()
+	if size <= 0 {
+		return 0, fmt.Errorf("fallback maximum size must be positive")
+	}
+	return size, nil
+}
+
+func pathsOverlap(left, right string) bool {
+	return pathWithin(left, right) || pathWithin(right, left)
+}
+
+func pathWithin(base, candidate string) bool {
+	relative, err := filepath.Rel(base, candidate)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
+func canonicalPath(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	path = filepath.Clean(path)
+	missing := make([]string, 0)
+	for current := path; ; current = filepath.Dir(current) {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for _, component := range slices.Backward(missing) {
+				resolved = filepath.Join(resolved, component)
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(current))
+	}
 }
 
 func kubernetesClients(logger *slog.Logger) (kubernetes.Interface, driver.ClassResolver) {

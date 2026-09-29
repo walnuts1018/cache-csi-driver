@@ -80,3 +80,56 @@ func TestPressureReclaimsRuntimeDegradedCacheWithoutKubernetesClient(t *testing.
 		t.Fatalf("trash entries after pressure tick = %d, want 0", len(trash))
 	}
 }
+
+func TestRecoverIncludesFallbackStore(t *testing.T) {
+	t.Parallel()
+	mainStore, err := cache.NewStore(filepath.Join(t.TempDir(), "cache"), cache.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := mainStore.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	fallbackRoot := filepath.Join(t.TempDir(), "fallback")
+	fallbackStore, err := cache.NewStore(fallbackRoot, cache.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := cache.FallbackIdentity("fallback-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := cache.Policy{SharingPolicy: cache.SharingPolicyExclusive, DiscardOnLastRelease: true, NoExec: true}
+	lease := cache.Lease{ID: "fallback-recovery", Target: filepath.Join(t.TempDir(), "mount"), NoExec: true}
+	if _, _, err := fallbackStore.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fallbackStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fallbackStore, err = cache.NewStore(fallbackRoot, cache.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fallbackStore.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	manager := New(mainStore, Options{
+		FallbackStore: fallbackStore,
+		InspectMount: func(string, cache.Lease, cache.Policy) (bool, error) {
+			return false, nil
+		},
+	})
+	if err := manager.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(fallbackRoot, identity)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unmounted fallback object remains after manager recovery: %v", err)
+	}
+}

@@ -10,6 +10,7 @@ fullnameOverride: ""
 driverName: cache.csi.walnuts.dev
 cacheRootDir: /var/lib/cache-csi
 fallbackRootDir: /run/cache-csi/fallback
+fallbackMaxBytes: 1Gi
 kubeletRootDir: /var/lib/kubelet
 gcInterval: 30s
 pressure:

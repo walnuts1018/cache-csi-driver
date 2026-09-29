@@ -23,11 +23,12 @@ type Options struct {
 	PressureInterval time.Duration
 	Client           kubernetes.Interface
 	InspectMount     MountInspector
+	FallbackStore    *cache.Store
 	Logger           *slog.Logger
 }
 
 type Manager struct {
-	store            *cache.Store
+	stores           []*cache.Store
 	interval         time.Duration
 	pressureInterval time.Duration
 	client           kubernetes.Interface
@@ -45,8 +46,12 @@ func New(store *cache.Store, options Options) *Manager {
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
+	stores := []*cache.Store{store}
+	if options.FallbackStore != nil && options.FallbackStore != store {
+		stores = append(stores, options.FallbackStore)
+	}
 	return &Manager{
-		store:            store,
+		stores:           stores,
 		interval:         options.Interval,
 		pressureInterval: options.PressureInterval,
 		client:           options.Client,
@@ -59,8 +64,10 @@ func (m *Manager) Recover() error {
 	if m.inspectMount == nil {
 		return errors.New("mount inspector is not configured")
 	}
-	if err := m.store.RecoverLeases(m.inspectMount); err != nil {
-		return fmt.Errorf("recover cache leases: %w", err)
+	for _, store := range m.stores {
+		if err := store.RecoverLeases(m.inspectMount); err != nil {
+			return fmt.Errorf("recover cache leases under %s: %w", store.Root(), err)
+		}
 	}
 	return nil
 }
@@ -88,13 +95,14 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) collect(ctx context.Context, now time.Time) {
-	if err := m.store.Collect(now); err != nil {
-		m.logger.ErrorContext(ctx, "cache collection failed", "error", err)
-		return
-	}
-	if err := m.store.CleanupTrash(ctx); err != nil {
-		m.logger.ErrorContext(ctx, "cache trash cleanup failed", "error", err)
-		return
+	for _, store := range m.stores {
+		if err := store.Collect(now); err != nil {
+			m.logger.ErrorContext(ctx, "cache collection failed", "root", store.Root(), "error", err)
+			continue
+		}
+		if err := store.CleanupTrash(ctx); err != nil {
+			m.logger.ErrorContext(ctx, "cache trash cleanup failed", "root", store.Root(), "error", err)
+		}
 	}
 }
 
@@ -102,38 +110,43 @@ func (m *Manager) pressure(ctx context.Context) {
 	if err := ctx.Err(); err != nil {
 		return
 	}
-	if m.inspectMount != nil {
-		if err := m.store.RecoverDegraded(ctx, m.inspectMount); err != nil {
+	for _, store := range m.stores {
+		if m.inspectMount != nil {
+			if err := store.RecoverDegraded(ctx, m.inspectMount); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
+				}
+				m.logger.WarnContext(ctx, "degraded cache recovery was incomplete", "root", store.Root(), "error", err)
+			}
+		}
+		if err := store.CleanupTrash(ctx); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			m.logger.WarnContext(ctx, "degraded cache recovery was incomplete", "error", err)
+			m.logger.WarnContext(ctx, "cache trash cleanup failed during pressure check", "root", store.Root(), "error", err)
 		}
-	}
-	if err := m.store.CleanupTrash(ctx); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return
-		}
-		m.logger.WarnContext(ctx, "cache trash cleanup failed during pressure check", "error", err)
-	}
-	if err := m.store.ReclaimPressure(ctx); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return
-		}
-		if errors.Is(err, cache.ErrPressureReclaimIncomplete) {
-			m.logger.WarnContext(ctx, "cache pressure reclaim was incomplete", "error", err)
-		} else {
-			m.logger.ErrorContext(ctx, "cache pressure reclaim failed", "error", err)
-			return
+		if err := store.ReclaimPressure(ctx); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			if errors.Is(err, cache.ErrPressureReclaimIncomplete) {
+				m.logger.WarnContext(ctx, "cache pressure reclaim was incomplete", "root", store.Root(), "error", err)
+			} else {
+				m.logger.ErrorContext(ctx, "cache pressure reclaim failed", "root", store.Root(), "error", err)
+			}
 		}
 	}
 	if m.client == nil {
 		return
 	}
-	victims, err := m.store.PressureVictims()
-	if err != nil {
-		m.logger.ErrorContext(ctx, "inspect cache pressure victims failed", "error", err)
-		return
+	var victims []cache.Lease
+	for _, store := range m.stores {
+		storeVictims, err := store.PressureVictims()
+		if err != nil {
+			m.logger.ErrorContext(ctx, "inspect cache pressure victims failed", "root", store.Root(), "error", err)
+			continue
+		}
+		victims = append(victims, storeVictims...)
 	}
 	if len(victims) == 0 {
 		return
