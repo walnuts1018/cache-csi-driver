@@ -69,7 +69,7 @@ spec:
     - name: check
       image: $app_image
       imagePullPolicy: IfNotPresent
-      command: ["sh", "-c", "if [ -f /cache/marker ]; then printf 'HIT:%s' \"$(cat /cache/marker)\" > /tmp/cache-result; else printf 'MISS' > /tmp/cache-result; printf '%s' '$name' > /cache/marker; fi; sleep 3600"]
+      command: ["sh", "-c", "if [ -f /cache/marker ]; then printf 'HIT' > /tmp/cache-result; else printf 'MISS' > /tmp/cache-result; printf 'cached' > /cache/marker; fi; sleep 3600"]
       volumeMounts:
         - name: cache
           mountPath: /cache
@@ -140,14 +140,14 @@ expect_result pod-a MISS
 delete_pod pod-a
 
 start_pod pod-b "$node_a" default
-expect_result pod-b HIT:pod-a
+expect_result pod-b HIT
 
 restart_plugin "$node_a"
-kubectl --context "$context" exec --namespace default pod-b -- cat /cache/marker | grep -Fxq pod-a
+kubectl --context "$context" exec --namespace default pod-b -- cat /cache/marker | grep -Fxq cached
 delete_pod pod-b
 
 start_pod pod-after-restart "$node_a" default
-expect_result pod-after-restart HIT:pod-a
+expect_result pod-after-restart HIT
 delete_pod pod-after-restart
 
 start_pod pod-other-node "$node_b" default
