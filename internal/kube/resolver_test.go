@@ -7,9 +7,18 @@ import (
 	"net"
 	"syscall"
 	"testing"
+	"time"
 
+	cachev1alpha1 "github.com/walnuts1018/cache-csi-driver/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	kubefake "k8s.io/client-go/kubernetes/fake"
+	toolscache "k8s.io/client-go/tools/cache"
 )
 
 const testCacheClassesResource = "cacheclasses"
@@ -46,5 +55,50 @@ func TestIsTemporaryAPIError(t *testing.T) {
 				t.Fatalf("IsTemporaryAPIError(%v) = %t, want %t", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolverUsesInformerCachesAfterStartupSync(t *testing.T) {
+	t.Parallel()
+
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "build", UID: "namespace-uid"}}
+	cacheClass := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": cachev1alpha1.GroupVersion.String(),
+		"kind":       "CacheClass",
+		"metadata": map[string]any{
+			"name": "compiler",
+			"uid":  "class-uid",
+		},
+		"spec": map[string]any{"backend": "directory"},
+	}}
+	kubernetesClient := kubefake.NewClientset(namespace)
+	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cacheClass)
+	resolver := newResolver(kubernetesClient, dynamicClient)
+	if _, _, err := resolver.Resolve(t.Context(), namespace.Name, "compiler"); !errors.Is(err, ErrResolverNotSynced) {
+		t.Fatalf("resolve before cache sync error = %v, want ErrResolverNotSynced", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	resolver.Start(ctx)
+	if !toolscache.WaitForCacheSync(ctx.Done(), resolver.namespaceInformer.HasSynced, resolver.classInformer.HasSynced) {
+		t.Fatal("resolver informer caches did not synchronize")
+	}
+
+	resolvedNamespaceUID, resolvedClass, err := resolver.Resolve(ctx, namespace.Name, "compiler")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedNamespaceUID != string(namespace.UID) || resolvedClass.UID != "class-uid" || resolvedClass.Object.Spec.Backend != cachev1alpha1.BackendDirectory {
+		t.Fatalf("resolved cache identity inputs = namespace UID %q, class %+v", resolvedNamespaceUID, resolvedClass)
+	}
+
+	cancel()
+	if _, _, err := resolver.Resolve(t.Context(), namespace.Name, "compiler"); err != nil {
+		t.Fatalf("resolve from the synchronized cache after API informer shutdown: %v", err)
+	}
+	for _, action := range append(kubernetesClient.Actions(), dynamicClient.Actions()...) {
+		if action.GetVerb() == "get" {
+			t.Fatalf("resolver issued a per-request API GET: %#v", action)
+		}
 	}
 }

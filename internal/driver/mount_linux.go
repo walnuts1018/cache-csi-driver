@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -63,6 +64,70 @@ func mount(source, target string, readOnly, noExec bool) error {
 	}
 	if err := unix.Close(detachedMount); err != nil {
 		return fmt.Errorf("close attached cache mount: %w", err)
+	}
+	return nil
+}
+
+func PreflightMountAPI() (resultErr error) {
+	root, err := os.MkdirTemp("", "cache-csi-mount-preflight-")
+	if err != nil {
+		return fmt.Errorf("create mount preflight directory: %w", err)
+	}
+	source := filepath.Join(root, "source")
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		return errors.Join(fmt.Errorf("create mount preflight source: %w", err), os.RemoveAll(root))
+	}
+	if err := os.Mkdir(target, 0o700); err != nil {
+		return errors.Join(fmt.Errorf("create mount preflight target: %w", err), os.RemoveAll(root))
+	}
+	mounted := false
+	defer func() {
+		if mounted {
+			if err := unmount(target); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("unmount mount preflight target: %w", err))
+			}
+		}
+		if err := os.RemoveAll(root); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("remove mount preflight directory: %w", err))
+		}
+	}()
+
+	mountErr := mount(source, target, true, true)
+	mounted, err = mountedAt(target)
+	if err != nil {
+		return fmt.Errorf("inspect mount preflight target: %w", err)
+	}
+	if mountErr != nil {
+		return fmt.Errorf("exercise open_tree, mount_setattr, and move_mount: %w", mountErr)
+	}
+	if !mounted {
+		return errors.New("mount API preflight completed without attaching the test mount")
+	}
+	same, err := sameCacheMount(source, target, true, true)
+	if err != nil {
+		return fmt.Errorf("verify mount preflight attributes: %w", err)
+	}
+	if !same {
+		return errors.New("mount API preflight did not apply readonly, nodev, nosuid, and noexec attributes")
+	}
+	readOnly, err := filesystemReadOnly(target)
+	if err != nil {
+		return fmt.Errorf("verify mount preflight readonly state: %w", err)
+	}
+	if !readOnly {
+		return errors.New("mount API preflight mount is not readonly")
+	}
+	if err := unmount(target); err != nil {
+		return fmt.Errorf("unmount mount preflight target: %w", err)
+	}
+	mounted = false
+	stillMounted, err := mountedAt(target)
+	if err != nil {
+		return fmt.Errorf("verify mount preflight cleanup: %w", err)
+	}
+	if stillMounted {
+		return errors.New("mount API preflight target remains mounted after unmount")
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"syscall"
 
 	cachev1alpha1 "github.com/walnuts1018/cache-csi-driver/api/v1alpha1"
@@ -15,13 +16,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
+	toolscache "k8s.io/client-go/tools/cache"
 )
 
 var cacheClassGVR = schema.GroupVersionResource{Group: cachev1alpha1.GroupVersion.Group, Version: cachev1alpha1.GroupVersion.Version, Resource: "cacheclasses"}
 
 var ErrAPIResolverUnavailable = errors.New("the Kubernetes API resolver is unavailable")
+
+var ErrResolverNotSynced = errors.New("the Kubernetes API informer cache is not synchronized")
 
 func IsTemporaryAPIError(err error) bool {
 	if err == nil {
@@ -41,8 +48,13 @@ func IsTemporaryAPIError(err error) bool {
 }
 
 type Resolver struct {
-	kubernetes kubernetes.Interface
-	dynamic    dynamic.Interface
+	namespaceLister   corelisters.NamespaceLister
+	classLister       toolscache.GenericLister
+	namespaceInformer toolscache.SharedIndexInformer
+	classInformer     toolscache.SharedIndexInformer
+	kubernetesFactory informers.SharedInformerFactory
+	dynamicFactory    dynamicinformer.DynamicSharedInformerFactory
+	startOnce         sync.Once
 }
 
 type ResolvedClass struct {
@@ -59,27 +71,63 @@ func NewResolver(config *rest.Config) (*Resolver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create dynamic Kubernetes client: %w", err)
 	}
-	return &Resolver{kubernetes: kubeClient, dynamic: dynamicClient}, nil
+	return newResolver(kubeClient, dynamicClient), nil
+}
+
+func newResolver(kubernetesClient kubernetes.Interface, dynamicClient dynamic.Interface) *Resolver {
+	kubernetesFactory := informers.NewSharedInformerFactory(kubernetesClient, 0)
+	namespaceInformer := kubernetesFactory.Core().V1().Namespaces()
+	dynamicFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
+	classInformer := dynamicFactory.ForResource(cacheClassGVR)
+	return &Resolver{
+		namespaceLister:   namespaceInformer.Lister(),
+		classLister:       classInformer.Lister(),
+		namespaceInformer: namespaceInformer.Informer(),
+		classInformer:     classInformer.Informer(),
+		kubernetesFactory: kubernetesFactory,
+		dynamicFactory:    dynamicFactory,
+	}
+}
+
+func (r *Resolver) Start(ctx context.Context) {
+	r.startOnce.Do(func() {
+		r.kubernetesFactory.StartWithContext(ctx)
+		r.dynamicFactory.Start(ctx.Done())
+	})
+}
+
+func (r *Resolver) HasSynced() bool {
+	return r.namespaceInformer.HasSynced() && r.classInformer.HasSynced()
 }
 
 func (r *Resolver) Resolve(ctx context.Context, namespace, className string) (string, ResolvedClass, error) {
-	namespaceObject, err := r.kubernetes.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+	if err := ctx.Err(); err != nil {
+		return "", ResolvedClass{}, err
+	}
+	if !r.HasSynced() {
+		return "", ResolvedClass{}, ErrResolverNotSynced
+	}
+	namespaceObject, err := r.namespaceLister.Get(namespace)
 	if err != nil {
 		return "", ResolvedClass{}, fmt.Errorf("get pod namespace: %w", err)
 	}
-	object, err := r.dynamic.Resource(cacheClassGVR).Get(ctx, className, metav1.GetOptions{})
+	object, err := r.classLister.Get(className)
 	if err != nil {
 		return "", ResolvedClass{}, fmt.Errorf("get CacheClass %q: %w", className, err)
 	}
+	unstructuredClass, ok := object.(*unstructured.Unstructured)
+	if !ok {
+		return "", ResolvedClass{}, fmt.Errorf("CacheClass %q informer object has unexpected type %T", className, object)
+	}
 	class := cachev1alpha1.CacheClass{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.Object, &class); err != nil {
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredClass.Object, &class); err != nil {
 		return "", ResolvedClass{}, fmt.Errorf("decode CacheClass %q: %w", className, err)
 	}
 	if err := class.Spec.Validate(); err != nil {
 		return "", ResolvedClass{}, fmt.Errorf("CacheClass %q is invalid: %w", className, err)
 	}
-	class.UID = object.GetUID()
-	return string(namespaceObject.UID), ResolvedClass{Object: class, UID: string(object.GetUID())}, nil
+	class.UID = unstructuredClass.GetUID()
+	return string(namespaceObject.UID), ResolvedClass{Object: class, UID: string(unstructuredClass.GetUID())}, nil
 }
 
 func Unstructured(class *cachev1alpha1.CacheClass) (*unstructured.Unstructured, error) {

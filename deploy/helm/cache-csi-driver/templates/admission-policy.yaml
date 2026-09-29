@@ -15,7 +15,7 @@ spec:
   validations:
     - expression: >-
         !has(object.spec.volumes) || object.spec.volumes.all(volume,
-          !has(volume.csi) || volume.csi.driver != {{ .Values.driverName | quote }}
+          !has(volume.csi) || volume.csi.driver != "cache.csi.walnuts.dev"
         )
       message: Cache CSI volumes are restricted to namespaces labeled cache.csi.walnuts.dev/allow-use=true.
 ---

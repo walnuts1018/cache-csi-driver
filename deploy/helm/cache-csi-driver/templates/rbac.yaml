@@ -12,12 +12,15 @@ rules:
     verbs:
       - get
       - list
+      - watch
   - apiGroups:
       - ""
     resources:
       - namespaces
     verbs:
       - get
+      - list
+      - watch
   {{- if .Values.rbac.createPodEvictions }}
   - apiGroups:
       - ""

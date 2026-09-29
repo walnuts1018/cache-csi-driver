@@ -31,6 +31,7 @@ func (systemMounter) filesystemReadOnly(path string) (bool, error) {
 }
 
 func mount(string, string, bool, bool) error { return errors.New("bind mounts require Linux") }
+func PreflightMountAPI() error               { return errors.New("bind mount preflight requires Linux") }
 func unmount(string) error                   { return errors.New("bind mounts require Linux") }
 func mountedAt(string) (bool, error)         { return false, errors.New("mount inspection requires Linux") }
 func sameCacheMount(string, string, bool, bool) (bool, error) {

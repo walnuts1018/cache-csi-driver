@@ -101,6 +101,9 @@ func run(logger *slog.Logger) error {
 	if err := mountFallbackTmpfs(*fallbackRoot, fallbackSize); err != nil {
 		return fmt.Errorf("prepare bounded fallback filesystem: %w", err)
 	}
+	if err := driver.PreflightMountAPI(); err != nil {
+		return fmt.Errorf("preflight Linux mount APIs: %w", err)
+	}
 
 	pressure := cache.PressureConfig{
 		HighFreePercent:      *highFreePercent,
@@ -122,7 +125,12 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("initialize fallback cache store: %w", errors.Join(err, store.Close()))
 	}
 	defer func() { _ = fallbackStore.Close() }()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	client, resolver := kubernetesClients(logger)
+	if resolver != nil {
+		resolver.Start(ctx)
+	}
 	cacheManager := manager.New(store, manager.Options{
 		Interval:      *gcInterval,
 		Client:        client,
@@ -155,8 +163,6 @@ func run(logger *slog.Logger) error {
 	defer cleanupSocket()
 
 	logger.Info("starting cache CSI node driver", "version", version, "revision", revision, "nodeID", *nodeID, "endpoint", *endpoint)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	managerContext, cancelManager := context.WithCancel(ctx)
 	managerDone := make(chan struct{})
 	go func() {
@@ -244,7 +250,7 @@ func canonicalPath(path string) (string, error) {
 	}
 }
 
-func kubernetesClients(logger *slog.Logger) (kubernetes.Interface, driver.ClassResolver) {
+func kubernetesClients(logger *slog.Logger) (kubernetes.Interface, *kube.Resolver) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		logger.Warn("in-cluster Kubernetes configuration is unavailable; using isolated fallback caches", "error", err)

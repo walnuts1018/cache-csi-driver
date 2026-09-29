@@ -97,7 +97,7 @@ spec:
           imagePullPolicy: {{ .Values.registrar.image.pullPolicy }}
           args:
             - --csi-address=/csi/csi.sock
-            - --kubelet-registration-path={{ .Values.kubeletRootDir }}/plugins/{{ .Values.driverName }}/csi.sock
+            - --kubelet-registration-path={{ .Values.kubeletRootDir }}/plugins/cache.csi.walnuts.dev/csi.sock
             - --health-port=9809
             - --v=2
           resources:
@@ -136,7 +136,7 @@ spec:
       volumes:
         - name: csi-socket-dir
           hostPath:
-            path: {{ .Values.kubeletRootDir }}/plugins/{{ .Values.driverName }}
+            path: {{ .Values.kubeletRootDir }}/plugins/cache.csi.walnuts.dev
             type: DirectoryOrCreate
         - name: registration-dir
           hostPath:

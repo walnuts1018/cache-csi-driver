@@ -23,7 +23,7 @@ kubectl label namespace default cache.csi.walnuts.dev/allow-use=true
 
 Helm valuesの`admissionPolicy.enabled=false`でpolicyを無効化する場合は、同等の利用制限を別のAdmission設定で行ってください。ClusterRoleはNamespaceとCacheClassの読み取り権限に加え、既定で`pods/eviction`の作成権限を持ちます。Node pluginはmount system callを使うためprivileged containerとして動作し、mount属性付きmountの伝播にLinux kernel 5.12以降が必要です。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映されます。
 
-Kubernetes API resolverが一時的な障害になり、volume attributeに`maxBytes`がない場合は、volume IDごとに分離したfallback objectを使います。CacheClassがquotaを使わない場合は、cache metadataのdegradationや`Exclusive` identityの競合時にもfallbackを使います。volume attributeに`maxBytes`がある要求、解決済みCacheClassのquotaが有効な状態で発生したmetadata degradationやidentity競合、通常cacheのmount・quota設定に失敗した要求ではfallbackに切り替えません。CacheClassを解決できない場合は`spec.maxBytes`や`quota.defaultMaxBytes`を確認できないため、そのper-class quotaは適用せず、fallback用の別tierとして扱います。fallback leaseとgenerationは`fallbackRootDir`配下のStore metadataで管理し、CSI unpublish時にobjectをtrashへdetachします。driver再起動時もmountを検証してleaseを回復し、mountされていないfallback objectは破棄します。fallback filesystemには`fallbackMaxBytes`で指定したtmpfs上限を適用し、mountには`nodev`、`nosuid`、`noexec`を付けます。これは全fallback objectに共通するfilesystem全体の上限であり、個別volumeやCacheClassのquotaではありません。active fallback dataはunpublishまで回収できず、容量上限に達した書き込みは`ENOSPC`になります。この値はNode上のhostPathとplugin引数の両方に反映され、mount伝播に`Bidirectional`を使います。
+CacheClassとNamespaceはNode pluginのInformer cacheから参照します。initial sync完了後は、API serverの一時障害中もcacheにあるClassを利用できます。cold start直後でInformer cacheが同期していない要求は`Unavailable`となり、kubeletのretryで再試行されます。Node内でKubernetes resolverを初期化できない場合など、resolverが利用できずvolume attributeに`maxBytes`がないときは、volume IDごとに分離したfallback objectを使います。CacheClassがquotaを使わない場合は、cache metadataのdegradationや`Exclusive` identityの競合時にもfallbackを使います。volume attributeに`maxBytes`がある要求、解決済みCacheClassのquotaが有効な状態で発生したmetadata degradationやidentity競合、通常cacheのmount・quota設定に失敗した要求ではfallbackに切り替えません。CacheClassを解決できない場合は`spec.maxBytes`や`quota.defaultMaxBytes`を確認できないため、そのper-class quotaは適用せず、fallback用の別tierとして扱います。fallback leaseとgenerationは`fallbackRootDir`配下のStore metadataで管理し、CSI unpublish時にobjectをtrashへdetachします。driver再起動時もmountを検証してleaseを回復し、mountされていないfallback objectは破棄します。fallback filesystemには`fallbackMaxBytes`で指定したtmpfs上限を適用し、mountには`nodev`、`nosuid`、`noexec`を付けます。これは全fallback objectに共通するfilesystem全体の上限であり、個別volumeやCacheClassのquotaではありません。active fallback dataはunpublishまで回収できず、容量上限に達した書き込みは`ENOSPC`になります。この値はNode上のhostPathとplugin引数の両方に反映され、mount伝播に`Bidirectional`を使います。
 
 `preventPodSchedulingIfMissing`を有効にしているため、CSI pluginが登録されていないNodeへのPod配置を防ぎます。Cluster Autoscalerを使う場合は、CSI node-aware schedulingを有効にしてください。
 
@@ -72,7 +72,6 @@ spec:
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/walnuts1018/cache-csi-driver` | Node plugin image |
 | `image.tag` | ChartのappVersion | Node plugin image tag |
-| `driverName` | `cache.csi.walnuts.dev` | CSI driver name |
 | `cacheRootDir` | `/var/lib/cache-csi` | Node上のcache directory |
 | `fallbackRootDir` | `/run/cache-csi/fallback` | Node上のfallback Store root。plugin起動時にこのpathへ上限付きtmpfsをmount |
 | `fallbackMaxBytes` | `1Gi` | Node上のfallback tmpfs全体の最大size。各fallback volume固有のquotaではない |
@@ -91,7 +90,7 @@ spec:
 
 `CacheClass.spec.maxBytes`は、各cache identityに対してvolume側が要求できるquota上限です。`quota.enabled`と`backend: xfs-project`が必要で、volume attributeの`maxBytes`がこの上限を超える場合はmount要求を拒否します。volume attributeに`maxBytes`がない場合は`quota.defaultMaxBytes`を設定していればその値を使い、未設定なら`spec.maxBytes`を使います。quotaを有効にするCacheClassには`spec.maxBytes`または`quota.defaultMaxBytes`を設定してください。`examples/cacheclass-xfs-project.yaml`と`examples/pod-inline-cache-xfs-project.yaml`に設定例があります。
 
-現在、class全体の集約byte上限はありません。pressure watermarksはCacheClassごとではなく、`cacheRootDir`が属する単一filesystem全体に適用します。Node pluginは`gcInterval`とは別に3秒ごとに空き容量とinodeを確認し、開始水位を下回ると未使用cacheを物理削除して終了水位までの回復を試みます。未使用cacheを回収してもpressureが続く場合に限り、`evictRunning`を有効にしたCacheClassのPodへEviction APIで退去を要求します。`retention`は未使用cacheの保持期間で、省略時はAPI serverのdefaultである`72h`、明示的な`0s`は次回retention scanから回収対象になります。`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
+現在、class全体の集約byte上限はありません。pressure watermarksはCacheClassごとではなく、`cacheRootDir`が属する単一filesystem全体に適用します。Node pluginは`gcInterval`とは別に3秒ごとに空き容量とinodeを確認し、開始水位を下回ると未使用cacheを物理削除して終了水位までの回復を試みます。未使用cacheを回収してもpressureが続く場合に限り、`evictRunning`を有効にしたCacheClassのPodへEviction APIで退去を要求します。`retention`は未使用cacheの保持期間で、省略時はAPI serverのdefaultである`72h`です。明示的な`0s`ではretentionを理由にした回収を無効にしますが、pressure時の回収対象にはなります。`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
 
 `evictRunning`を有効にしたCacheClassでは、未使用cacheを回収した後もglobal pressureが続く場合、そのcacheを利用中のPodへKubernetes Eviction APIでbest-effortの退去要求を出します。PodDisruptionBudgetにより拒否される場合やPodが退去しない場合があり、cacheの回収は保証されません。driverはPodを強制削除しません。Node pluginのClusterRoleは全namespaceの`pods/eviction`作成だけを追加し、Podの直接削除権限は持ちません。active Pod evictionを使わない場合は`rbac.createPodEvictions=false`にできます。
 
