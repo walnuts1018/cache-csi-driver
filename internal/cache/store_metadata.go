@@ -51,15 +51,14 @@ type RetiredGeneration struct {
 }
 
 type Policy struct {
-	ClassName          string        `json:"className"`
-	ClassUID           string        `json:"classUID"`
-	SharingPolicy      string        `json:"sharingPolicy,omitempty"`
-	NoExec             bool          `json:"noExec"`
-	SchemaVersion      string        `json:"schemaVersion"`
-	CrashRecoveryReuse bool          `json:"crashRecoveryReuse"`
-	QuotaEnabled       bool          `json:"quotaEnabled"`
-	MaxBytes           int64         `json:"maxBytes"`
-	Retention          time.Duration `json:"retention"`
+	ClassName     string        `json:"className"`
+	ClassUID      string        `json:"classUID"`
+	SharingPolicy string        `json:"sharingPolicy,omitempty"`
+	NoExec        bool          `json:"noExec"`
+	SchemaVersion string        `json:"schemaVersion"`
+	QuotaEnabled  bool          `json:"quotaEnabled"`
+	MaxBytes      int64         `json:"maxBytes"`
+	Retention     time.Duration `json:"retention"`
 }
 
 type policyAlias Policy
@@ -397,6 +396,12 @@ func (s *Store) indexMetadata(meta Metadata) {
 
 func (s *Store) markDegraded(identity string, cause error) {
 	s.generationManager.markDegraded(s, identity, cause)
+}
+
+func (s *Store) clearDegraded(identity string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.generationManager.degraded, identity)
 }
 
 func (s *Store) indexDegradedLeaseIDs(identity string, meta Metadata) {

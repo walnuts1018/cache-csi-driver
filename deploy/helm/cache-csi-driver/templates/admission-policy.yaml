@@ -51,8 +51,7 @@ spec:
     - expression: >-
         !has(object.spec.volumes) || object.spec.volumes.all(volume,
           !has(volume.csi) || volume.csi.driver != "cache.csi.walnuts.dev" ||
-          (has(volume.csi.ephemeral) && volume.csi.ephemeral &&
-          has(volume.csi.volumeAttributes) &&
+          (has(volume.csi.volumeAttributes) &&
           volume.csi.volumeAttributes.all(attribute,
             attribute in ["cacheClass", "cacheKey", "maxBytes"]) &&
           "cacheClass" in volume.csi.volumeAttributes &&
@@ -74,12 +73,12 @@ spec:
           ((!has(object.spec.nodeName) || object.spec.nodeName == "" ||
             (request.operation == "UPDATE" && has(oldObject) &&
             has(oldObject.spec.nodeName) && object.spec.nodeName == oldObject.spec.nodeName)) &&
-          (!has(object.spec.schedulerName) || object.spec.schedulerName == "" ||
-            object.spec.schedulerName == "default-scheduler") &&
+          has(object.spec.schedulerName) &&
+          object.spec.schedulerName == "cache-csi-scheduler" &&
           (!has(object.spec.nodeSelector) ||
             !("cache.csi.walnuts.dev/ready" in object.spec.nodeSelector) ||
             object.spec.nodeSelector["cache.csi.walnuts.dev/ready"] == "true")))
-      message: Cache CSI Pods must use the default scheduler, must not set spec.nodeName, and must not conflict with the cache readiness node selector.
+      message: Cache CSI Pods must use cache-csi-scheduler, must not set spec.nodeName, and must not conflict with the cache readiness node selector.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -109,25 +108,31 @@ spec:
       expression: >-
         has(object.spec.volumes) && object.spec.volumes.exists(volume,
           has(volume.csi) && volume.csi.driver == "cache.csi.walnuts.dev")
-    - name: cache-readiness-selector-is-absent
-      expression: >-
-        !has(object.spec.nodeSelector) ||
-        !("cache.csi.walnuts.dev/ready" in object.spec.nodeSelector)
   reinvocationPolicy: IfNeeded
   mutations:
     - patchType: JSONPatch
       jsonPatch:
         expression: >-
-          has(object.spec.nodeSelector)
+          !has(object.spec.nodeSelector)
+          ? [JSONPatch{
+              op: "add",
+              path: "/spec/nodeSelector",
+              value: {"cache.csi.walnuts.dev/ready": "true"}
+            }]
+          : !("cache.csi.walnuts.dev/ready" in object.spec.nodeSelector)
           ? [JSONPatch{
               op: "add",
               path: "/spec/nodeSelector/" + jsonpatch.escapeKey("cache.csi.walnuts.dev/ready"),
               value: "true"
             }]
-          : [JSONPatch{
+          : []
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          [JSONPatch{
               op: "add",
-              path: "/spec/nodeSelector",
-              value: {"cache.csi.walnuts.dev/ready": "true"}
+              path: "/spec/schedulerName",
+              value: "cache-csi-scheduler"
             }]
 ---
 apiVersion: admissionregistration.k8s.io/v1

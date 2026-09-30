@@ -20,6 +20,7 @@ spec:
       annotations:
         {{- toYaml $podAnnotations | nindent 8 }}
     spec:
+      hostPID: true
       serviceAccountName: {{ include "cache-csi-driver.serviceAccountName" . }}
       automountServiceAccountToken: false
       priorityClassName: {{ .Values.priorityClassName | quote }}
@@ -38,6 +39,8 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --metrics-address=:{{ .Values.metrics.port }}
             - --cache-root={{ .Values.cacheRootDir }}
+            - --storage-backend={{ .Values.storage.backend }}
+            - --require-cache-root-mountpoint={{ .Values.storage.requireRootMountpoint }}
             - --node-id=$(NODE_NAME)
             - --kubelet-root={{ .Values.kubeletRootDir }}
             - --gc-interval={{ .Values.gcInterval }}

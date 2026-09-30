@@ -5,25 +5,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-type CacheBackend string
-type CrashRecoveryPolicy string
 type SharingPolicy string
 type CacheScope string
 
 const (
-	BackendDirectory       CacheBackend        = "directory"
-	BackendXFSProject      CacheBackend        = "xfs-project"
-	CrashRecoveryDiscard   CrashRecoveryPolicy = "discard"
-	CrashRecoveryReuse     CrashRecoveryPolicy = "reuse"
-	SharingPolicyShared    SharingPolicy       = "Shared"
-	SharingPolicyExclusive SharingPolicy       = "Exclusive"
-	ScopeServiceAccount    CacheScope          = "ServiceAccount"
-	ScopeNamespace         CacheScope          = "Namespace"
+	SharingPolicyShared    SharingPolicy = "Shared"
+	SharingPolicyExclusive SharingPolicy = "Exclusive"
+	ScopeServiceAccount    CacheScope    = "ServiceAccount"
+	ScopeNamespace         CacheScope    = "Namespace"
 )
 
 // CacheClassSpec defines storage and reuse behavior for node-local cache generations.
 type CacheClassSpec struct {
-	// Storage backend and quota limits used for cache generations.
+	// Per-cache quota limits for cache generations.
 	Storage StoragePolicy `json:"storage"`
 	// Maximum age of an unused cache before it becomes eligible for garbage collection.
 	// +kubebuilder:default="72h"
@@ -33,10 +27,6 @@ type CacheClassSpec struct {
 	// +kubebuilder:default="v1"
 	// +kubebuilder:validation:XValidation:rule="!self.contains('/') && !self.contains('\\\\') && !self.contains('\\u0000')",message="schemaVersion contains an invalid character"
 	SchemaVersion string `json:"schemaVersion,omitempty"`
-	// Policy for generations left active after an unclean node shutdown.
-	// +kubebuilder:default=discard
-	// +kubebuilder:validation:Enum=discard;reuse
-	CrashRecovery CrashRecoveryPolicy `json:"crashRecovery,omitempty"`
 	// SharingPolicy describes concurrent access to a cache generation. Shared is safe only when the cache implementation supports concurrent multi-process access and all Pods using the same cacheKey coordinate writes. Pods must use compatible effective UID and GID values because existing file modes can prevent a Pod with different credentials from writing reused data.
 	// +kubebuilder:default=Exclusive
 	// +kubebuilder:validation:Enum=Shared;Exclusive
@@ -49,19 +39,13 @@ type CacheClassSpec struct {
 	NoExec bool `json:"noExec,omitempty"`
 }
 
-// StoragePolicy defines the filesystem backend and quota limits for cache generations.
+// StoragePolicy defines per-cache quota limits for cache generations.
 // +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !quantity(string(self.maxBytes)).isLessThan(quantity('0'))",message="maxBytes must not be negative"
 // +kubebuilder:validation:XValidation:rule="!has(self.defaultMaxBytes) || !quantity(string(self.defaultMaxBytes)).isLessThan(quantity('0'))",message="defaultMaxBytes must not be negative"
-// +kubebuilder:validation:XValidation:rule="self.backend != 'directory' || (!has(self.maxBytes) && !has(self.defaultMaxBytes))",message="directory backend does not support quota limits"
 // +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || quantity(string(self.maxBytes)).isGreaterThan(quantity('0'))",message="maxBytes must be greater than zero"
 // +kubebuilder:validation:XValidation:rule="!has(self.defaultMaxBytes) || quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity('0'))",message="defaultMaxBytes must be greater than zero"
-// +kubebuilder:validation:XValidation:rule="self.backend != 'xfs-project' || ((has(self.maxBytes) && quantity(string(self.maxBytes)).isGreaterThan(quantity('0'))) || (has(self.defaultMaxBytes) && quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity('0'))))",message="xfs-project backend requires maxBytes or defaultMaxBytes"
 // +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !has(self.defaultMaxBytes) || !quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))",message="defaultMaxBytes must not exceed maxBytes"
 type StoragePolicy struct {
-	// Storage backend used for cache generations.
-	// +kubebuilder:default=directory
-	// +kubebuilder:validation:Enum=directory;xfs-project
-	Backend CacheBackend `json:"backend"`
 	// Maximum per-cache quota ceiling for volume-level maxBytes requests in this class. Requests above this limit are rejected.
 	// +kubebuilder:validation:Type=string
 	MaxBytes resource.Quantity `json:"maxBytes,omitzero"`
@@ -72,7 +56,6 @@ type StoragePolicy struct {
 
 // CacheClass is the schema for cacheclasses.
 // +kubebuilder:resource:scope=Cluster,shortName=cc
-// +kubebuilder:printcolumn:name="Backend",type=string,JSONPath=".spec.storage.backend"
 // +kubebuilder:printcolumn:name="MaxBytes",type=string,JSONPath=".spec.storage.maxBytes"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:object:root=true

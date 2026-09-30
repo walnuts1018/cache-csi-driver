@@ -33,6 +33,7 @@ spec:
           args:
             - health-controller
             - --namespace=$(POD_NAMESPACE)
+            - --scheduler-extender-address=:8090
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -54,6 +55,17 @@ spec:
               type: RuntimeDefault
           resources:
             {{- toYaml .Values.healthController.resources | nindent 12 }}
+          ports:
+            - name: scheduler-extender
+              containerPort: 8090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: scheduler-extender
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
       {{- with .Values.healthController.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -62,6 +74,39 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "cache-csi-driver.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: health-controller
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "cache-csi-driver.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: health-controller
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: health-controller
+spec:
+  selector:
+    {{- include "cache-csi-driver.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: health-controller
+  ports:
+    - name: scheduler-extender
+      port: 8090
+      targetPort: scheduler-extender
+      protocol: TCP
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

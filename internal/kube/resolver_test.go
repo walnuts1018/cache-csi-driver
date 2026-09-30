@@ -82,7 +82,7 @@ func TestResolverGetsNamespaceAndServiceAccountOnDemand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolvedNamespaceUID != string(namespace.UID) || resolvedServiceAccountUID != string(serviceAccount.UID) || resolvedClass.UID != testCacheClassUID || resolvedClass.Object.Spec.Storage.Backend != cachev1alpha1.BackendDirectory {
+	if resolvedNamespaceUID != string(namespace.UID) || resolvedServiceAccountUID != string(serviceAccount.UID) || resolvedClass.UID != testCacheClassUID {
 		t.Fatalf("resolved cache identity inputs = namespace UID %q, service account UID %q, class %+v", resolvedNamespaceUID, resolvedServiceAccountUID, resolvedClass)
 	}
 

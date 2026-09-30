@@ -3,8 +3,6 @@ kind: CacheClass
 metadata:
   name: default
 spec:
-  storage:
-    backend: directory
+  storage: {}
   retention: 72h
   schemaVersion: v1
-  crashRecovery: discard

@@ -20,11 +20,10 @@ import (
 )
 
 const (
-	ReadyLabel              = "cache.csi.walnuts.dev/ready"
-	CSIPluginName           = "cache.csi.walnuts.dev"
-	ControllerInterval      = 5 * time.Second
-	acceptedEvictionGap     = 30 * time.Second
-	staleLeaseEvictionGrace = 30 * time.Second
+	ReadyLabel          = "cache.csi.walnuts.dev/ready"
+	CSIPluginName       = "cache.csi.walnuts.dev"
+	ControllerInterval  = 5 * time.Second
+	acceptedEvictionGap = 30 * time.Second
 )
 
 type evictionKey struct {
@@ -33,26 +32,26 @@ type evictionKey struct {
 }
 
 type Controller struct {
-	client     kubernetes.Interface
-	namespace  string
-	logger     *slog.Logger
-	nextEvict  map[evictionKey]time.Time
-	staleSince map[string]time.Time
+	client    kubernetes.Interface
+	apiCache  *APICache
+	namespace string
+	logger    *slog.Logger
+	nextEvict map[evictionKey]time.Time
 }
 
-func NewController(client kubernetes.Interface, namespace string, logger *slog.Logger) (*Controller, error) {
-	if client == nil || namespace == "" {
-		return nil, errors.New("Kubernetes client and controller namespace are required")
+func NewController(client kubernetes.Interface, apiCache *APICache, namespace string, logger *slog.Logger) (*Controller, error) {
+	if client == nil || apiCache == nil || namespace == "" || apiCache.namespace != namespace {
+		return nil, errors.New("kubernetes client, matching API cache, and controller namespace are required")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Controller{
-		client:     client,
-		namespace:  namespace,
-		logger:     logger,
-		nextEvict:  make(map[evictionKey]time.Time),
-		staleSince: make(map[string]time.Time),
+		client:    client,
+		apiCache:  apiCache,
+		namespace: namespace,
+		logger:    logger,
+		nextEvict: make(map[evictionKey]time.Time),
 	}, nil
 }
 
@@ -71,15 +70,14 @@ func (controller *Controller) Run(ctx context.Context) {
 }
 
 func (controller *Controller) Reconcile(ctx context.Context) {
-	leases, err := controller.client.CoordinationV1().Leases(controller.namespace).List(ctx, metav1.ListOptions{LabelSelector: LeaseComponentLabel + "=" + LeaseComponentValue})
+	leases, err := controller.apiCache.Leases()
 	if err != nil {
-		controller.logger.ErrorContext(ctx, "list cache node health leases", "error", err)
+		controller.logger.ErrorContext(ctx, "read cache node health Lease informer cache", "error", err)
 		return
 	}
 	now := time.Now()
-	leaseByNode := make(map[string]*coordinationv1.Lease, len(leases.Items))
-	for index := range leases.Items {
-		lease := &leases.Items[index]
+	leaseByNode := make(map[string]*coordinationv1.Lease, len(leases))
+	for _, lease := range leases {
 		nodeName := lease.Annotations[LeaseNodeNameKey]
 		if nodeName == "" || LeaseName(nodeName) != lease.Name {
 			continue
@@ -87,37 +85,22 @@ func (controller *Controller) Reconcile(ctx context.Context) {
 		leaseByNode[nodeName] = lease
 	}
 
-	nodes, err := controller.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	nodes, err := controller.apiCache.Nodes()
 	if err != nil {
-		controller.logger.ErrorContext(ctx, "list Nodes while reconciling cache health", "error", err)
+		controller.logger.ErrorContext(ctx, "read Node informer cache while reconciling cache health", "error", err)
 		return
 	}
 	activeEvictions := make(map[evictionKey]struct{})
-	presentNodes := make(map[string]struct{}, len(nodes.Items))
-	for index := range nodes.Items {
-		node := &nodes.Items[index]
-		presentNodes[node.Name] = struct{}{}
+	for _, node := range nodes {
 		lease := leaseByNode[node.Name]
 		ready := IsSchedulableLease(lease, now)
 		if err := controller.setNodeReady(ctx, node, ready); err != nil {
 			controller.logger.ErrorContext(ctx, "update cache scheduling label", "node", node.Name, "error", err)
 		}
-		leaseCurrent := IsCurrentLease(lease, now)
-		if leaseCurrent {
-			delete(controller.staleSince, node.Name)
-		} else if _, found := controller.staleSince[node.Name]; !found {
-			controller.staleSince[node.Name] = now
-		}
-		staleExpired := !leaseCurrent && now.Sub(controller.staleSince[node.Name]) >= staleLeaseEvictionGrace
-		if IsEvictingLease(lease, now) || staleExpired {
+		if IsEvictingLease(lease, now) {
 			if err := controller.evictCachePods(ctx, node.Name, activeEvictions); err != nil {
 				controller.logger.ErrorContext(ctx, "evict cache Pods from unavailable Node", "node", node.Name, "error", err)
 			}
-		}
-	}
-	for nodeName := range controller.staleSince {
-		if _, exists := presentNodes[nodeName]; !exists {
-			delete(controller.staleSince, nodeName)
 		}
 	}
 	for key := range controller.nextEvict {
@@ -129,12 +112,12 @@ func (controller *Controller) Reconcile(ctx context.Context) {
 
 func (controller *Controller) setNodeReady(ctx context.Context, node *corev1.Node, ready bool) error {
 	current, exists := node.Labels[ReadyLabel]
-	if ready && exists && current == "true" || !ready && !exists {
+	if ready && exists && current == trueString || !ready && !exists {
 		return nil
 	}
 	var value any
 	if ready {
-		value = "true"
+		value = trueString
 	}
 	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"labels": map[string]any{ReadyLabel: value}}})
 	if err != nil {
@@ -155,7 +138,7 @@ func (controller *Controller) evictCachePods(ctx context.Context, nodeName strin
 	now := time.Now()
 	for index := range pods.Items {
 		pod := &pods.Items[index]
-		if pod.DeletionTimestamp != nil || !podHasCacheCSIVolume(pod) {
+		if pod.DeletionTimestamp != nil || !podHasCacheCSIVolume(pod) || !podHasReplacementController(pod) {
 			continue
 		}
 		key := evictionKey{namespace: pod.Namespace, uid: pod.UID}
@@ -196,4 +179,27 @@ func podHasCacheCSIVolume(pod *corev1.Pod) bool {
 	return slices.ContainsFunc(pod.Spec.Volumes, func(volume corev1.Volume) bool {
 		return volume.CSI != nil && volume.CSI.Driver == CSIPluginName
 	})
+}
+
+func podHasReplacementController(pod *corev1.Pod) bool {
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller == nil || !*owner.Controller {
+			continue
+		}
+		switch owner.APIVersion {
+		case "apps/v1":
+			if owner.Kind == "ReplicaSet" || owner.Kind == "StatefulSet" {
+				return true
+			}
+		case "batch/v1":
+			if owner.Kind == "Job" {
+				return true
+			}
+		case "v1":
+			if owner.Kind == "ReplicationController" {
+				return true
+			}
+		}
+	}
+	return false
 }

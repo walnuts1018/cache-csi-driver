@@ -13,7 +13,10 @@ import (
 )
 
 func (s *Store) rebuildIndexes() error {
-	registryMissing := s.loadProjectRegistry()
+	registryMissing := false
+	if s.projectQuotaEnabled {
+		registryMissing = s.loadProjectRegistry()
+	}
 
 	entries, err := s.metadataRepository.readDir(s.metadataRepository.root)
 	if err != nil {
@@ -30,11 +33,14 @@ func (s *Store) rebuildIndexes() error {
 			if generationErr == nil && hasGenerationDirectory(generations) {
 				s.markDegraded(entry.Name(), errors.New("cache metadata is missing while generations remain"))
 			} else if generationErr != nil && !errors.Is(generationErr, os.ErrNotExist) {
-				s.markDegraded(entry.Name(), generationErr)
+				return fmt.Errorf("inspect cache generations for %s: %w", entry.Name(), generationErr)
 			}
 			continue
 		}
 		if err != nil {
+			if isFilesystemOperationError(err) {
+				return fmt.Errorf("read cache metadata for %s: %w", entry.Name(), err)
+			}
 			s.markDegraded(entry.Name(), err)
 			continue
 		}
@@ -42,6 +48,9 @@ func (s *Store) rebuildIndexes() error {
 			s.indexDegradedLeaseIDs(entry.Name(), meta)
 			s.markDegraded(entry.Name(), err)
 			continue
+		}
+		if !s.projectQuotaEnabled && metadataHasProjectQuota(meta) {
+			return fmt.Errorf("cache object %s uses XFS project quota state but the node backend is directory", entry.Name())
 		}
 		s.indexMetadata(meta)
 	}
@@ -60,8 +69,11 @@ func (s *Store) rebuildIndexes() error {
 			err = validateMetadata(meta.Identity, meta)
 		}
 		if err != nil {
+			if isFilesystemOperationError(err) {
+				return fmt.Errorf("read cache trash metadata %s: %w", entry.Name(), err)
+			}
 			s.markDegraded(filepath.Join(trashDirectoryName, entry.Name()), err)
-			if validIdentity(meta.Identity) {
+			if s.projectQuotaEnabled && validIdentity(meta.Identity) {
 				s.addUnknownProjectReservation(meta.Identity, entry.Name())
 			}
 			continue
@@ -90,10 +102,26 @@ func (s *Store) rebuildIndexes() error {
 			}
 		}
 	}
-	if err := s.reconcileProjectReservations(entries, trashEntries); err != nil {
-		return err
+	if s.projectQuotaEnabled {
+		if err := s.reconcileProjectReservations(entries, trashEntries); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func isFilesystemOperationError(err error) bool {
+	_, ok := errors.AsType[*os.PathError](err)
+	return ok
+}
+
+func metadataHasProjectQuota(meta Metadata) bool {
+	if meta.Policy.QuotaEnabled || meta.ProjectAssigned || meta.ProjectID != 0 || meta.QuotaBytes != 0 {
+		return true
+	}
+	return slices.ContainsFunc(meta.Retired, func(generation RetiredGeneration) bool {
+		return generation.ProjectAssigned || generation.ProjectID != 0 || generation.QuotaBytes != 0
+	})
 }
 
 func hasGenerationDirectory(entries []os.DirEntry) bool {
@@ -389,7 +417,7 @@ func (s *Store) recoverValidObjectLeases(ctx context.Context, path, identity str
 		return nil
 	}
 	allLeasesActive := len(active) == len(meta.Leases)
-	if allLeasesActive && (len(active) > 0 || !wasDirty || meta.Policy.CrashRecoveryReuse) {
+	if allLeasesActive && (len(active) > 0 || !wasDirty) {
 		meta.Leases = active
 		if hadPreparingLease || metadataNeedsNormalization(meta) {
 			if err := s.writeMetadata(path, meta); err != nil {
@@ -400,7 +428,7 @@ func (s *Store) recoverValidObjectLeases(ctx context.Context, path, identity str
 		}
 		return nil
 	}
-	if len(active) == 0 && wasDirty && !meta.Policy.CrashRecoveryReuse {
+	if len(active) == 0 && wasDirty {
 		return s.recoverDirtyObject(path, identity, meta)
 	}
 	meta.Leases = active
@@ -512,7 +540,7 @@ func (s *Store) quarantineForRecovery(ctx context.Context, path, identity string
 func (s *Store) quarantineDegradedObjectChecked(ctx context.Context, path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
 	if err := s.metadataRepository.stat(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			delete(s.generationManager.degraded, identity)
+			s.clearDegraded(identity)
 			return nil
 		}
 		s.markDegraded(identity, err)

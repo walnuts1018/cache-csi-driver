@@ -9,6 +9,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const storeLabelName = "store"
+
 type StoreSnapshot struct {
 	Ready               bool
 	PressureState       string
@@ -45,40 +47,40 @@ func New() *Metrics {
 		pressureState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cache_csi_pressure_state",
 			Help: "Current cache filesystem pressure state, represented as a one-hot gauge.",
-		}, []string{"store", "state"}),
+		}, []string{storeLabelName, "state"}),
 		degradedObjects: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cache_csi_store_degraded_objects",
 			Help: "Number of cache objects with degraded metadata in the store index.",
-		}, []string{"store"}),
+		}, []string{storeLabelName}),
 		cacheObjects: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cache_csi_store_objects",
 			Help: "Number of cache objects in the in-memory store index.",
-		}, []string{"store"}),
+		}, []string{storeLabelName}),
 		retiredGenerations: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cache_csi_retired_generations",
 			Help: "Number of retired cache generations in the in-memory store index.",
-		}, []string{"store"}),
+		}, []string{storeLabelName}),
 		storeReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cache_csi_store_ready",
 			Help: "Whether cache store indexes and lease recovery are ready.",
-		}, []string{"store"}),
+		}, []string{storeLabelName}),
 		recoveryState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cache_csi_store_recovery_state",
 			Help: "Current cache store recovery state, represented as a one-hot gauge.",
-		}, []string{"store", "state"}),
+		}, []string{storeLabelName, "state"}),
 		recoveryAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cache_csi_store_recovery_attempts_total",
 			Help: "Cache store recovery attempts by result.",
-		}, []string{"store", "result"}),
+		}, []string{storeLabelName, "result"}),
 		recoveryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cache_csi_store_recovery_duration_seconds",
 			Help:    "Duration of cache store recovery attempts.",
 			Buckets: prometheus.DefBuckets,
-		}, []string{"store"}),
+		}, []string{storeLabelName}),
 		trashObjectsDeleted: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cache_csi_trash_objects_deleted_total",
 			Help: "Cache objects physically removed from trash.",
-		}, []string{"store"}),
+		}, []string{storeLabelName}),
 		observedTrash: make(map[string]uint64),
 	}
 	registry.MustRegister(

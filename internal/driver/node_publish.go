@@ -109,7 +109,7 @@ func (s *Server) validatePublishRequest(req *csi.NodePublishVolumeRequest) (podV
 func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublishVolumeRequest) (string, error) {
 	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
 	if err != nil {
-		return "", s.nodeBackendError(ctx, "MountInspectionFailed", err, true)
+		return "", s.nodeBackendError(ctx, "MountInspectionFailed", err)
 	}
 	if !mounted {
 		return "", nil
@@ -118,7 +118,7 @@ func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublish
 	if errors.Is(err, cache.ErrDegradedMetadata) {
 		verified, verifyErr := s.verifyExistingDegradedMount(req)
 		if verifyErr != nil {
-			return "", s.nodeBackendError(ctx, "DegradedMountInspectionFailed", verifyErr, true)
+			return "", s.nodeBackendError(ctx, "DegradedMountInspectionFailed", verifyErr)
 		}
 		if verified {
 			return publishOutcomeHit, nil
@@ -126,7 +126,7 @@ func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublish
 		return "", status.Error(codes.Unavailable, "cache metadata is degraded and the existing mount could not be verified")
 	}
 	if err != nil {
-		return "", s.nodeBackendError(ctx, "CacheMetadataReadFailed", err, true)
+		return "", s.nodeBackendError(ctx, "CacheMetadataReadFailed", err)
 	}
 	if found {
 		handled, verifyErr := s.verifyExistingLeaseMount(ctx, req, lease, source)
@@ -166,7 +166,7 @@ func (s *Server) verifyExistingLeaseMount(ctx context.Context, req *csi.NodePubl
 	}
 	same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), lease.NoExec)
 	if err != nil {
-		return false, s.nodeBackendError(ctx, "CacheMountVerificationFailed", err, true)
+		return false, s.nodeBackendError(ctx, "CacheMountVerificationFailed", err)
 	}
 	if !same {
 		return false, status.Error(codes.AlreadyExists, "target is mounted from a different source or with different options")
@@ -215,21 +215,21 @@ func (s *Server) prepareLease(ctx context.Context, req *csi.NodePublishVolumeReq
 				if ctx.Err() != nil {
 					return cache.Policy{}, false, status.FromContextError(ctx.Err()).Err()
 				}
-				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheQuarantineFailed", recoverErr, true)
+				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheQuarantineFailed", recoverErr)
 			}
 			_, _, _, _, found, err = s.store.LeaseDetails(req.GetVolumeId())
 			if errors.Is(err, cache.ErrDegradedMetadata) {
 				return cache.Policy{}, false, status.Error(codes.Unavailable, "cache metadata is degraded and an existing generation is still mounted")
 			}
 			if err != nil {
-				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheMetadataReadFailed", err, true)
+				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheMetadataReadFailed", err)
 			}
 			if found {
 				return cache.Policy{}, false, status.Error(codes.AlreadyExists, "volume ID is still present after degraded cache quarantine")
 			}
 			return cache.Policy{}, false, nil
 		}
-		return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheMetadataReadFailed", err, true)
+		return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheMetadataReadFailed", err)
 	}
 	if found {
 		if oldLease.Target != req.GetTargetPath() {
@@ -243,12 +243,12 @@ func (s *Server) prepareLease(ctx context.Context, req *csi.NodePublishVolumeReq
 				if errors.Is(err, cache.ErrLeaseGenerationRetired) {
 					return cache.Policy{}, false, status.Errorf(codes.FailedPrecondition, "begin cache publish: %v", err)
 				}
-				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheLeaseUpdateFailed", err, true)
+				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheLeaseUpdateFailed", err)
 			}
 			return oldPolicy, true, nil
 		}
 		if err := s.store.Release(req.GetVolumeId(), oldLease.Target); err != nil {
-			return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheLeaseReleaseFailed", err, true)
+			return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheLeaseReleaseFailed", err)
 		}
 	}
 	return cache.Policy{}, false, nil
@@ -262,7 +262,7 @@ func (s *Server) resolve(ctx context.Context, volumeContext podVolumeContext) (s
 	if err != nil {
 		return "", cache.Policy{}, err
 	}
-	policy, err := policyFor(class.Object.Spec, volumeContext.cacheClass, class.UID, volumeContext.maxBytes)
+	policy, err := policyFor(class.Object.Spec, volumeContext.cacheClass, class.UID, volumeContext.maxBytes, s.options.ProjectQuotaEnabled)
 	if err != nil {
 		return "", cache.Policy{}, err
 	}
@@ -275,7 +275,7 @@ func (s *Server) resolve(ctx context.Context, volumeContext podVolumeContext) (s
 	return identity, policy, err
 }
 
-func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requestedMaxBytes string) (cache.Policy, error) {
+func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requestedMaxBytes string, projectQuotaEnabled bool) (cache.Policy, error) {
 	if err := spec.Validate(); err != nil {
 		return cache.Policy{}, err
 	}
@@ -284,22 +284,28 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 		sharingPolicy = cachev1alpha1.SharingPolicyExclusive
 	}
 	policy := cache.Policy{
-		ClassName:          className,
-		ClassUID:           classUID,
-		SharingPolicy:      string(sharingPolicy),
-		NoExec:             spec.NoExec,
-		SchemaVersion:      spec.SchemaVersion,
-		CrashRecoveryReuse: spec.CrashRecovery == "reuse",
-		QuotaEnabled:       spec.Storage.Backend == cachev1alpha1.BackendXFSProject,
-		Retention:          spec.Retention.Duration,
+		ClassName:     className,
+		ClassUID:      classUID,
+		SharingPolicy: string(sharingPolicy),
+		NoExec:        spec.NoExec,
+		SchemaVersion: spec.SchemaVersion,
+		QuotaEnabled:  projectQuotaEnabled,
+		Retention:     spec.Retention.Duration,
 	}
 	if policy.SchemaVersion == "" {
 		policy.SchemaVersion = "v1"
 	}
 	classMaxBytes := spec.Storage.MaxBytes.Value()
+	defaultMaxBytes := spec.Storage.DefaultMaxBytes.Value()
+	if !policy.QuotaEnabled && (classMaxBytes > 0 || defaultMaxBytes > 0 || requestedMaxBytes != "") {
+		return cache.Policy{}, errors.New("CacheClass size limits require the node's xfs-project storage backend")
+	}
+	if policy.QuotaEnabled && classMaxBytes <= 0 && defaultMaxBytes <= 0 {
+		return cache.Policy{}, errors.New("xfs-project storage backend requires CacheClass maxBytes or defaultMaxBytes")
+	}
 	if requestedMaxBytes != "" {
 		if !policy.QuotaEnabled {
-			return cache.Policy{}, errors.New("maxBytes requires an XFS project quota CacheClass")
+			return cache.Policy{}, errors.New("maxBytes requires the node's xfs-project storage backend")
 		}
 		requested, err := resource.ParseQuantity(requestedMaxBytes)
 		if err != nil || requested.Sign() <= 0 {
@@ -309,8 +315,8 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 			return cache.Policy{}, errors.New("maxBytes exceeds the CacheClass per-cache quota ceiling")
 		}
 		policy.MaxBytes = requested.Value()
-	} else if spec.Storage.DefaultMaxBytes.Sign() > 0 {
-		policy.MaxBytes = spec.Storage.DefaultMaxBytes.Value()
+	} else if defaultMaxBytes > 0 {
+		policy.MaxBytes = defaultMaxBytes
 	} else {
 		policy.MaxBytes = classMaxBytes
 	}
@@ -321,12 +327,12 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 }
 
 func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolumeRequest, identity string, lease cache.Lease, policy cache.Policy, outcome string) error {
-	source, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
+	_, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 	if errors.Is(err, cache.ErrDegradedMetadata) {
 		if quarantineErr := s.store.QuarantineDegradedObject(identity, s.mounter.sourceMounted); quarantineErr != nil {
-			return s.nodeBackendError(ctx, "CacheQuarantineFailed", quarantineErr, true)
+			return s.nodeBackendError(ctx, "CacheQuarantineFailed", quarantineErr)
 		}
-		source, _, err = s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
+		_, _, err = s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 		if errors.Is(err, cache.ErrDegradedMetadata) {
 			return status.Error(codes.Unavailable, "cache object is degraded and cannot be replaced while one of its generations remains mounted")
 		}
@@ -334,18 +340,17 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 	if err != nil {
 		return s.cacheAcquireError(ctx, err)
 	}
-	_, storedLease, storedSource, storedPolicy, found, err := s.store.LeaseDetails(req.GetVolumeId())
+	_, storedLease, source, storedPolicy, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil || !found {
 		if err == nil {
 			err = errors.New("cache lease disappeared after acquisition")
 		}
 		return s.rollbackPublish(ctx, req, status.Errorf(codes.Internal, "read acquired cache lease: %v", err))
 	}
-	source = storedSource
 	policy = storedPolicy
 	policy.NoExec = storedLease.NoExec
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {
-		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheQuotaUnavailable", err, true))
+		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheQuotaUnavailable", err))
 	}
 	source, err = s.store.Expose(identity)
 	if err != nil {
@@ -356,7 +361,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 				err = errors.Join(err, quarantineErr)
 			}
 		}
-		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheGenerationExposeFailed", err, true))
+		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheGenerationExposeFailed", err))
 	}
 	return s.publishMountedCache(ctx, req, source, policy.NoExec, outcome)
 }
@@ -368,13 +373,13 @@ func (s *Server) cacheAcquireError(ctx context.Context, err error) error {
 	case errors.Is(err, cache.ErrPressureActive):
 		return s.markNodeUnavailable(ctx, "CacheFilesystemPressure", err, false)
 	default:
-		return s.nodeBackendError(ctx, "CacheAcquireFailed", err, true)
+		return s.nodeBackendError(ctx, "CacheAcquireFailed", err)
 	}
 }
 
 func (s *Server) rollbackPublish(ctx context.Context, req *csi.NodePublishVolumeRequest, publishErr error) error {
 	if err := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); err != nil {
-		return s.nodeBackendError(ctx, "CacheLeaseRollbackFailed", errors.Join(publishErr, err), true)
+		return s.nodeBackendError(ctx, "CacheLeaseRollbackFailed", errors.Join(publishErr, err))
 	}
 	return publishErr
 }
@@ -386,7 +391,7 @@ func (s *Server) publishMountedCache(ctx context.Context, req *csi.NodePublishVo
 	if err := s.mounter.mount(source, req.GetTargetPath(), req.GetReadonly(), noExec); err != nil {
 		mounted, inspectErr := s.mounter.mountedAt(req.GetTargetPath())
 		if inspectErr != nil {
-			return s.nodeBackendError(ctx, "CacheMountStateUnknown", errors.Join(err, inspectErr), true)
+			return s.nodeBackendError(ctx, "CacheMountStateUnknown", errors.Join(err, inspectErr))
 		}
 		if mounted {
 			same, verifyErr := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), noExec)
@@ -397,9 +402,9 @@ func (s *Server) publishMountedCache(ctx context.Context, req *csi.NodePublishVo
 				s.recordNormalPublish(outcome)
 				return nil
 			}
-			return s.nodeBackendError(ctx, "CacheMountStateUnknown", errors.Join(err, verifyErr), true)
+			return s.nodeBackendError(ctx, "CacheMountStateUnknown", errors.Join(err, verifyErr))
 		}
-		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheMountUnavailable", err, true))
+		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheMountOperationFailed", err))
 	}
 	if err := s.store.CommitPublish(req.GetVolumeId(), req.GetTargetPath()); err != nil {
 		return s.recordMountedLeaseCommitFailure(ctx, req.GetVolumeId(), err)
@@ -409,9 +414,9 @@ func (s *Server) publishMountedCache(ctx context.Context, req *csi.NodePublishVo
 }
 
 func (s *Server) recordMountedLeaseCommitFailure(ctx context.Context, volumeID string, err error) error {
-	return s.nodeBackendError(ctx, "CacheLeaseCommitFailed", fmt.Errorf("volume %s: %w", volumeID, err), true)
+	return s.nodeBackendError(ctx, "CacheLeaseCommitFailed", fmt.Errorf("volume %s: %w", volumeID, err))
 }
 
-func (s *Server) nodeBackendError(ctx context.Context, reason string, err error, evict bool) error {
-	return s.markNodeUnavailable(ctx, reason, err, evict)
+func (s *Server) nodeBackendError(ctx context.Context, reason string, err error) error {
+	return s.markNodeUnavailable(ctx, reason, err, true)
 }

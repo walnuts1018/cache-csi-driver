@@ -147,7 +147,7 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 		return "", false, ErrQuotaPolicyConflict
 	}
 	policyChanged := requestedPolicyHash != storedPolicyHash
-	if !objectHasLeases && (policyChanged || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
+	if !objectHasLeases && (policyChanged || meta.Dirty) {
 		if err := s.rejectUnderPressure(); err != nil {
 			return "", false, err
 		}
@@ -296,12 +296,6 @@ func (s *Store) activeLeaseCount(meta Metadata) int {
 		}
 	}
 	return count
-}
-
-func (s *Store) hasPreparingGenerationLease(meta Metadata, generation string) bool {
-	return slices.ContainsFunc(meta.Leases, func(lease Lease) bool {
-		return lease.Preparing && (lease.Generation == generation || lease.Generation == "" && generation == meta.Generation)
-	})
 }
 
 func (s *Store) createLease(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {

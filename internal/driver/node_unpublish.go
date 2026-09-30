@@ -75,11 +75,7 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 		return status.Errorf(codes.Internal, "remove cache mount target: %v", err)
 	}
 
-	if errors.Is(leaseErr, cache.ErrDegradedMetadata) {
-		if degradedIdentity != "" {
-			identity = degradedIdentity
-		}
-	} else if leaseErr == nil && found {
+	if leaseErr == nil && found {
 		if err := s.store.Release(req.GetVolumeId(), target); err != nil {
 			s.logger.WarnContext(ctx, "failed to release cache lease after target teardown", "volumeID", req.GetVolumeId(), "root", s.store.Root(), "error", err)
 			_ = s.markNodeUnavailable(ctx, "CacheLeaseReleaseFailed", err, true)

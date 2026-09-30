@@ -22,6 +22,8 @@ type Options struct {
 	ResolverReady      func() bool
 	CapabilityProbe    func(context.Context, string) error
 	FilesystemReadOnly func(string) (bool, error)
+	QuotaRequired      bool
+	QuotaProbe         func(context.Context, string) error
 	Health             *nodehealth.Tracker
 	Logger             *slog.Logger
 	Metrics            *metrics.Metrics
@@ -35,12 +37,11 @@ type Manager struct {
 	resolverReady      func() bool
 	capabilityProbe    func(context.Context, string) error
 	filesystemReadOnly func(string) (bool, error)
+	quotaRequired      bool
+	quotaProbe         func(context.Context, string) error
 	health             *nodehealth.Tracker
 	logger             *slog.Logger
 	metrics            *metrics.Metrics
-	stateMu            sync.Mutex
-	pressureActive     bool
-	maintenanceError   bool
 }
 
 func New(store *cache.Store, options Options) *Manager {
@@ -67,6 +68,8 @@ func New(store *cache.Store, options Options) *Manager {
 		resolverReady:      options.ResolverReady,
 		capabilityProbe:    options.CapabilityProbe,
 		filesystemReadOnly: options.FilesystemReadOnly,
+		quotaRequired:      options.QuotaRequired,
+		quotaProbe:         options.QuotaProbe,
 		health:             options.Health,
 		logger:             options.Logger,
 		metrics:            options.Metrics,
@@ -74,7 +77,8 @@ func New(store *cache.Store, options Options) *Manager {
 }
 
 func (manager *Manager) Recover(ctx context.Context) error {
-	manager.health.Set(nodehealth.PhaseRecovering, "CacheRecovery", false)
+	manager.health.ClearCondition(nodehealth.SubsystemStartup)
+	manager.health.SetCondition(nodehealth.SubsystemRecovery, nodehealth.PhaseRecovering, "CacheRecovery", false)
 	if manager.metrics != nil {
 		manager.metrics.SetRecoveryState("primary", "recovering")
 	}
@@ -86,21 +90,18 @@ func (manager *Manager) Recover(ctx context.Context) error {
 		return manager.recoveryFailure(started, errors.New("mount inspector is not configured"))
 	}
 	if err := manager.store.WaitForIndexes(ctx); err != nil {
-		manager.classifyRecoveryFailure()
+		manager.classifyRecoveryFailure(ctx)
 		return manager.recoveryFailure(started, fmt.Errorf("wait for cache indexes under %s: %w", manager.store.Root(), err))
 	}
 	if err := manager.store.RecoverLeasesContext(ctx, manager.inspectMount); err != nil {
-		manager.classifyRecoveryFailure()
+		manager.classifyRecoveryFailure(ctx)
 		return manager.recoveryFailure(started, fmt.Errorf("recover cache leases under %s: %w", manager.store.Root(), err))
 	}
-	if err := manager.backendHealth(); err != nil {
-		manager.health.Set(nodehealth.PhaseUnavailable, "CacheBackendUnavailable", true)
+	if err := manager.backendHealth(ctx, true); err != nil {
 		return manager.recoveryFailure(started, err)
 	}
-	if err := manager.store.CheckFilesystem(); err != nil {
-		manager.health.Set(nodehealth.PhaseUnavailable, "CacheBackendUnavailable", true)
-		return manager.recoveryFailure(started, fmt.Errorf("probe cache filesystem under %s: %w", manager.store.Root(), err))
-	}
+	manager.health.ClearCondition(nodehealth.SubsystemRecovery)
+	manager.health.ClearCondition(nodehealth.SubsystemStartup)
 	manager.refreshHealth(ctx)
 	if manager.metrics != nil {
 		manager.metrics.RecordRecoveryAttempt("primary", "success", time.Since(started).Seconds())
@@ -118,20 +119,9 @@ func (manager *Manager) recoveryFailure(started time.Time, err error) error {
 	return err
 }
 
-func (manager *Manager) classifyRecoveryFailure() {
-	if !manager.store.Ready() {
-		if err := manager.store.CheckFilesystem(); err != nil {
-			manager.health.Set(nodehealth.PhaseUnavailable, "CacheBackendUnavailable", true)
-			return
-		}
-		manager.health.Set(nodehealth.PhaseRecovering, "CacheRecovery", false)
-		return
-	}
-	if err := manager.backendHealth(); err != nil {
-		manager.health.Set(nodehealth.PhaseUnavailable, "CacheBackendUnavailable", true)
-		return
-	}
-	manager.health.Set(nodehealth.PhaseRecovering, "CacheRecovery", false)
+func (manager *Manager) classifyRecoveryFailure(ctx context.Context) {
+	manager.health.SetCondition(nodehealth.SubsystemRecovery, nodehealth.PhaseRecovering, "CacheRecovery", false)
+	_ = manager.backendHealth(ctx, false)
 }
 
 func (manager *Manager) Run(ctx context.Context) {
@@ -193,22 +183,19 @@ func (manager *Manager) observePressure(ctx context.Context, requests chan<- str
 	active, err := manager.store.ObservePressure()
 	if err != nil {
 		manager.logger.ErrorContext(ctx, "observe cache filesystem pressure failed", "root", manager.store.Root(), "error", err)
-		manager.health.Set(nodehealth.PhaseUnavailable, "CacheFilesystemUnavailable", true)
+		manager.health.SetCondition(nodehealth.SubsystemPressure, nodehealth.PhaseUnavailable, "CacheFilesystemUnavailable", true)
 		return
 	}
-	manager.setPressure(active)
 	manager.syncStoreMetrics()
 	if active {
-		current := manager.health.Current()
-		if current.Phase != nodehealth.PhaseUnavailable || current.Reason != "CacheFilesystemPressure" || !current.Evict {
-			manager.health.Set(nodehealth.PhaseUnavailable, "CacheFilesystemPressure", false)
-		}
+		manager.health.SetCondition(nodehealth.SubsystemPressure, nodehealth.PhaseUnavailable, "CacheFilesystemPressure", false)
 		select {
 		case requests <- struct{}{}:
 		default:
 		}
 		return
 	}
+	manager.health.ClearCondition(nodehealth.SubsystemPressure)
 	manager.refreshHealth(ctx)
 }
 
@@ -232,18 +219,17 @@ func (manager *Manager) pressure(ctx context.Context) {
 	}
 	active, err := manager.store.ObservePressure()
 	if err != nil {
-		manager.setPressure(true)
-		manager.health.Set(nodehealth.PhaseUnavailable, "CacheFilesystemUnavailable", true)
+		manager.health.SetCondition(nodehealth.SubsystemPressure, nodehealth.PhaseUnavailable, "CacheFilesystemUnavailable", true)
 		manager.logger.ErrorContext(ctx, "inspect cache filesystem after pressure reclaim failed", "root", manager.store.Root(), "error", err)
 		return
 	}
-	manager.setPressure(active)
 	if active {
-		manager.health.Set(nodehealth.PhaseUnavailable, "CacheFilesystemPressure", true)
+		manager.health.SetCondition(nodehealth.SubsystemPressure, nodehealth.PhaseUnavailable, "CacheFilesystemPressure", true)
 		manager.logger.WarnContext(ctx, "cache filesystem remains under pressure after unused cache reclamation")
 	} else {
-		manager.refreshHealth(ctx)
+		manager.health.ClearCondition(nodehealth.SubsystemPressure)
 	}
+	manager.refreshHealth(ctx)
 	manager.syncStoreMetrics()
 }
 
@@ -256,9 +242,9 @@ func (manager *Manager) recoverDegraded(ctx context.Context) {
 			return
 		}
 		manager.logger.WarnContext(ctx, "degraded cache recovery was incomplete", "root", manager.store.Root(), "error", err)
-		manager.setMaintenanceError(true)
+		manager.health.SetCondition(nodehealth.SubsystemDegradedRecovery, nodehealth.PhaseDegraded, "CacheDegradedRecoveryFailed", false)
 	} else {
-		manager.setMaintenanceError(false)
+		manager.health.ClearCondition(nodehealth.SubsystemDegradedRecovery)
 	}
 	manager.refreshHealth(ctx)
 	manager.syncStoreMetrics()
@@ -274,84 +260,141 @@ func (manager *Manager) collect(ctx context.Context, now time.Time) {
 		collectionErr = errors.Join(collectionErr, fmt.Errorf("clean cache trash: %w", err))
 		manager.logger.ErrorContext(ctx, "cache trash cleanup failed", "root", manager.store.Root(), "error", err)
 	}
-	manager.setMaintenanceError(collectionErr != nil)
+	if collectionErr != nil {
+		manager.health.SetCondition(nodehealth.SubsystemGarbageCollector, nodehealth.PhaseDegraded, "CacheCollectionDegraded", false)
+	} else {
+		manager.health.ClearCondition(nodehealth.SubsystemGarbageCollector)
+	}
 	manager.refreshHealth(ctx)
 	manager.syncStoreMetrics()
 }
 
 func (manager *Manager) refreshHealth(ctx context.Context) {
-	if err := manager.backendHealth(); err != nil {
-		manager.health.Set(nodehealth.PhaseUnavailable, "CacheBackendUnavailable", true)
-		return
-	}
-	manager.stateMu.Lock()
-	pressureActive := manager.pressureActive
-	maintenanceError := manager.maintenanceError
-	manager.stateMu.Unlock()
-	current := manager.health.Current()
-	if current.Phase == nodehealth.PhaseUnavailable {
-		if current.Reason == "CacheFilesystemPressure" && pressureActive {
-			return
-		}
-		if current.Reason != "CacheFilesystemPressure" && current.Reason != "CacheBackendUnavailable" && current.Reason != "CacheFilesystemUnavailable" {
-			if manager.capabilityProbe == nil {
-				return
-			}
-			probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := manager.capabilityProbe(probeContext, current.Reason)
-			cancel()
-			if err != nil {
-				return
-			}
-		}
-		if err := manager.store.CheckFilesystem(); err != nil {
-			manager.health.Set(nodehealth.PhaseUnavailable, "CacheBackendUnavailable", true)
-			return
-		}
-	}
-	if pressureActive {
-		return
-	}
-	if err := manager.store.MetadataError(); err != nil {
-		manager.health.Set(nodehealth.PhaseDegraded, "CacheMetadataDegraded", false)
-		return
-	}
-	if maintenanceError {
-		manager.health.Set(nodehealth.PhaseDegraded, "CacheMaintenanceDegraded", false)
-		return
-	}
-	manager.health.Set(nodehealth.PhaseReady, "CacheReady", false)
+	_ = manager.backendHealth(ctx, false)
+	manager.probeReportedCapabilities(ctx)
 }
 
-func (manager *Manager) backendHealth() error {
-	if !manager.store.Ready() {
+func (manager *Manager) backendHealth(ctx context.Context, probeCapabilities bool) error {
+	var healthErrors []error
+	initialization := manager.store.InitializationStatus()
+	if initialization.State == cache.InitializationInitializing {
+		manager.health.ClearCondition(nodehealth.SubsystemStore)
+		manager.health.SetCondition(nodehealth.SubsystemRecovery, nodehealth.PhaseRecovering, "CacheRecovery", false)
 		return cache.ErrStoreNotReady
 	}
+	if initialization.State == cache.InitializationRetryableFailed || initialization.State == cache.InitializationNodeWideFailed {
+		reason := "CacheStoreInitializationRetrying"
+		evict := false
+		if initialization.State == cache.InitializationNodeWideFailed {
+			reason = "CacheStoreInitializationFailed"
+			evict = true
+		}
+		failure := fmt.Errorf("cache store initialization failed: %w", initialization.Err)
+		manager.health.SetCondition(nodehealth.SubsystemStore, nodehealth.PhaseUnavailable, reason, evict)
+		return failure
+	}
+	if !manager.store.Ready() {
+		manager.health.ClearCondition(nodehealth.SubsystemStore)
+		manager.health.SetCondition(nodehealth.SubsystemRecovery, nodehealth.PhaseRecovering, "CacheRecovery", false)
+		return cache.ErrStoreNotReady
+	}
+	manager.health.ClearCondition(nodehealth.SubsystemStore)
+	var filesystemError error
 	if manager.filesystemReadOnly != nil {
 		readOnly, err := manager.filesystemReadOnly(manager.store.Root())
 		if err != nil {
-			return fmt.Errorf("inspect cache root filesystem: %w", err)
-		}
-		if readOnly {
-			return errors.New("cache root filesystem is read-only")
+			filesystemError = fmt.Errorf("inspect cache root filesystem: %w", err)
+		} else if readOnly {
+			filesystemError = errors.New("cache root filesystem is read-only")
 		}
 	}
-	if err := manager.store.ProjectRegistryError(); err != nil {
-		return fmt.Errorf("cache project quota registry is unavailable: %w", err)
+	if filesystemError == nil && (probeCapabilities || hasCondition(manager.health, nodehealth.SubsystemFilesystem)) {
+		if err := manager.store.CheckFilesystem(); err != nil {
+			filesystemError = fmt.Errorf("probe cache filesystem under %s: %w", manager.store.Root(), err)
+		}
 	}
-	return nil
+	if filesystemError != nil {
+		manager.health.SetCondition(nodehealth.SubsystemFilesystem, nodehealth.PhaseUnavailable, "CacheFilesystemUnavailable", true)
+		healthErrors = append(healthErrors, filesystemError)
+	} else {
+		manager.health.ClearCondition(nodehealth.SubsystemFilesystem)
+	}
+	if manager.quotaRequired {
+		if manager.quotaProbe == nil {
+			failure := errors.New("cache quota is required but no quota capability probe is configured")
+			manager.health.SetCondition(nodehealth.SubsystemQuota, nodehealth.PhaseUnavailable, "CacheQuotaProbeUnavailable", true)
+			healthErrors = append(healthErrors, failure)
+		} else if probeCapabilities || hasCondition(manager.health, nodehealth.SubsystemQuota) {
+			probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := manager.quotaProbe(probeContext, manager.store.Root())
+			cancel()
+			if err != nil {
+				failure := fmt.Errorf("probe cache quota backend: %w", err)
+				manager.health.SetCondition(nodehealth.SubsystemQuota, nodehealth.PhaseUnavailable, "CacheQuotaUnavailable", true)
+				healthErrors = append(healthErrors, failure)
+			} else {
+				manager.health.ClearCondition(nodehealth.SubsystemQuota)
+			}
+		}
+		if err := manager.store.ProjectRegistryError(); err != nil {
+			failure := fmt.Errorf("cache project quota registry is unavailable: %w", err)
+			manager.health.SetCondition(nodehealth.SubsystemProjectRegistry, nodehealth.PhaseUnavailable, "CacheProjectRegistryUnavailable", true)
+			healthErrors = append(healthErrors, failure)
+		} else {
+			manager.health.ClearCondition(nodehealth.SubsystemProjectRegistry)
+		}
+	} else {
+		manager.health.ClearCondition(nodehealth.SubsystemQuota)
+		manager.health.ClearCondition(nodehealth.SubsystemProjectRegistry)
+	}
+	return errors.Join(healthErrors...)
 }
 
-func (manager *Manager) setPressure(active bool) {
-	manager.stateMu.Lock()
-	manager.pressureActive = active
-	manager.stateMu.Unlock()
+func (manager *Manager) probeReportedCapabilities(ctx context.Context) {
+	for _, condition := range manager.health.Conditions() {
+		if condition.Phase != nodehealth.PhaseUnavailable {
+			continue
+		}
+		switch condition.Subsystem {
+		case nodehealth.SubsystemQuota:
+			if manager.quotaRequired && manager.quotaProbe != nil {
+				probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+				err := manager.quotaProbe(probeContext, manager.store.Root())
+				cancel()
+				if err == nil {
+					manager.health.ClearCondition(condition.Subsystem)
+				}
+			}
+		case nodehealth.SubsystemMount:
+			if manager.capabilityProbe != nil {
+				probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+				err := manager.capabilityProbe(probeContext, condition.Reason)
+				cancel()
+				if err == nil {
+					manager.health.ClearCondition(condition.Subsystem)
+				}
+			}
+		case nodehealth.SubsystemStartup,
+			nodehealth.SubsystemRecovery,
+			nodehealth.SubsystemStore,
+			nodehealth.SubsystemStoreOperations,
+			nodehealth.SubsystemFilesystem,
+			nodehealth.SubsystemProjectRegistry,
+			nodehealth.SubsystemPressure,
+			nodehealth.SubsystemGarbageCollector,
+			nodehealth.SubsystemDegradedRecovery:
+			continue
+		}
+	}
 }
 
-func (manager *Manager) setMaintenanceError(active bool) {
-	manager.stateMu.Lock()
-	manager.maintenanceError = active
-	manager.stateMu.Unlock()
+func hasCondition(tracker *nodehealth.Tracker, subsystem nodehealth.Subsystem) bool {
+	for _, condition := range tracker.Conditions() {
+		if condition.Subsystem == subsystem {
+			return true
+		}
+	}
+	return false
 }
 
 func (manager *Manager) syncStoreMetrics() {

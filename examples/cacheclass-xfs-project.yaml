@@ -4,9 +4,7 @@ metadata:
   name: xfs-project
 spec:
   storage:
-    backend: xfs-project
     maxBytes: 64Gi
     defaultMaxBytes: 16Gi
   retention: 72h
   schemaVersion: v1
-  crashRecovery: discard

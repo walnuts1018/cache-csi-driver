@@ -187,7 +187,7 @@ func (manager *pressureManager) underLowWatermark(fs unix.Statfs_t) bool {
 func (manager *pressureManager) updatePressure(fs unix.Statfs_t) bool {
 	if !manager.pressureActive {
 		manager.pressureActive = manager.underLowWatermark(fs)
-		manager.updatePressureState(fs)
+		manager.updatePressureState()
 		return manager.pressureActive
 	}
 	bytesRecovered := manager.pressure.HighFreePercent == 0 || above(fs.Bavail, fs.Blocks, manager.pressure.HighFreePercent)
@@ -195,11 +195,11 @@ func (manager *pressureManager) updatePressure(fs unix.Statfs_t) bool {
 	if bytesRecovered && inodesRecovered {
 		manager.pressureActive = false
 	}
-	manager.updatePressureState(fs)
+	manager.updatePressureState()
 	return manager.pressureActive
 }
 
-func (manager *pressureManager) updatePressureState(fs unix.Statfs_t) {
+func (manager *pressureManager) updatePressureState() {
 	manager.pressureState = pressureStateNormal
 	if !manager.pressureActive {
 		return

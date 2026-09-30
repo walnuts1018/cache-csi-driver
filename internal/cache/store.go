@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -38,8 +39,25 @@ type StoreOptions struct {
 	Pressure              PressureConfig
 	ProjectIDStart        uint32
 	ProjectIDCount        uint32
+	ProjectQuotaEnabled   bool
 	UnmountGeneration     func(string) error
 	RequireRootMountpoint bool
+}
+
+type InitializationState string
+
+const (
+	InitializationInitializing    InitializationState = "initializing"
+	InitializationReady           InitializationState = "ready"
+	InitializationRetryableFailed InitializationState = "retryable-failure"
+	InitializationNodeWideFailed  InitializationState = "node-wide-failure"
+)
+
+const initializationFailureEscalation = 3
+
+type InitializationStatus struct {
+	State InitializationState
+	Err   error
 }
 
 type Store struct {
@@ -47,6 +65,7 @@ type Store struct {
 	generationManager    generationManager
 	leaseManager         leaseManager
 	projectQuotaRegistry projectQuotaRegistry
+	projectQuotaEnabled  bool
 	pressureManager      pressureManager
 	trashCollector       trashCollector
 	unmountGeneration    func(string) error
@@ -54,7 +73,9 @@ type Store struct {
 	closeOnce            sync.Once
 	closeErr             error
 	initDone             chan struct{}
+	initState            InitializationState
 	initErr              error
+	initFailures         uint
 	indexReady           atomic.Bool
 	ready                atomic.Bool
 	// lease lockを取得してからidentity lockを取得し、project registry lockの後にmuを取得します。muはfilesystem I/O中に保持しません。
@@ -203,20 +224,38 @@ func (s *Store) Ready() bool {
 }
 
 func (s *Store) WaitForIndexes(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.initDone:
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status := s.InitializationStatus()
+		switch status.State {
+		case InitializationInitializing:
+		case InitializationReady:
+			return nil
+		case InitializationRetryableFailed, InitializationNodeWideFailed:
+			return fmt.Errorf("initialize cache indexes: %w", status.Err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.initDone:
+			if status.Err != nil {
+				return fmt.Errorf("initialize cache indexes: %w", status.Err)
+			}
+			return ErrStoreNotReady
+		case <-ticker.C:
+		}
 	}
+}
+
+func (s *Store) InitializationError() error {
+	return s.InitializationStatus().Err
+}
+
+func (s *Store) InitializationStatus() InitializationStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.initErr != nil {
-		return fmt.Errorf("initialize cache indexes: %w", s.initErr)
-	}
-	if !s.indexReady.Load() {
-		return ErrStoreNotReady
-	}
-	return nil
+	return InitializationStatus{State: s.initState, Err: s.initErr}
 }
 
 func (repository *metadataRepository) relative(path string) (string, error) {
@@ -286,8 +325,8 @@ func NewStore(root string, options StoreOptions) (*Store, error) {
 	return newStoreMode(root, options, true, true)
 }
 
-func newStore(root string, options StoreOptions, startTrashCollector bool) (*Store, error) {
-	return newStoreMode(root, options, true, startTrashCollector)
+func newStore(root string, options StoreOptions) (*Store, error) {
+	return newStoreMode(root, options, true, false)
 }
 
 func NewStoreAsync(root string, options StoreOptions) (*Store, error) {
@@ -311,7 +350,7 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		return nil, err
 	}
 	if options.RequireRootMountpoint {
-		if err := validateRootMountpoint(root); err != nil {
+		if err := validateRootMountpoint(root, !options.ProjectQuotaEnabled); err != nil {
 			_ = rootFS.Close()
 			return nil, fmt.Errorf("validate cache root mountpoint: %w", err)
 		}
@@ -333,18 +372,24 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		generationManager:    generationManager{metadataByIdentity: make(map[string]Metadata), leaseIndex: make(map[string]string), degraded: make(map[string]error)},
 		leaseManager:         leaseManager{},
 		projectQuotaRegistry: projectQuotaRegistry{projectIDStart: options.ProjectIDStart, projectIDCount: options.ProjectIDCount, projectReservations: make(map[uint32][]projectReservation), projectOwnersByID: make(map[uint32]projectReservationKey), projectIDByGeneration: make(map[projectReservationKey]uint32), unknownProjectReservations: make(map[string]string)},
+		projectQuotaEnabled:  options.ProjectQuotaEnabled,
 		pressureManager:      pressureManager{pressure: options.Pressure, pressureState: pressureStateNormal},
 		trashCollector:       trashCollector{trashMetadata: make(map[string]Metadata), stopTrash: make(chan struct{}), trashDone: make(chan struct{}), trashRequests: make(chan chan error)},
 		unmountGeneration:    options.UnmountGeneration,
 		initDone:             make(chan struct{}),
+		initState:            InitializationInitializing,
 	}
 	if initializeIndexes {
 		if err := store.rebuildIndexes(); err != nil {
+			store.initErr = err
+			store.initFailures++
+			store.initState = classifyInitializationError(err, store.initFailures)
 			_ = rootFS.Close()
 			return nil, fmt.Errorf("rebuild cache indexes: %w", err)
 		}
 		store.indexReady.Store(true)
 		store.ready.Store(true)
+		store.initState = InitializationReady
 		close(store.initDone)
 		if startTrashCollector {
 			store.startTrashCollector()
@@ -376,6 +421,14 @@ func (s *Store) initializeIndexes() {
 		s.mu.Lock()
 		s.initErr = err
 		s.indexReady.Store(err == nil)
+		s.ready.Store(err == nil)
+		if err == nil {
+			s.initFailures = 0
+			s.initState = InitializationReady
+		} else {
+			s.initFailures++
+			s.initState = classifyInitializationError(err, s.initFailures)
+		}
 		s.mu.Unlock()
 		if err == nil {
 			s.startTrashCollector()
@@ -389,6 +442,18 @@ func (s *Store) initializeIndexes() {
 		case <-timer.C:
 		}
 	}
+}
+
+func classifyInitializationError(err error, failures uint) InitializationState {
+	for _, temporary := range []error{syscall.EAGAIN, syscall.EBUSY, syscall.EINTR, syscall.EIO, syscall.ENOSPC, syscall.EROFS} {
+		if errors.Is(err, temporary) {
+			if failures < initializationFailureEscalation {
+				return InitializationRetryableFailed
+			}
+			return InitializationNodeWideFailed
+		}
+	}
+	return InitializationNodeWideFailed
 }
 
 func (s *Store) resetIndexState() {

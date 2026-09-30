@@ -80,6 +80,7 @@ func (s *Server) NodeGetStorageHealth(context.Context, *csi.NodeGetStorageHealth
 		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, snapshot.Reason, "cache node is unavailable")
 	case nodehealth.PhaseDegraded:
 		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, snapshot.Reason, "cache node is degraded")
+	case nodehealth.PhaseReady:
 	}
 	if !s.store.Ready() {
 		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheRecoveryInProgress", "cache store recovery is still in progress")
@@ -91,14 +92,10 @@ func (s *Server) NodeGetStorageHealth(context.Context, *csi.NodeGetStorageHealth
 	if readOnly {
 		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, "CacheRootReadOnly", "cache filesystem is read-only")
 	}
-	if err := s.store.ProjectRegistryError(); err != nil {
-		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheProjectIDRegistryUnavailable", "cache project ID registry is unavailable")
-	}
-	if err := s.store.MetadataError(); err != nil {
-		if errors.Is(err, cache.ErrDegradedMetadata) {
-			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheObjectDegraded", "one or more cache objects are being recovered")
+	if s.options.ProjectQuotaEnabled {
+		if err := s.store.ProjectRegistryError(); err != nil {
+			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheProjectIDRegistryUnavailable", "cache project ID registry is unavailable")
 		}
-		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheMetadataUnavailable", "cache metadata is unavailable")
 	}
 	return &csi.NodeGetStorageHealthResponse{}, nil
 }

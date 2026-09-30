@@ -56,7 +56,8 @@ func run(logger *slog.Logger) error {
 	endpoint := flag.String("endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint")
 	metricsAddress := flag.String("metrics-address", ":9807", "Prometheus metrics HTTP listen address")
 	cacheRoot := flag.String("cache-root", "/var/lib/cache-csi", "cache storage directory")
-	requireCacheRootMountpoint := flag.Bool("require-cache-root-mountpoint", false, "require cache-root to be a filesystem mountpoint before measuring filesystem-wide pressure")
+	storageBackend := flag.String("storage-backend", "directory", "node-wide cache storage backend: directory or xfs-project")
+	requireCacheRootMountpoint := flag.Bool("require-cache-root-mountpoint", true, "require cache-root to be a filesystem mountpoint")
 	nodeID := flag.String("node-id", os.Getenv("NODE_NAME"), "Kubernetes node name")
 	healthNamespace := flag.String("health-namespace", os.Getenv("POD_NAMESPACE"), "namespace for the node health Lease")
 	kubeletRoot := flag.String("kubelet-root", "/var/lib/kubelet", "kubelet root directory")
@@ -72,31 +73,14 @@ func run(logger *slog.Logger) error {
 	if err := validateRuntimeConfig(*gcInterval, *projectIDStart, *projectIDCount, *nodeID); err != nil {
 		return err
 	}
+	projectQuotaEnabled, err := validateStorageBackend(*storageBackend, *requireCacheRootMountpoint)
+	if err != nil {
+		return err
+	}
 	paths, err := resolveRuntimePaths(*cacheRoot, *kubeletRoot, *endpoint)
 	if err != nil {
 		return err
 	}
-	if err := driver.PreflightMountAPI(); err != nil {
-		return fmt.Errorf("preflight Linux mount APIs: %w", err)
-	}
-
-	pressure := cache.PressureConfig{
-		HighFreePercent:      *highFreePercent,
-		LowFreePercent:       *lowFreePercent,
-		HighInodeFreePercent: *highInodeFreePercent,
-		LowInodeFreePercent:  *lowInodeFreePercent,
-	}
-	store, err := cache.NewStoreAsync(*cacheRoot, cache.StoreOptions{
-		Pressure:              pressure,
-		ProjectIDStart:        uint32(*projectIDStart),
-		ProjectIDCount:        uint32(*projectIDCount),
-		RequireRootMountpoint: *requireCacheRootMountpoint,
-	})
-	if err != nil {
-		return fmt.Errorf("initialize cache store: %w", err)
-	}
-	defer func() { _ = store.Close() }()
-
 	metricSet := metrics.New()
 	health := nodehealth.NewTracker()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -106,17 +90,29 @@ func run(logger *slog.Logger) error {
 	if resolver != nil {
 		resolver.Start(ctx)
 	}
-	if client == nil {
-		logger.Error("Kubernetes client is unavailable; Cache CSI remains unavailable until the process restarts")
-		health.Set(nodehealth.PhaseUnavailable, "KubernetesClientUnavailable", false)
-	} else if *healthNamespace == "" {
-		logger.Error("POD_NAMESPACE is required to publish node cache health")
-		health.Set(nodehealth.PhaseUnavailable, "HealthNamespaceUnavailable", false)
-	} else {
-		reporter, reporterErr := nodehealth.NewReporter(client, *healthNamespace, *nodeID, health, logger)
-		if reporterErr != nil {
-			return fmt.Errorf("configure node health Lease reporter: %w", reporterErr)
-		}
+	reporter, err := configureNodeHealthReporter(client, *healthNamespace, *nodeID, health, logger)
+	if err != nil {
+		return err
+	}
+
+	pressure := cache.PressureConfig{
+		HighFreePercent:      *highFreePercent,
+		LowFreePercent:       *lowFreePercent,
+		HighInodeFreePercent: *highInodeFreePercent,
+		LowInodeFreePercent:  *lowInodeFreePercent,
+	}
+	store, err := initializeNodeStore(ctx, *cacheRoot, cache.StoreOptions{
+		Pressure:              pressure,
+		ProjectIDStart:        uint32(*projectIDStart),
+		ProjectIDCount:        uint32(*projectIDCount),
+		ProjectQuotaEnabled:   projectQuotaEnabled,
+		RequireRootMountpoint: *requireCacheRootMountpoint,
+	}, health, reporter)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+	if reporter != nil {
 		go reporter.Run(ctx)
 	}
 
@@ -127,25 +123,28 @@ func run(logger *slog.Logger) error {
 		FilesystemReadOnly: driver.FilesystemReadOnly,
 		CapabilityProbe: func(probeContext context.Context, reason string) error {
 			switch reason {
-			case "CacheQuotaUnavailable":
-				return quotaBackend.Check(probeContext, *cacheRoot)
 			case "CacheMountUnavailable":
 				return driver.PreflightMountAPI()
 			default:
-				return nil
+				return fmt.Errorf("no capability probe is configured for %q", reason)
 			}
+		},
+		QuotaRequired: projectQuotaEnabled,
+		QuotaProbe: func(probeContext context.Context, root string) error {
+			return quotaBackend.Check(probeContext, root)
 		},
 		Health:  health,
 		Logger:  logger,
 		Metrics: metricSet,
 	})
 	service := driver.New(store, resolver, quotaBackend, driver.Options{
-		NodeID:        *nodeID,
-		KubeletRoot:   *kubeletRoot,
-		VendorVersion: version,
-		Metrics:       metricSet,
-		Logger:        logger,
-		Health:        health,
+		NodeID:              *nodeID,
+		KubeletRoot:         *kubeletRoot,
+		VendorVersion:       version,
+		ProjectQuotaEnabled: projectQuotaEnabled,
+		Metrics:             metricSet,
+		Logger:              logger,
+		Health:              health,
 	})
 	grpcServer := grpc.NewServer()
 	csi.RegisterIdentityServer(grpcServer, service)
@@ -237,6 +236,57 @@ func run(logger *slog.Logger) error {
 	return nil
 }
 
+func validateStorageBackend(backend string, requireRootMountpoint bool) (bool, error) {
+	switch backend {
+	case "directory":
+		if !requireRootMountpoint {
+			return false, errors.New("directory storage backend requires cache-root to be a filesystem mountpoint")
+		}
+		return false, nil
+	case "xfs-project":
+		return true, nil
+	default:
+		return false, fmt.Errorf("unsupported storage backend %q", backend)
+	}
+}
+
+func configureNodeHealthReporter(client kubernetes.Interface, namespace, nodeID string, health *nodehealth.Tracker, logger *slog.Logger) (*nodehealth.Reporter, error) {
+	if client == nil {
+		logger.Error("Kubernetes client is unavailable; Cache CSI remains unavailable until the process restarts")
+		health.SetCondition(nodehealth.SubsystemStartup, nodehealth.PhaseUnavailable, "KubernetesClientUnavailable", false)
+		return nil, nil
+	}
+	if namespace == "" {
+		logger.Error("POD_NAMESPACE is required to publish node cache health")
+		health.SetCondition(nodehealth.SubsystemStartup, nodehealth.PhaseUnavailable, "HealthNamespaceUnavailable", false)
+		return nil, nil
+	}
+	reporter, err := nodehealth.NewReporter(client, namespace, nodeID, health, logger)
+	if err != nil {
+		return nil, fmt.Errorf("configure node health Lease reporter: %w", err)
+	}
+	return reporter, nil
+}
+
+func initializeNodeStore(ctx context.Context, root string, options cache.StoreOptions, health *nodehealth.Tracker, reporter *nodehealth.Reporter) (*cache.Store, error) {
+	if err := driver.PreflightMountAPI(); err != nil {
+		health.SetCondition(nodehealth.SubsystemMount, nodehealth.PhaseUnavailable, "CacheMountUnavailable", true)
+		if reporter != nil {
+			reporter.Publish(ctx)
+		}
+		return nil, fmt.Errorf("preflight Linux mount APIs: %w", err)
+	}
+	store, err := cache.NewStoreAsync(root, options)
+	if err != nil {
+		health.SetCondition(nodehealth.SubsystemStore, nodehealth.PhaseUnavailable, "CacheStoreInitializationFailed", true)
+		if reporter != nil {
+			reporter.Publish(ctx)
+		}
+		return nil, fmt.Errorf("initialize cache store: %w", err)
+	}
+	return store, nil
+}
+
 func resolverSynced(resolver *kube.Resolver) func() bool {
 	if resolver == nil {
 		return func() bool { return false }
@@ -247,6 +297,7 @@ func resolverSynced(resolver *kube.Resolver) func() bool {
 func runHealthController(logger *slog.Logger, args []string) error {
 	flags := flag.NewFlagSet("health-controller", flag.ContinueOnError)
 	namespace := flags.String("namespace", os.Getenv("POD_NAMESPACE"), "namespace for node health Leases")
+	extenderAddress := flags.String("scheduler-extender-address", ":8090", "scheduler extender HTTP listen address")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -272,12 +323,27 @@ func runHealthController(logger *slog.Logger, args []string) error {
 			return fmt.Errorf("resolve health controller identity: %w", err)
 		}
 	}
-	controller, err := nodehealth.NewController(client, *namespace, logger)
+	apiCache, err := nodehealth.NewAPICache(client, *namespace)
+	if err != nil {
+		return err
+	}
+	controller, err := nodehealth.NewController(client, apiCache, *namespace, logger)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if err := apiCache.Start(ctx); err != nil {
+		return fmt.Errorf("synchronize health controller Kubernetes informer caches: %w", err)
+	}
+	extenderDone := make(chan error, 1)
+	go func() {
+		err := nodehealth.ServeSchedulerExtender(ctx, *extenderAddress, nodehealth.SchedulerExtenderHandler(apiCache))
+		if err != nil {
+			stop()
+		}
+		extenderDone <- err
+	}()
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock: &resourcelock.LeaseLock{
 			LeaseMeta: metav1.ObjectMeta{Name: "cache-csi-health-controller-leader", Namespace: *namespace},
@@ -304,6 +370,10 @@ func runHealthController(logger *slog.Logger, args []string) error {
 		ReleaseOnCancel: true,
 		Name:            "cache-csi-health-controller",
 	})
+	stop()
+	if err := <-extenderDone; err != nil {
+		return fmt.Errorf("serve scheduler extender: %w", err)
+	}
 	return nil
 }
 

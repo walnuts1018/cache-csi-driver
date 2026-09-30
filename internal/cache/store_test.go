@@ -31,7 +31,7 @@ func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 	})
 
 	identity := stableIdentity("test-cache")
-	policy := Policy{CrashRecoveryReuse: false, Retention: time.Hour}
+	policy := Policy{Retention: time.Hour}
 	firstPath, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
 		Lease:    Lease{ID: firstLeaseID, Target: filepath.Join(t.TempDir(), firstLeaseID)},
@@ -1012,7 +1012,7 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 		Retention:     time.Hour,
 		NoExec:        true,
 	}
-	store, err := newStore(t.TempDir(), StoreOptions{}, false)
+	store, err := newStore(t.TempDir(), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1079,7 +1079,7 @@ func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
 		Retention:     time.Hour,
 		NoExec:        true,
 	}
-	store, err := newStore(t.TempDir(), StoreOptions{}, false)
+	store, err := newStore(t.TempDir(), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1140,7 +1140,7 @@ func TestAcquireWaitsForCollectionOfSameIdentity(t *testing.T) {
 		enteredOnce.Do(func() { close(enteredDetach) })
 		<-continueDetach
 		return nil
-	}}, false)
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1213,7 +1213,7 @@ func TestAcquireWaitsForCollectionOfSameIdentity(t *testing.T) {
 
 func TestAcquireClaimsLeaseIDAcrossIdentities(t *testing.T) {
 	t.Parallel()
-	store, err := newStore(t.TempDir(), StoreOptions{}, false)
+	store, err := newStore(t.TempDir(), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,6 +29,7 @@ run = """
 set -euo pipefail
 tmp_dir="$(mktemp -d)"
 container_name="cache-csi-sanity-$$"
+mkdir -p "$tmp_dir/cache"
 cleanup() {
   if docker container inspect "$container_name" >/dev/null 2>&1; then
     docker rm -f "$container_name" >/dev/null 2>&1 || true
@@ -56,6 +57,7 @@ chmod 0755 "$tmp_dir/csi-sanity"
 
 docker run --detach --privileged --platform "linux/$go_arch" --name "$container_name" \
   -v "$tmp_dir:/tmp/csi-sanity" \
+  --tmpfs /tmp/csi-sanity/cache \
   --entrypoint /bin/bash \
   ubuntu:26.04 \
   -lc 'set -euo pipefail

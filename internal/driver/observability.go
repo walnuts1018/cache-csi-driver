@@ -20,7 +20,7 @@ func (server *Server) recordNormalPublish(result string) {
 }
 
 func (server *Server) markNodeUnavailable(ctx context.Context, reason string, err error, evict bool) error {
-	server.options.Health.Set(nodehealth.PhaseUnavailable, reason, evict)
+	server.options.Health.SetCondition(nodeHealthSubsystem(reason), nodehealth.PhaseUnavailable, reason, evict)
 	if err != nil {
 		server.logger.ErrorContext(ctx, "cache node cannot provide a requested cache", "reason", reason, "evict", evict, "error", err)
 		return status.Errorf(codes.Unavailable, "cache node is unavailable: %s: %v", reason, err)
@@ -28,9 +28,15 @@ func (server *Server) markNodeUnavailable(ctx context.Context, reason string, er
 	return status.Errorf(codes.Unavailable, "cache node is unavailable: %s", reason)
 }
 
-func (server *Server) markNodeDegraded(ctx context.Context, reason string, err error) {
-	server.options.Health.Set(nodehealth.PhaseDegraded, reason, false)
-	if err != nil {
-		server.logger.WarnContext(ctx, "cache node is degraded but can provide new cache generations", "reason", reason, "error", err)
+func nodeHealthSubsystem(reason string) nodehealth.Subsystem {
+	switch reason {
+	case "CacheFilesystemPressure":
+		return nodehealth.SubsystemPressure
+	case "CacheQuotaUnavailable":
+		return nodehealth.SubsystemQuota
+	case "CacheMountUnavailable":
+		return nodehealth.SubsystemMount
+	default:
+		return nodehealth.SubsystemStoreOperations
 	}
 }

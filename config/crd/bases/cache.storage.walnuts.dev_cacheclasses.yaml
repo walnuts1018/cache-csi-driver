@@ -17,9 +17,6 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.storage.backend
-      name: Backend
-      type: string
     - jsonPath: .spec.storage.maxBytes
       name: MaxBytes
       type: string
@@ -52,14 +49,6 @@ spec:
             description: CacheClassSpec defines storage and reuse behavior for node-local
               cache generations.
             properties:
-              crashRecovery:
-                default: discard
-                description: Policy for generations left active after an unclean node
-                  shutdown.
-                enum:
-                - discard
-                - reuse
-                type: string
               noExec:
                 description: Mounts cache generations with execution disabled.
                 type: boolean
@@ -101,15 +90,8 @@ spec:
                 - Exclusive
                 type: string
               storage:
-                description: Storage backend and quota limits used for cache generations.
+                description: Per-cache quota limits for cache generations.
                 properties:
-                  backend:
-                    default: directory
-                    description: Storage backend used for cache generations.
-                    enum:
-                    - directory
-                    - xfs-project
-                    type: string
                   defaultMaxBytes:
                     anyOf:
                     - type: integer
@@ -130,23 +112,16 @@ spec:
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     type: string
                     x-kubernetes-int-or-string: true
-                required:
-                - backend
                 type: object
                 x-kubernetes-validations:
                 - message: maxBytes must not be negative
                   rule: '!has(self.maxBytes) || !quantity(string(self.maxBytes)).isLessThan(quantity(''0''))'
                 - message: defaultMaxBytes must not be negative
                   rule: '!has(self.defaultMaxBytes) || !quantity(string(self.defaultMaxBytes)).isLessThan(quantity(''0''))'
-                - message: directory backend does not support quota limits
-                  rule: self.backend != 'directory' || (!has(self.maxBytes) && !has(self.defaultMaxBytes))
                 - message: maxBytes must be greater than zero
                   rule: '!has(self.maxBytes) || quantity(string(self.maxBytes)).isGreaterThan(quantity(''0''))'
                 - message: defaultMaxBytes must be greater than zero
                   rule: '!has(self.defaultMaxBytes) || quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity(''0''))'
-                - message: xfs-project backend requires maxBytes or defaultMaxBytes
-                  rule: self.backend != 'xfs-project' || ((has(self.maxBytes) && quantity(string(self.maxBytes)).isGreaterThan(quantity('0')))
-                    || (has(self.defaultMaxBytes) && quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity('0'))))
                 - message: defaultMaxBytes must not exceed maxBytes
                   rule: '!has(self.maxBytes) || !has(self.defaultMaxBytes) || !quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))'
             required:

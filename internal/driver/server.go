@@ -37,12 +37,13 @@ type mounter interface {
 }
 
 type Options struct {
-	NodeID        string
-	KubeletRoot   string
-	VendorVersion string
-	Metrics       *metrics.Metrics
-	Logger        *slog.Logger
-	Health        *nodehealth.Tracker
+	NodeID              string
+	KubeletRoot         string
+	VendorVersion       string
+	ProjectQuotaEnabled bool
+	Metrics             *metrics.Metrics
+	Logger              *slog.Logger
+	Health              *nodehealth.Tracker
 }
 
 type Server struct {

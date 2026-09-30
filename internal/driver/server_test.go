@@ -255,7 +255,6 @@ func TestNodePublishRetryUsesPersistedQuotaPolicy(t *testing.T) {
 
 	spec := cachev1alpha1.CacheClassSpec{
 		Storage: cachev1alpha1.StoragePolicy{
-			Backend:         cachev1alpha1.BackendXFSProject,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
 		},
 	}
@@ -287,7 +286,6 @@ func TestNodePublishRollsBackLeaseWhenQuotaConfigurationFails(t *testing.T) {
 	spec := cachev1alpha1.CacheClassSpec{
 		NoExec: true,
 		Storage: cachev1alpha1.StoragePolicy{
-			Backend:         cachev1alpha1.BackendXFSProject,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
 		},
 	}
@@ -417,7 +415,6 @@ func TestNodePublishRejectsQuotaIdentityConflict(t *testing.T) {
 	spec := cachev1alpha1.CacheClassSpec{
 		SharingPolicy: cachev1alpha1.SharingPolicyExclusive,
 		Storage: cachev1alpha1.StoragePolicy{
-			Backend:         cachev1alpha1.BackendXFSProject,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
 		},
 	}
@@ -916,7 +913,7 @@ func TestPolicyForMapsSharingPolicy(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			policy, err := policyFor(cachev1alpha1.CacheClassSpec{SharingPolicy: test.input}, testDefault, "class-uid", "")
+			policy, err := policyFor(cachev1alpha1.CacheClassSpec{SharingPolicy: test.input}, testDefault, "class-uid", "", false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -929,7 +926,7 @@ func TestPolicyForMapsSharingPolicy(t *testing.T) {
 
 func TestPolicyForPreservesZeroRetention(t *testing.T) {
 	t.Parallel()
-	policy, err := policyFor(cachev1alpha1.CacheClassSpec{}, testDefault, "class-uid", "")
+	policy, err := policyFor(cachev1alpha1.CacheClassSpec{}, testDefault, "class-uid", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,7 +1001,8 @@ type testMounter struct {
 func newTestServer(t *testing.T, spec cachev1alpha1.CacheClassSpec, quotaError error) (*Server, *testMounter, *cache.Store) {
 	t.Helper()
 	root := t.TempDir()
-	store, err := cache.NewStore(filepath.Join(root, "cache"), cache.StoreOptions{})
+	projectQuotaEnabled := spec.Storage.MaxBytes.Sign() > 0 || spec.Storage.DefaultMaxBytes.Sign() > 0
+	store, err := cache.NewStore(filepath.Join(root, "cache"), cache.StoreOptions{ProjectQuotaEnabled: projectQuotaEnabled})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1019,7 +1017,8 @@ func newTestServer(t *testing.T, spec cachev1alpha1.CacheClassSpec, quotaError e
 		quota = &testQuota{err: quotaError}
 	}
 	server := New(store, resolver, quota, Options{
-		KubeletRoot: filepath.Join(root, "kubelet"),
+		KubeletRoot:         filepath.Join(root, "kubelet"),
+		ProjectQuotaEnabled: projectQuotaEnabled,
 	})
 	server.options.Health.Set(nodehealth.PhaseReady, "TestReady", false)
 	mounts := &testMounter{mounts: make(map[string]testMount)}

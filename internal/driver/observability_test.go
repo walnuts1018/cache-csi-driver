@@ -16,7 +16,6 @@ func TestQuotaBackendFailureMakesCacheNodeUnavailable(t *testing.T) {
 
 	spec := cachev1alpha1.CacheClassSpec{
 		Storage: cachev1alpha1.StoragePolicy{
-			Backend:         cachev1alpha1.BackendXFSProject,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
 		},
 	}
