@@ -49,20 +49,20 @@ type StoreOptions struct {
 }
 
 type Store struct {
-	metadataRepository
-	generationManager
-	leaseManager
-	projectQuotaRegistry
-	pressureManager
-	trashCollector
-	unmountGeneration func(string) error
-	mu                sync.Mutex
-	closeOnce         sync.Once
-	closeErr          error
-	initDone          chan struct{}
-	initErr           error
-	indexReady        atomic.Bool
-	ready             atomic.Bool
+	metadataRepository   metadataRepository
+	generationManager    generationManager
+	leaseManager         leaseManager
+	projectQuotaRegistry projectQuotaRegistry
+	pressureManager      pressureManager
+	trashCollector       trashCollector
+	unmountGeneration    func(string) error
+	mu                   sync.Mutex
+	closeOnce            sync.Once
+	closeErr             error
+	initDone             chan struct{}
+	initErr              error
+	indexReady           atomic.Bool
+	ready                atomic.Bool
 	// lease lockを取得してからidentity lockを取得し、project registry lockの後にmuを取得します。muはfilesystem I/O中に保持しません。
 	recoveryMu sync.Mutex
 }
@@ -73,7 +73,6 @@ type metadataRepository struct {
 }
 
 type generationManager struct {
-	store                  *Store
 	metadataByIdentity     map[string]Metadata
 	leaseIndex             map[string]string
 	degraded               map[string]error
@@ -89,7 +88,6 @@ type leaseManager struct {
 
 // projectQuotaRegistryはcache metadataをcanonical sourceとしてproject ID予約indexを管理します。永続registryはmetadataから再構築でき、保存失敗はdirty状態のまま再試行します。
 type projectQuotaRegistry struct {
-	store                      *Store
 	projectIDStart             uint32
 	projectIDCount             uint32
 	projectRegistryDamaged     bool
@@ -109,7 +107,6 @@ type pressureManager struct {
 }
 
 type trashCollector struct {
-	store              *Store
 	trashMetadata      map[string]Metadata
 	trashDeleted       uint64
 	trashCursor        string
@@ -134,12 +131,12 @@ type keyedMutex struct {
 	refs int
 }
 
-func (manager *leaseManager) lockIdentity(identity string) func() {
-	return manager.identityLocks.lock(identity)
+func (s *Store) lockIdentity(identity string) func() {
+	return s.leaseManager.identityLocks.lock(identity)
 }
 
-func (manager *leaseManager) lockLease(leaseID string) func() {
-	return manager.leaseLocks.lock(leaseID)
+func (s *Store) lockLease(leaseID string) func() {
+	return s.leaseManager.leaseLocks.lock(leaseID)
 }
 
 func (m *keyedMutexes) lock(key string) func() {
@@ -177,37 +174,37 @@ type RuntimeStats struct {
 	TrashObjectsDeleted   uint64
 }
 
-func (s *Store) Root() string { return s.root }
+func (s *Store) Root() string { return s.metadataRepository.root }
 
 func (s *Store) RuntimeStats() RuntimeStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return RuntimeStats{
 		Ready:                 s.ready.Load(),
-		PressureState:         s.pressureState,
-		DegradedObjects:       len(s.degraded),
-		CacheObjects:          len(s.metadataByIdentity),
-		RetiredGenerations:    s.retiredGenerationCount,
-		FallbackReservedBytes: s.fallbackReservedBytes,
-		TrashObjectsDeleted:   s.trashDeleted,
+		PressureState:         s.pressureManager.pressureState,
+		DegradedObjects:       len(s.generationManager.degraded),
+		CacheObjects:          len(s.generationManager.metadataByIdentity),
+		RetiredGenerations:    s.generationManager.retiredGenerationCount,
+		FallbackReservedBytes: s.generationManager.fallbackReservedBytes,
+		TrashObjectsDeleted:   s.trashCollector.trashDeleted,
 	}
 }
 
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
-		close(s.stopTrash)
+		close(s.trashCollector.stopTrash)
 		<-s.initDone
-		s.collectorMu.Lock()
-		if !s.collectorStarted && !s.collectorFinished {
-			s.collectorFinished = true
-			close(s.trashDone)
+		s.trashCollector.collectorMu.Lock()
+		if !s.trashCollector.collectorStarted && !s.trashCollector.collectorFinished {
+			s.trashCollector.collectorFinished = true
+			close(s.trashCollector.trashDone)
 		}
-		collectorStarted := s.collectorStarted
-		s.collectorMu.Unlock()
+		collectorStarted := s.trashCollector.collectorStarted
+		s.trashCollector.collectorMu.Unlock()
 		if collectorStarted {
-			<-s.trashDone
+			<-s.trashCollector.trashDone
 		}
-		s.closeErr = s.rootFS.Close()
+		s.closeErr = s.metadataRepository.rootFS.Close()
 	})
 	return s.closeErr
 }
@@ -343,30 +340,15 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		return nil, fmt.Errorf("create cache trash directory: %w", err)
 	}
 	store := &Store{
-		metadataRepository:         metadataRepository{root: root, rootFS: rootFS},
-		metadataByIdentity:         make(map[string]Metadata),
-		leaseIndex:                 make(map[string]string),
-		degraded:                   make(map[string]error),
-		projectIDStart:             options.ProjectIDStart,
-		projectIDCount:             options.ProjectIDCount,
-		projectReservations:        make(map[uint32][]projectReservation),
-		projectOwnersByID:          make(map[uint32]projectReservationKey),
-		projectIDByGeneration:      make(map[projectReservationKey]uint32),
-		unknownProjectReservations: make(map[string]string),
-		pressure:                   options.Pressure,
-		pressureState:              pressureStateNormal,
-		pressureDetachFailed:       make(map[string]struct{}),
-		trashMetadata:              make(map[string]Metadata),
-		stopTrash:                  make(chan struct{}),
-		trashDone:                  make(chan struct{}),
-		trashRequests:              make(chan chan error),
-		quarantineRequests:         make(chan quarantineRequest, 64),
-		unmountGeneration:          options.UnmountGeneration,
-		initDone:                   make(chan struct{}),
+		metadataRepository:   metadataRepository{root: root, rootFS: rootFS},
+		generationManager:    generationManager{metadataByIdentity: make(map[string]Metadata), leaseIndex: make(map[string]string), degraded: make(map[string]error)},
+		leaseManager:         leaseManager{},
+		projectQuotaRegistry: projectQuotaRegistry{projectIDStart: options.ProjectIDStart, projectIDCount: options.ProjectIDCount, projectReservations: make(map[uint32][]projectReservation), projectOwnersByID: make(map[uint32]projectReservationKey), projectIDByGeneration: make(map[projectReservationKey]uint32), unknownProjectReservations: make(map[string]string)},
+		pressureManager:      pressureManager{pressure: options.Pressure, pressureState: pressureStateNormal, pressureDetachFailed: make(map[string]struct{})},
+		trashCollector:       trashCollector{trashMetadata: make(map[string]Metadata), stopTrash: make(chan struct{}), trashDone: make(chan struct{}), trashRequests: make(chan chan error), quarantineRequests: make(chan quarantineRequest, 64)},
+		unmountGeneration:    options.UnmountGeneration,
+		initDone:             make(chan struct{}),
 	}
-	store.generationManager.store = store
-	store.projectQuotaRegistry.store = store
-	store.trashCollector.store = store
 	if initializeIndexes {
 		if err := store.rebuildIndexes(); err != nil {
 			_ = rootFS.Close()
@@ -392,13 +374,13 @@ func (s *Store) initializeIndexes() {
 		if s.stopRequested() {
 			return
 		}
-		s.trashMu.Lock()
-		s.projectRegistryMu.Lock()
+		s.trashCollector.trashMu.Lock()
+		s.projectQuotaRegistry.projectRegistryMu.Lock()
 		s.mu.Lock()
 		s.resetIndexState()
 		s.mu.Unlock()
-		s.projectRegistryMu.Unlock()
-		s.trashMu.Unlock()
+		s.projectQuotaRegistry.projectRegistryMu.Unlock()
+		s.trashCollector.trashMu.Unlock()
 
 		err := s.rebuildIndexes()
 
@@ -412,7 +394,7 @@ func (s *Store) initializeIndexes() {
 		}
 		timer := time.NewTimer(5 * time.Second)
 		select {
-		case <-s.stopTrash:
+		case <-s.trashCollector.stopTrash:
 			timer.Stop()
 			return
 		case <-timer.C:
@@ -421,55 +403,53 @@ func (s *Store) initializeIndexes() {
 }
 
 func (s *Store) resetIndexState() {
-	clear(s.metadataByIdentity)
-	clear(s.leaseIndex)
-	clear(s.degraded)
-	clear(s.projectReservations)
-	clear(s.projectOwnersByID)
-	clear(s.projectIDByGeneration)
-	clear(s.unknownProjectReservations)
-	clear(s.trashMetadata)
-	clear(s.pressureDetachFailed)
-	s.projectRegistryDamaged = false
-	s.projectRegistryDirty = false
-	s.pressureActive = false
-	s.pressureState = pressureStateNormal
-	s.fallbackReservedBytes = 0
-	s.retiredGenerationCount = 0
-	s.trashCursor = ""
+	clear(s.generationManager.metadataByIdentity)
+	clear(s.generationManager.leaseIndex)
+	clear(s.generationManager.degraded)
+	clear(s.projectQuotaRegistry.projectReservations)
+	clear(s.projectQuotaRegistry.projectOwnersByID)
+	clear(s.projectQuotaRegistry.projectIDByGeneration)
+	clear(s.projectQuotaRegistry.unknownProjectReservations)
+	clear(s.trashCollector.trashMetadata)
+	clear(s.pressureManager.pressureDetachFailed)
+	s.projectQuotaRegistry.projectRegistryDamaged = false
+	s.projectQuotaRegistry.projectRegistryDirty = false
+	s.pressureManager.pressureActive = false
+	s.pressureManager.pressureState = pressureStateNormal
+	s.generationManager.fallbackReservedBytes = 0
+	s.generationManager.retiredGenerationCount = 0
+	s.trashCollector.trashCursor = ""
 }
 
-func (collector *trashCollector) startTrashCollector() {
-	s := collector.store
-	s.collectorMu.Lock()
-	defer s.collectorMu.Unlock()
-	if s.collectorStarted || s.collectorFinished {
+func (s *Store) startTrashCollector() {
+	s.trashCollector.collectorMu.Lock()
+	defer s.trashCollector.collectorMu.Unlock()
+	if s.trashCollector.collectorStarted || s.trashCollector.collectorFinished {
 		return
 	}
 	select {
-	case <-s.stopTrash:
-		s.collectorFinished = true
-		close(s.trashDone)
+	case <-s.trashCollector.stopTrash:
+		s.trashCollector.collectorFinished = true
+		close(s.trashCollector.trashDone)
 	default:
-		s.collectorStarted = true
-		go s.runTrashCollector()
+		s.trashCollector.collectorStarted = true
+		go s.trashCollector.run(s)
 	}
 }
 
-func (collector *trashCollector) finishTrashCollector() {
-	s := collector.store
-	s.collectorMu.Lock()
-	defer s.collectorMu.Unlock()
-	if s.collectorFinished {
+func (s *Store) finishTrashCollector() {
+	s.trashCollector.collectorMu.Lock()
+	defer s.trashCollector.collectorMu.Unlock()
+	if s.trashCollector.collectorFinished {
 		return
 	}
-	s.collectorFinished = true
-	close(s.trashDone)
+	s.trashCollector.collectorFinished = true
+	close(s.trashCollector.trashDone)
 }
 
-func (collector *trashCollector) stopRequested() bool {
+func (s *Store) stopRequested() bool {
 	select {
-	case <-collector.stopTrash:
+	case <-s.trashCollector.stopTrash:
 		return true
 	default:
 		return false

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -106,10 +107,9 @@ func TestNodePublishValidatesTargetPodIdentityAndShape(t *testing.T) {
 			wantReject: true,
 		},
 		{
-			name:       "target is not an inline CSI volume mount",
-			target:     filepath.Join(server.options.KubeletRoot, "pods", testPodUID, "volumes", "other-driver", "volume-name", "mount"),
-			podUID:     testPodUID,
-			wantReject: true,
+			name:   "target layout may differ under the matching Pod directory",
+			target: filepath.Join(server.options.KubeletRoot, "pods", testPodUID, "volumes", "other-driver", "volume-name", "mount"),
+			podUID: testPodUID,
 		},
 		{
 			name:       "target has a noncanonical path",
@@ -224,8 +224,8 @@ func TestNodePublishUsesBoundedFallbackUntilCacheStoreRecoveryCompletes(t *testi
 	if err != nil || !found {
 		t.Fatalf("fallback lease found = %t, error = %v; want a bounded fallback lease", found, err)
 	}
-	if policy.MaxBytes != 1<<20 || mounts.mountCalls != 1 || !mounts.mounts[request.GetTargetPath()].noExec {
-		t.Fatalf("fallback policy = %+v, mount calls = %d, mount = %+v; want 1Mi, one noexec mount", policy, mounts.mountCalls, mounts.mounts[request.GetTargetPath()])
+	if policy.MaxBytes != 1<<20 || mounts.mountCalls != 1 || mounts.mounts[request.GetTargetPath()].noExec {
+		t.Fatalf("fallback policy = %+v, mount calls = %d, mount = %+v; want 1Mi and CacheClass execution policy", policy, mounts.mountCalls, mounts.mounts[request.GetTargetPath()])
 	}
 	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
 		t.Fatalf("idempotent fallback republish while the normal store is recovering: %v", err)
@@ -1201,6 +1201,18 @@ func (mounts *testMounter) sameCacheMount(source, target string, readOnly, noExe
 func (mounts *testMounter) sameCacheSource(source, target string) (bool, error) {
 	state, found := mounts.mounts[target]
 	return found && state.source == source, nil
+}
+
+func (mounts *testMounter) sourceWithinRoot(target, root string) (bool, error) {
+	state, found := mounts.mounts[target]
+	if !found {
+		return false, nil
+	}
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(state.source))
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return false, err
+	}
+	return true, nil
 }
 
 func (mounts *testMounter) sourceMounted(source string) (bool, error) {

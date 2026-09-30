@@ -11,11 +11,19 @@ cacheRootDir: /var/lib/cache-csi
 fallbackRootDir: /run/cache-csi/fallback
 fallbackMaxBytes: 1Gi
 fallbackVolumeMaxBytes: 128Mi
+fallbackEmergencyRootDir: /run/cache-csi/fallback-emergency
+fallbackEmergencyMaxBytes: 64Mi
+fallbackEmergencyRootMaxBytes: 16Mi
+fallbackEmergencyVolumeMaxBytes: 4Mi
+fallbackTerminalRootDir: /run/cache-csi/fallback-terminal
+fallbackTerminalRootMaxBytes: 4Mi
 metrics:
   port: 9807
 kubeletRootDir: /var/lib/kubelet
 gcInterval: 30s
 pressure:
+  allowPodEviction: false
+  allowForceDelete: false
   highFreePercent: 25
   lowFreePercent: 20
   criticalFreePercent: 0

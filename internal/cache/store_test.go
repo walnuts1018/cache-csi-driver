@@ -117,7 +117,7 @@ func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(firstPath, "stale"), []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestRecoveryCommitsPreparingLeaseWhenMountIsVerified(t *testing.T) {
 	if err != nil || !found || lease.Preparing {
 		t.Fatalf("recovered lease = (%+v, %t, %v), want published lease", lease, found, err)
 	}
-	meta, err := recovered.readMetadata(filepath.Join(root, identity))
+	meta, err := recovered.metadataRepository.readMetadata(filepath.Join(root, identity))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestPressureVictimsSkipsMetadataScanWhenPressureIsOff(t *testing.T) {
 	if victims, err := store.PressureVictims(); err != nil || len(victims) != 0 {
 		t.Fatalf("pressure-off victims = %+v, error = %v", victims, err)
 	}
-	if _, degraded := store.degraded[identity]; degraded {
+	if _, degraded := store.generationManager.degraded[identity]; degraded {
 		t.Fatal("pressure-off victim lookup read and degraded cache metadata")
 	}
 }
@@ -436,13 +436,13 @@ func TestPressureDoesNotRetirePreparingLeaseBeforePublishCommit(t *testing.T) {
 		}
 		if attempt == 0 {
 			source = result.source
-			store.pressure = PressureConfig{
+			store.pressureManager.pressure = PressureConfig{
 				HighFreePercent:      100,
 				LowFreePercent:       99,
 				HighInodeFreePercent: 100,
 				LowInodeFreePercent:  99,
 			}
-			store.pressureActive = true
+			store.pressureManager.pressureActive = true
 		}
 		assertPreparingGenerationProtected(t, store, identity, result.source, options.Lease.ID, target)
 		barrier.release()
@@ -501,14 +501,14 @@ func assertPreparingGenerationProtected(t *testing.T, store *Store, identity, so
 	if len(victims) != 0 {
 		t.Fatalf("preparing lease pressure victims = %+v, want none", victims)
 	}
-	if !store.pressureActive {
+	if !store.pressureManager.pressureActive {
 		t.Fatal("barrier test did not keep pressure active")
 	}
 	_, lease, currentSource, _, found, err := store.LeaseDetails(leaseID)
 	if err != nil || !found || !lease.Preparing || currentSource != source || lease.Target != target {
 		t.Fatalf("preparing lease details = (%+v, %q, %t, %v), want preparing source %q", lease, currentSource, found, err, source)
 	}
-	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +592,7 @@ func TestQuotaModeChangeCreatesFreshGenerationAndReservesOldProjectID(t *testing
 	if newPath == oldPath {
 		t.Fatal("quota mode change reused the old generation")
 	}
-	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,7 +679,7 @@ func TestValidatePressureWatermarks(t *testing.T) {
 
 func TestCriticalWatermarkDetection(t *testing.T) {
 	t.Parallel()
-	store := &Store{pressure: PressureConfig{CriticalFreePercent: 10, CriticalInodeFreePercent: 5}}
+	store := &Store{pressureManager: pressureManager{pressure: PressureConfig{CriticalFreePercent: 10, CriticalInodeFreePercent: 5}}}
 	tests := []struct {
 		name string
 		fs   unix.Statfs_t
@@ -1071,13 +1071,13 @@ func gateTrashRemoval(t *testing.T, store *Store) *trashRemovalGate {
 	}
 	gate := &trashRemovalGate{started: make(chan struct{}, 1), release: make(chan struct{})}
 	t.Cleanup(gate.unblock)
-	store.removeTrashEntry = func(path string) error {
+	store.trashCollector.removeTrashEntry = func(path string) error {
 		select {
 		case gate.started <- struct{}{}:
 		default:
 		}
 		<-gate.release
-		return store.removeAll(path)
+		return store.metadataRepository.removeAll(path)
 	}
 	return gate
 }
@@ -1122,7 +1122,7 @@ func TestRecoverKeepsEmptyObjectWithoutMetadata(t *testing.T) {
 	})
 	identity := stableIdentity("empty-object")
 	entry := filepath.Join(root, identity)
-	if err := store.ensureDirectory(filepath.Join(entry, "generations")); err != nil {
+	if err := store.metadataRepository.ensureDirectory(filepath.Join(entry, "generations")); err != nil {
 		t.Fatal(err)
 	}
 	calls := 0
@@ -1491,9 +1491,9 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	if err := store.CommitPublish("second-shared-lease", secondTarget); err != nil {
 		t.Fatal(err)
 	}
-	store.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
-	store.pressureActive = true
-	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
+	store.pressureManager.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
+	store.pressureManager.pressureActive = true
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1593,8 +1593,8 @@ func TestAcquireRejectsQuotaChangeWhileRetiredGenerationExists(t *testing.T) {
 		MaxBytes:       1024,
 	}
 	store, identity, _, firstTarget, _ := pressureLease(t, "retired-quota-policy", policy, 2, false)
-	store.pressure = PressureConfig{}
-	store.pressureActive = false
+	store.pressureManager.pressure = PressureConfig{}
+	store.pressureManager.pressureActive = false
 	secondTarget := filepath.Join(t.TempDir(), "second-retired")
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
@@ -1606,16 +1606,16 @@ func TestAcquireRejectsQuotaChangeWhileRetiredGenerationExists(t *testing.T) {
 	if err := store.CommitPublish("second-retired-lease", secondTarget); err != nil {
 		t.Fatal(err)
 	}
-	store.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
-	store.pressureActive = true
+	store.pressureManager.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
+	store.pressureManager.pressureActive = true
 	if victims, err := store.PressureVictims(); err != nil || len(victims) != 2 {
 		t.Fatalf("pressure victims = %+v, error = %v; want both shared leases", victims, err)
 	}
 	if err := store.Release(firstLeaseID, firstTarget); err != nil {
 		t.Fatal(err)
 	}
-	store.pressure = PressureConfig{}
-	store.pressureActive = false
+	store.pressureManager.pressure = PressureConfig{}
+	store.pressureManager.pressureActive = false
 	updatedPolicy := policy
 	updatedPolicy.MaxBytes = 2048
 	if _, _, err := store.Acquire(AcquireOptions{
@@ -1685,7 +1685,7 @@ func TestAcquireWaitsForCollectionOfSameIdentity(t *testing.T) {
 		})
 		acquireDone <- acquireResult{path: path, err: err}
 	}()
-	waitForKeyedLockReferences(t, &store.identityLocks, identity, 2)
+	waitForKeyedLockReferences(t, &store.leaseManager.identityLocks, identity, 2)
 	select {
 	case result := <-acquireDone:
 		t.Fatalf("Acquire completed while collection held the identity lock: %+v", result)
@@ -1837,15 +1837,15 @@ func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 	if err := store.Collect(now); err != nil {
 		t.Fatal(err)
 	}
-	trash, err := store.readDir(filepath.Join(store.Root(), trashDirectoryName))
+	trash, err := store.metadataRepository.readDir(filepath.Join(store.Root(), trashDirectoryName))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(trash) != len(identities) {
 		t.Fatalf("trash entries before pressure reclaim = %d, want %d", len(trash), len(identities))
 	}
-	store.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
-	store.pressureActive = true
+	store.pressureManager.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
+	store.pressureManager.pressureActive = true
 	if err := store.ReclaimPressure(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -1854,7 +1854,7 @@ func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 			t.Fatalf("unused object %q remains after pressure reclaim: %v", identity, err)
 		}
 	}
-	trash, err = store.readDir(filepath.Join(store.Root(), trashDirectoryName))
+	trash, err = store.metadataRepository.readDir(filepath.Join(store.Root(), trashDirectoryName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1878,11 +1878,11 @@ func TestTrashCleanupSkipsFailedEntriesAcrossBatches(t *testing.T) {
 		t.Fatalf("wait for initial trash cleanup: %v", err)
 	}
 	blockedErr := errors.New("trash entry is temporarily unavailable")
-	store.removeTrashEntry = func(path string) error {
+	store.trashCollector.removeTrashEntry = func(path string) error {
 		if filepath.Base(path) == "000" {
 			return blockedErr
 		}
-		return store.removeAll(path)
+		return store.metadataRepository.removeAll(path)
 	}
 	for index := range trashBatchSize + 1 {
 		trashID := fmt.Sprintf("%03d", index)
@@ -1915,11 +1915,11 @@ func TestPressureVictimsRemainAvailableWhenTrashDeletionFails(t *testing.T) {
 		t.Fatalf("wait for initial trash cleanup: %v", err)
 	}
 	blockedErr := errors.New("trash entry is temporarily unavailable")
-	store.removeTrashEntry = func(path string) error {
+	store.trashCollector.removeTrashEntry = func(path string) error {
 		if filepath.Base(path) == "blocked" {
 			return blockedErr
 		}
-		return store.removeAll(path)
+		return store.metadataRepository.removeAll(path)
 	}
 	blockedEntry := filepath.Join(store.Root(), trashDirectoryName, "blocked")
 	if err := os.Mkdir(blockedEntry, 0o700); err != nil {
@@ -1962,7 +1962,7 @@ func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
 		t.Fatalf("retired lease resolves to %q, found %v, error %v; want %q", retiredPath, found, err, oldPath)
 	}
 
-	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1974,7 +1974,7 @@ func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
 	if len(retries) != 1 || retries[0].Lease.ID != firstLeaseID || retries[0].ForceDelete {
 		t.Fatalf("pressure retry victims = %+v, want the retired lease", retries)
 	}
-	meta, err = store.readMetadata(filepath.Join(store.Root(), identity))
+	meta, err = store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2012,15 +2012,15 @@ func TestRetiredGenerationReservesProjectIDUntilDeleted(t *testing.T) {
 	if _, _, _, err := store.QuotaState(identity, policy.MaxBytes); err != nil {
 		t.Fatal(err)
 	}
-	meta, err := store.readMetadata(filepath.Join(store.Root(), identity))
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if meta.ProjectID == oldProjectID {
 		t.Fatal("replacement generation reused the retired generation's project ID")
 	}
-	store.pressure = PressureConfig{}
-	store.pressureActive = false
+	store.pressureManager.pressure = PressureConfig{}
+	store.pressureManager.pressureActive = false
 	otherIdentity := stableIdentity("pressure-other-cache")
 	if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
 		t.Fatal(err)
@@ -2062,7 +2062,7 @@ func pressureLease(t *testing.T, name string, policy Policy, projectIDCount uint
 	if err := store.CommitPublish(firstLeaseID, target); err != nil {
 		t.Fatal(err)
 	}
-	store.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
-	store.pressureActive = true
+	store.pressureManager.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
+	store.pressureManager.pressureActive = true
 	return store, identity, policy, target, oldPath
 }

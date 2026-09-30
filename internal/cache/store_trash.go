@@ -7,7 +7,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -18,26 +17,25 @@ const trashDirectoryName = ".trash"
 
 const trashBatchSize = 16
 
-func (collector *trashCollector) runTrashCollector() {
-	s := collector.store
-	defer s.finishTrashCollector()
+func (collector *trashCollector) run(store *Store) {
+	defer store.finishTrashCollector()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	_ = s.retryProjectRegistry()
-	_ = s.cleanupTrashBatch()
+	_ = store.retryProjectRegistry()
+	_ = store.cleanupTrashBatch()
 	for {
 		select {
-		case <-s.stopTrash:
+		case <-collector.stopTrash:
 			return
 		case <-ticker.C:
-			_ = s.retryProjectRegistry()
-			_ = s.cleanupTrashBatch()
-		case request := <-s.quarantineRequests:
-			if err := s.CleanupDegradedObject(request.identity, request.sourceMounted); err != nil {
-				s.markDegraded(request.identity, fmt.Errorf("scheduled degraded cache quarantine: %w", err))
+			_ = store.retryProjectRegistry()
+			_ = store.cleanupTrashBatch()
+		case request := <-collector.quarantineRequests:
+			if err := store.CleanupDegradedObject(request.identity, request.sourceMounted); err != nil {
+				store.markDegraded(request.identity, fmt.Errorf("scheduled degraded cache quarantine: %w", err))
 			}
-		case response := <-s.trashRequests:
-			response <- errors.Join(s.retryProjectRegistry(), s.cleanupTrashBatch())
+		case response := <-collector.trashRequests:
+			response <- errors.Join(store.retryProjectRegistry(), store.cleanupTrashBatch())
 		}
 	}
 }
@@ -47,11 +45,11 @@ func (s *Store) CleanupTrash(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-s.stopTrash:
+	case <-s.trashCollector.stopTrash:
 		return errors.New("cache store is closed")
-	case <-s.trashDone:
+	case <-s.trashCollector.trashDone:
 		return errors.New("cache store has no trash collector")
-	case s.trashRequests <- response:
+	case s.trashCollector.trashRequests <- response:
 	}
 	select {
 	case <-ctx.Done():
@@ -61,24 +59,22 @@ func (s *Store) CleanupTrash(ctx context.Context) error {
 	}
 }
 
-func (collector *trashCollector) cleanupTrashBatch() error {
-	s := collector.store
+func (s *Store) cleanupTrashBatch() error {
 	_, err := s.cleanupTrashBatchSkipping(nil)
 	return err
 }
 
-func (collector *trashCollector) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]struct{}, error) {
-	s := collector.store
+func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]struct{}, error) {
 	// detach処理と同じmutex下でsnapshotし、作成途中のtrash entryを削除対象に含めない。
-	s.trashMu.Lock()
-	entries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
+	s.trashCollector.trashMu.Lock()
+	entries, err := s.metadataRepository.readDir(filepath.Join(s.metadataRepository.root, trashDirectoryName))
 	if err != nil {
-		s.trashMu.Unlock()
+		s.trashCollector.trashMu.Unlock()
 		return nil, err
 	}
 	trashIDs := make([]string, 0, min(len(entries), trashBatchSize))
 	if len(entries) > 0 {
-		start := sort.Search(len(entries), func(index int) bool { return entries[index].Name() > s.trashCursor })
+		start := sort.Search(len(entries), func(index int) bool { return entries[index].Name() > s.trashCollector.trashCursor })
 		for offset := range entries {
 			entry := entries[(start+offset)%len(entries)]
 			if _, alreadyAttempted := skip[entry.Name()]; alreadyAttempted {
@@ -90,74 +86,72 @@ func (collector *trashCollector) cleanupTrashBatchSkipping(skip map[string]struc
 			}
 		}
 		if len(trashIDs) > 0 {
-			s.trashCursor = trashIDs[len(trashIDs)-1]
+			s.trashCollector.trashCursor = trashIDs[len(trashIDs)-1]
 		}
 	}
-	s.trashMu.Unlock()
+	s.trashCollector.trashMu.Unlock()
 
 	attempted := make(map[string]struct{}, len(trashIDs))
 	var cleanupErr error
 	for _, trashID := range trashIDs {
 		attempted[trashID] = struct{}{}
-		if err := s.removeTrash(filepath.Join(s.root, trashDirectoryName, trashID)); err != nil {
+		if err := s.removeTrash(filepath.Join(s.metadataRepository.root, trashDirectoryName, trashID)); err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue
 		}
-		s.projectRegistryMu.Lock()
+		s.projectQuotaRegistry.projectRegistryMu.Lock()
 		s.mu.Lock()
-		s.trashDeleted++
-		for projectID, reservations := range s.projectReservations {
+		s.trashCollector.trashDeleted++
+		for projectID, reservations := range s.projectQuotaRegistry.projectReservations {
 			kept := make([]projectReservation, 0, len(reservations))
 			for _, reservation := range reservations {
 				if reservation.TrashID != trashID {
 					kept = append(kept, reservation)
 					continue
 				}
-				if meta, exists := s.metadataByIdentity[reservation.Identity]; exists && metadataHasProjectReservation(meta, projectID, reservation.Generation) {
+				if meta, exists := s.generationManager.metadataByIdentity[reservation.Identity]; exists && metadataHasProjectReservation(meta, projectID, reservation.Generation) {
 					if reservation.TrashID != "" {
 						reservation.TrashID = ""
-						s.projectRegistryDirty = true
+						s.projectQuotaRegistry.projectRegistryDirty = true
 					}
 					kept = append(kept, reservation)
 				}
 			}
 			if len(kept) != len(reservations) {
-				s.projectRegistryDirty = true
+				s.projectQuotaRegistry.projectRegistryDirty = true
 			}
 			if len(kept) == 0 {
-				delete(s.projectReservations, projectID)
+				delete(s.projectQuotaRegistry.projectReservations, projectID)
 			} else {
-				s.projectReservations[projectID] = kept
+				s.projectQuotaRegistry.projectReservations[projectID] = kept
 			}
 		}
 		s.rebuildProjectReservationIndexes()
-		delete(s.trashMetadata, trashID)
-		delete(s.degraded, filepath.Join(trashDirectoryName, trashID))
-		for identity, reservedTrashID := range s.unknownProjectReservations {
+		delete(s.trashCollector.trashMetadata, trashID)
+		delete(s.generationManager.degraded, filepath.Join(trashDirectoryName, trashID))
+		for identity, reservedTrashID := range s.projectQuotaRegistry.unknownProjectReservations {
 			if reservedTrashID == trashID {
-				delete(s.unknownProjectReservations, identity)
-				s.projectRegistryDirty = true
+				delete(s.projectQuotaRegistry.unknownProjectReservations, identity)
+				s.projectQuotaRegistry.projectRegistryDirty = true
 			}
 		}
 		s.mu.Unlock()
 		if err := s.persistProjectReservationsLocked(); err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("persist project ID registry after trash cleanup: %w", err))
 		}
-		s.projectRegistryMu.Unlock()
+		s.projectQuotaRegistry.projectRegistryMu.Unlock()
 	}
 	return attempted, cleanupErr
 }
 
-func (collector *trashCollector) removeTrash(path string) error {
-	s := collector.store
-	if collector.removeTrashEntry != nil {
-		return collector.removeTrashEntry(path)
+func (s *Store) removeTrash(path string) error {
+	if s.trashCollector.removeTrashEntry != nil {
+		return s.trashCollector.removeTrashEntry(path)
 	}
-	return s.removeAll(path)
+	return s.metadataRepository.removeAll(path)
 }
 
-func (collector *trashCollector) cleanupTrashUntilAttempted(ctx context.Context, attempted map[string]struct{}) error {
-	s := collector.store
+func (s *Store) cleanupTrashUntilAttempted(ctx context.Context, attempted map[string]struct{}) error {
 	if attempted == nil {
 		attempted = make(map[string]struct{})
 	}
@@ -180,9 +174,9 @@ func (collector *trashCollector) cleanupTrashUntilAttempted(ctx context.Context,
 }
 
 func (s *Store) detachToTrash(path string) error {
-	s.trashMu.Lock()
-	defer s.trashMu.Unlock()
-	relative, err := s.relative(path)
+	s.trashCollector.trashMu.Lock()
+	defer s.trashCollector.trashMu.Unlock()
+	relative, err := s.metadataRepository.relative(path)
 	if err != nil {
 		return err
 	}
@@ -193,16 +187,16 @@ func (s *Store) detachToTrash(path string) error {
 		if err := s.unmountGenerationMounts(path); err != nil {
 			return fmt.Errorf("unmount cache generation before trash detach: %w", err)
 		}
-		meta, _ = s.readMetadata(path)
+		meta, _ = s.metadataRepository.readMetadata(path)
 	}
-	trashPath := filepath.Join(s.root, trashDirectoryName, uuid.NewV7().String())
+	trashPath := filepath.Join(s.metadataRepository.root, trashDirectoryName, uuid.NewV7().String())
 	trashID := filepath.Base(trashPath)
 	if isObject {
 		if err := s.reserveObjectForTrash(identity, trashID, meta); err != nil {
 			return err
 		}
 	}
-	if err := s.rename(path, trashPath); err != nil {
+	if err := s.metadataRepository.rename(path, trashPath); err != nil {
 		if isObject {
 			err = errors.Join(err, s.restoreObjectTrashReservation(identity, trashID))
 		}
@@ -213,14 +207,14 @@ func (s *Store) detachToTrash(path string) error {
 		s.indexObjectInTrash(identity, trashID, meta)
 		s.mu.Unlock()
 	}
-	return errors.Join(s.syncDirectory(filepath.Dir(path)), s.syncDirectory(filepath.Join(s.root, trashDirectoryName)))
+	return errors.Join(s.metadataRepository.syncDirectory(filepath.Dir(path)), s.metadataRepository.syncDirectory(filepath.Join(s.metadataRepository.root, trashDirectoryName)))
 }
 
 func (s *Store) unmountGenerationMounts(path string) error {
 	if s.unmountGeneration == nil {
 		return nil
 	}
-	relative, err := s.relative(path)
+	relative, err := s.metadataRepository.relative(path)
 	if err != nil {
 		return err
 	}
@@ -231,7 +225,7 @@ func (s *Store) unmountGenerationMounts(path string) error {
 	if len(parts) != 1 {
 		return nil
 	}
-	entries, err := s.readDir(filepath.Join(path, "generations"))
+	entries, err := s.metadataRepository.readDir(filepath.Join(path, "generations"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -250,20 +244,20 @@ func (s *Store) unmountGenerationMounts(path string) error {
 }
 
 func (s *Store) reserveObjectForTrash(identity, trashID string, meta Metadata) error {
-	s.projectRegistryMu.Lock()
-	defer s.projectRegistryMu.Unlock()
+	s.projectQuotaRegistry.projectRegistryMu.Lock()
+	defer s.projectQuotaRegistry.projectRegistryMu.Unlock()
 	s.mu.Lock()
-	for projectID, reservations := range s.projectReservations {
+	for projectID, reservations := range s.projectQuotaRegistry.projectReservations {
 		for index, reservation := range reservations {
 			if reservation.Identity == identity && reservation.TrashID != trashID {
 				reservation.TrashID = trashID
 				reservations[index] = reservation
-				s.projectRegistryDirty = true
+				s.projectQuotaRegistry.projectRegistryDirty = true
 			}
 		}
-		s.projectReservations[projectID] = reservations
+		s.projectQuotaRegistry.projectReservations[projectID] = reservations
 	}
-	if _, damaged := s.degraded[identity]; damaged || meta.Identity != identity {
+	if _, damaged := s.generationManager.degraded[identity]; damaged || meta.Identity != identity {
 		s.addUnknownProjectReservation(identity, trashID)
 	}
 	s.mu.Unlock()
@@ -274,20 +268,20 @@ func (s *Store) reserveObjectForTrash(identity, trashID string, meta Metadata) e
 }
 
 func (s *Store) restoreObjectTrashReservation(identity, trashID string) error {
-	s.projectRegistryMu.Lock()
-	defer s.projectRegistryMu.Unlock()
+	s.projectQuotaRegistry.projectRegistryMu.Lock()
+	defer s.projectQuotaRegistry.projectRegistryMu.Unlock()
 	s.mu.Lock()
-	for projectID, reservations := range s.projectReservations {
+	for projectID, reservations := range s.projectQuotaRegistry.projectReservations {
 		for index, reservation := range reservations {
 			if reservation.Identity == identity && reservation.TrashID == trashID {
 				reservation.TrashID = ""
 				reservations[index] = reservation
-				s.projectRegistryDirty = true
+				s.projectQuotaRegistry.projectRegistryDirty = true
 			}
 		}
-		s.projectReservations[projectID] = reservations
+		s.projectQuotaRegistry.projectReservations[projectID] = reservations
 	}
-	if s.unknownProjectReservations[identity] == trashID {
+	if s.projectQuotaRegistry.unknownProjectReservations[identity] == trashID {
 		s.addUnknownProjectReservation(identity, "")
 	}
 	s.mu.Unlock()
@@ -298,16 +292,16 @@ func (s *Store) restoreObjectTrashReservation(identity, trashID string) error {
 }
 
 func (s *Store) indexObjectInTrash(identity, trashID string, meta Metadata) {
-	if previous, exists := s.metadataByIdentity[identity]; exists {
+	if previous, exists := s.generationManager.metadataByIdentity[identity]; exists {
 		s.removeFallbackReservation(previous)
-		s.retiredGenerationCount -= len(previous.Retired)
+		s.generationManager.retiredGenerationCount -= len(previous.Retired)
 	}
-	delete(s.metadataByIdentity, identity)
-	maps.DeleteFunc(s.leaseIndex, func(_ string, leaseIdentity string) bool { return leaseIdentity == identity })
+	delete(s.generationManager.metadataByIdentity, identity)
+	maps.DeleteFunc(s.generationManager.leaseIndex, func(_ string, leaseIdentity string) bool { return leaseIdentity == identity })
 	if meta.Identity == identity {
-		s.trashMetadata[trashID] = meta
+		s.trashCollector.trashMetadata[trashID] = meta
 	}
-	delete(s.degraded, identity)
+	delete(s.generationManager.degraded, identity)
 }
 
 func (repository *metadataRepository) syncDirectory(path string) error {
@@ -325,9 +319,9 @@ func (repository *metadataRepository) syncDirectory(path string) error {
 }
 
 func (s *Store) detachGenerationToTrash(path string, identity string, retired RetiredGeneration) error {
-	s.trashMu.Lock()
-	defer s.trashMu.Unlock()
-	if err := s.stat(path); errors.Is(err, os.ErrNotExist) {
+	s.trashCollector.trashMu.Lock()
+	defer s.trashCollector.trashMu.Unlock()
+	if err := s.metadataRepository.stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
@@ -335,39 +329,39 @@ func (s *Store) detachGenerationToTrash(path string, identity string, retired Re
 	if err := s.unmountGenerationMounts(path); err != nil {
 		return fmt.Errorf("unmount retired cache generation before trash detach: %w", err)
 	}
-	trashPath := filepath.Join(s.root, trashDirectoryName, uuid.NewV7().String())
+	trashPath := filepath.Join(s.metadataRepository.root, trashDirectoryName, uuid.NewV7().String())
 	trashID := filepath.Base(trashPath)
 	var previous projectReservation
 	var hadPrevious bool
 	if retired.ProjectID != 0 {
-		s.projectRegistryMu.Lock()
+		s.projectQuotaRegistry.projectRegistryMu.Lock()
 		s.mu.Lock()
 		previous, hadPrevious = s.projectReservationLocked(retired.ProjectID, identity, retired.Generation)
 		s.addProjectReservation(retired.ProjectID, projectReservation{Identity: identity, Generation: retired.Generation, TrashID: trashID})
 		s.mu.Unlock()
 		if err := s.persistProjectReservationsLocked(); err != nil {
 			restoreErr := s.restoreProjectReservationLocked(retired.ProjectID, identity, retired.Generation, previous, hadPrevious)
-			s.projectRegistryMu.Unlock()
+			s.projectQuotaRegistry.projectRegistryMu.Unlock()
 			return errors.Join(fmt.Errorf("persist project ID reservation before retired generation detach: %w", err), restoreErr)
 		}
-		s.projectRegistryMu.Unlock()
+		s.projectQuotaRegistry.projectRegistryMu.Unlock()
 	}
-	if err := s.ensureDirectory(trashPath); err != nil {
+	if err := s.metadataRepository.ensureDirectory(trashPath); err != nil {
 		return errors.Join(err, s.restoreProjectReservation(retired.ProjectID, identity, retired.Generation, previous, hadPrevious))
 	}
-	trashDirectory := filepath.Join(s.root, trashDirectoryName)
-	if err := s.syncDirectory(trashDirectory); err != nil {
+	trashDirectory := filepath.Join(s.metadataRepository.root, trashDirectoryName)
+	if err := s.metadataRepository.syncDirectory(trashDirectory); err != nil {
 		return errors.Join(err, s.restoreProjectReservation(retired.ProjectID, identity, retired.Generation, previous, hadPrevious))
 	}
-	if err := s.rename(path, filepath.Join(trashPath, "generation")); err != nil {
-		removeErr := s.removeAll(trashPath)
+	if err := s.metadataRepository.rename(path, filepath.Join(trashPath, "generation")); err != nil {
+		removeErr := s.metadataRepository.removeAll(trashPath)
 		restoreErr := s.restoreProjectReservation(retired.ProjectID, identity, retired.Generation, previous, hadPrevious)
 		if errors.Is(err, os.ErrNotExist) {
 			return errors.Join(removeErr, restoreErr)
 		}
 		return errors.Join(err, removeErr, restoreErr)
 	}
-	if err := errors.Join(s.syncDirectory(filepath.Dir(path)), s.syncDirectory(trashPath)); err != nil {
+	if err := errors.Join(s.metadataRepository.syncDirectory(filepath.Dir(path)), s.metadataRepository.syncDirectory(trashPath)); err != nil {
 		return err
 	}
 	// project IDの予約はrename前に永続化し、trash entryのmetadataで処理を完了する。

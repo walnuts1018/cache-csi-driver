@@ -37,8 +37,8 @@ func validWatermarks(high, low int) bool {
 
 func (s *Store) Collect(now time.Time) error {
 	s.mu.Lock()
-	identities := make([]string, 0, len(s.metadataByIdentity))
-	for identity := range s.metadataByIdentity {
+	identities := make([]string, 0, len(s.generationManager.metadataByIdentity))
+	for identity := range s.generationManager.metadataByIdentity {
 		identities = append(identities, identity)
 	}
 	type candidate struct {
@@ -48,11 +48,11 @@ func (s *Store) Collect(now time.Time) error {
 	}
 	var candidates []candidate
 	for _, identity := range identities {
-		indexed := s.metadataByIdentity[identity]
+		indexed := s.generationManager.metadataByIdentity[identity]
 		if len(indexed.Leases) != 0 || indexed.Policy.Retention <= 0 || now.Sub(indexed.LastUsed) < indexed.Policy.Retention {
 			continue
 		}
-		candidates = append(candidates, candidate{identity: identity, path: filepath.Join(s.root, identity), meta: indexed})
+		candidates = append(candidates, candidate{identity: identity, path: filepath.Join(s.metadataRepository.root, identity), meta: indexed})
 	}
 	s.mu.Unlock()
 	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
@@ -76,9 +76,9 @@ func (s *Store) ReclaimPressure(ctx context.Context) error {
 	attemptedTrash := make(map[string]struct{})
 	var incomplete error
 	s.mu.Lock()
-	clear(s.pressureDetachFailed)
+	clear(s.pressureManager.pressureDetachFailed)
 	s.mu.Unlock()
-	usage, err := filesystemUsage(s.root)
+	usage, err := filesystemUsage(s.metadataRepository.root)
 	if err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func (s *Store) ReclaimPressure(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		usage, err = filesystemUsage(s.root)
+		usage, err = filesystemUsage(s.metadataRepository.root)
 		if err != nil {
 			return err
 		}
@@ -113,7 +113,7 @@ func (s *Store) ReclaimPressure(ctx context.Context) error {
 			incomplete = errors.Join(incomplete, err)
 		}
 
-		usage, err = filesystemUsage(s.root)
+		usage, err = filesystemUsage(s.metadataRepository.root)
 		if err != nil {
 			return err
 		}
@@ -135,7 +135,7 @@ func (s *Store) ReclaimPressure(ctx context.Context) error {
 			unlockIdentity()
 			continue
 		}
-		usage, err = filesystemUsage(s.root)
+		usage, err = filesystemUsage(s.metadataRepository.root)
 		if err != nil {
 			unlockIdentity()
 			return err
@@ -149,7 +149,7 @@ func (s *Store) ReclaimPressure(ctx context.Context) error {
 		s.mu.Unlock()
 		if err := s.detachToTrash(item.path); err != nil {
 			s.mu.Lock()
-			s.pressureDetachFailed[item.identity] = struct{}{}
+			s.pressureManager.pressureDetachFailed[item.identity] = struct{}{}
 			s.mu.Unlock()
 			incomplete = errors.Join(incomplete, fmt.Errorf("detach unused cache during pressure reclaim: %w", err))
 			unlockIdentity()
@@ -172,12 +172,12 @@ type pressureVictimCandidate struct {
 }
 
 func (s *Store) unusedPressureCandidates() []pressureCandidate {
-	candidates := make([]pressureCandidate, 0, len(s.metadataByIdentity))
-	for identity, meta := range s.metadataByIdentity {
+	candidates := make([]pressureCandidate, 0, len(s.generationManager.metadataByIdentity))
+	for identity, meta := range s.generationManager.metadataByIdentity {
 		if len(meta.Leases) != 0 {
 			continue
 		}
-		candidates = append(candidates, pressureCandidate{identity: identity, path: filepath.Join(s.root, identity), lastUsed: meta.LastUsed})
+		candidates = append(candidates, pressureCandidate{identity: identity, path: filepath.Join(s.metadataRepository.root, identity), lastUsed: meta.LastUsed})
 	}
 	return candidates
 }
@@ -223,20 +223,28 @@ func (manager *pressureManager) underCriticalWatermark(fs unix.Statfs_t) bool {
 	return below(fs.Bavail, fs.Blocks, manager.pressure.CriticalFreePercent) || below(fs.Ffree, fs.Files, manager.pressure.CriticalInodeFreePercent)
 }
 
+func (s *Store) updatePressure(fs unix.Statfs_t) bool {
+	return s.pressureManager.updatePressure(fs)
+}
+
+func (s *Store) underCriticalWatermark(fs unix.Statfs_t) bool {
+	return s.pressureManager.underCriticalWatermark(fs)
+}
+
 func (s *Store) MetadataError() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, err := range s.degraded {
+	for _, err := range s.generationManager.degraded {
 		return err
 	}
-	if s.projectRegistryDamaged {
+	if s.projectQuotaRegistry.projectRegistryDamaged {
 		return fmt.Errorf("%w: project ID reservation registry is damaged", ErrDegradedMetadata)
 	}
 	return nil
 }
 
 func (s *Store) PressureVictims() ([]PressureVictim, error) {
-	fs, err := filesystemUsage(s.root)
+	fs, err := filesystemUsage(s.metadataRepository.root)
 	if err != nil {
 		return nil, err
 	}
@@ -270,18 +278,18 @@ func (s *Store) pressureVictimSnapshot(fs unix.Statfs_t) (bool, bool, []string, 
 		return false, false, nil, nil, false
 	}
 	criticalPressure := s.underCriticalWatermark(fs)
-	identities := make([]string, 0, len(s.metadataByIdentity))
+	identities := make([]string, 0, len(s.generationManager.metadataByIdentity))
 	candidates := make([]pressureVictimCandidate, 0)
-	for identity, meta := range s.metadataByIdentity {
+	for identity, meta := range s.generationManager.metadataByIdentity {
 		identities = append(identities, identity)
 		if len(meta.Leases) == 0 {
-			if _, detachFailed := s.pressureDetachFailed[identity]; !detachFailed {
+			if _, detachFailed := s.pressureManager.pressureDetachFailed[identity]; !detachFailed {
 				s.mu.Unlock()
 				return true, criticalPressure, identities, nil, true
 			}
 		}
 		if policyAllowsPressureTermination(meta.Policy.PressurePolicy) && s.activeLeaseCount(meta) > 0 && !s.hasPreparingGenerationLease(meta, meta.Generation) {
-			candidates = append(candidates, pressureVictimCandidate{identity: identity, meta: meta, path: filepath.Join(s.root, identity)})
+			candidates = append(candidates, pressureVictimCandidate{identity: identity, meta: meta, path: filepath.Join(s.metadataRepository.root, identity)})
 		}
 	}
 	s.mu.Unlock()
@@ -295,7 +303,7 @@ func (s *Store) retirePressureCandidate(candidate pressureVictimCandidate) ([]Pr
 	if err != nil || s.activeLeaseCount(meta) == 0 || !policyAllowsPressureTermination(meta.Policy.PressurePolicy) || s.hasPreparingGenerationLease(meta, meta.Generation) {
 		return nil, false, nil
 	}
-	fs, err := filesystemUsage(s.root)
+	fs, err := filesystemUsage(s.metadataRepository.root)
 	if err != nil {
 		return nil, false, err
 	}
@@ -328,7 +336,7 @@ func (s *Store) retirePressureCandidate(candidate pressureVictimCandidate) ([]Pr
 	meta.GenerationState = GenerationStateActive
 	meta.CreatedAt = time.Now().UTC()
 	replacementPath := filepath.Join(candidate.path, "generations", meta.Generation)
-	if err := s.ensureDirectory(replacementPath); err != nil {
+	if err := s.metadataRepository.ensureDirectory(replacementPath); err != nil {
 		return nil, false, fmt.Errorf("create replacement cache generation before Pod eviction: %w", err)
 	}
 	meta.ProjectID = 0

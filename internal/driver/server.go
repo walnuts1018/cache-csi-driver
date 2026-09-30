@@ -31,20 +31,26 @@ type mounter interface {
 	mountedAt(string) (bool, error)
 	sameCacheMount(string, string, bool, bool) (bool, error)
 	sameCacheSource(string, string) (bool, error)
+	sourceWithinRoot(string, string) (bool, error)
 	sourceMounted(string) (bool, error)
 	filesystemReadOnly(string) (bool, error)
 }
 
 type Options struct {
-	NodeID                 string
-	KubeletRoot            string
-	FallbackRoot           string
-	FallbackStore          *cache.Store
-	FallbackMaxBytes       int64
-	FallbackVolumeMaxBytes int64
-	VendorVersion          string
-	Metrics                *metrics.Metrics
-	Logger                 *slog.Logger
+	NodeID                          string
+	KubeletRoot                     string
+	FallbackRoot                    string
+	FallbackStore                   *cache.Store
+	FallbackMaxBytes                int64
+	FallbackVolumeMaxBytes          int64
+	FallbackEmergencyRoot           string
+	FallbackEmergencyStore          *cache.Store
+	FallbackEmergencyMaxBytes       int64
+	FallbackEmergencyVolumeMaxBytes int64
+	FallbackTerminalRoot            string
+	VendorVersion                   string
+	Metrics                         *metrics.Metrics
+	Logger                          *slog.Logger
 }
 
 type Server struct {
@@ -52,6 +58,7 @@ type Server struct {
 	csi.UnimplementedNodeServer
 	store           *cache.Store
 	fallbackStore   *cache.Store
+	emergencyStore  *cache.Store
 	resolver        ClassResolver
 	quota           ProjectQuota
 	mounter         mounter
@@ -83,19 +90,53 @@ func New(store *cache.Store, resolver ClassResolver, quotaManager ProjectQuota, 
 	if options.FallbackVolumeMaxBytes <= 0 {
 		options.FallbackVolumeMaxBytes = 128 << 20
 	}
+	if options.FallbackEmergencyVolumeMaxBytes <= 0 {
+		options.FallbackEmergencyVolumeMaxBytes = 4 << 20
+	}
+	if options.FallbackEmergencyMaxBytes <= 0 {
+		options.FallbackEmergencyMaxBytes = 64 << 20
+	}
+	if options.FallbackEmergencyRoot == "" {
+		options.FallbackEmergencyRoot = "/run/cache-csi/fallback-emergency"
+	}
+	if options.FallbackTerminalRoot == "" {
+		options.FallbackTerminalRoot = "/run/cache-csi/fallback-terminal"
+	}
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
 	return &Server{
-		store:         store,
-		fallbackStore: options.FallbackStore,
-		resolver:      resolver,
-		quota:         quotaManager,
-		mounter:       newMounter(),
-		options:       options,
-		metrics:       options.Metrics,
-		logger:        options.Logger,
+		store:          store,
+		fallbackStore:  options.FallbackStore,
+		emergencyStore: options.FallbackEmergencyStore,
+		resolver:       resolver,
+		quota:          quotaManager,
+		mounter:        newMounter(),
+		options:        options,
+		metrics:        options.Metrics,
+		logger:         options.Logger,
 	}
+}
+
+func (s *Server) fallbackStores() []*cache.Store {
+	stores := make([]*cache.Store, 0, 2)
+	for _, store := range []*cache.Store{s.fallbackStore, s.emergencyStore} {
+		if store != nil && (len(stores) == 0 || stores[len(stores)-1] != store) {
+			stores = append(stores, store)
+		}
+	}
+	return stores
+}
+
+func (s *Server) fallbackRootForStore(store *cache.Store) string {
+	if store == s.emergencyStore {
+		return s.options.FallbackEmergencyRoot
+	}
+	return s.options.FallbackRoot
+}
+
+func (s *Server) isFallbackStore(store *cache.Store) bool {
+	return store == s.fallbackStore || store == s.emergencyStore
 }
 
 func (s *Server) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {

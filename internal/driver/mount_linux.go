@@ -45,6 +45,10 @@ func (systemMounter) sameCacheSource(source, target string) (bool, error) {
 	return sameCacheSource(source, target)
 }
 
+func (systemMounter) sourceWithinRoot(target, root string) (bool, error) {
+	return sourceWithinRoot(target, root)
+}
+
 func (systemMounter) sourceMounted(source string) (bool, error) { return sourceMounted(source) }
 
 func (systemMounter) filesystemReadOnly(path string) (bool, error) {
@@ -175,6 +179,78 @@ func sameCacheSource(source, target string) (bool, error) {
 		return false, nil
 	}
 	return sameMountedSource(source, target)
+}
+
+// sourceWithinRootはmountinfoのデバイス番号とmount rootを照合し、指定root配下からのbind mountであることを確認する。
+func sourceWithinRoot(target, root string) (bool, error) {
+	targetMounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(filepath.Clean(target)))
+	if err != nil {
+		return false, err
+	}
+	targetMount := topMountAtPath(targetMounts)
+	if targetMount == nil {
+		return false, nil
+	}
+	mounts, err := mountinfo.GetMounts(nil)
+	if err != nil {
+		return false, err
+	}
+	root = filepath.Clean(root)
+	rootMount := coveringMount(mounts, root)
+	if rootMount == nil {
+		return false, nil
+	}
+	if targetMount.Major == rootMount.Major && targetMount.Minor == rootMount.Minor {
+		relativeRoot, err := filepath.Rel(filepath.Clean(rootMount.Mountpoint), root)
+		if err == nil && relativeRoot != ".." && !strings.HasPrefix(relativeRoot, ".."+string(filepath.Separator)) && !filepath.IsAbs(relativeRoot) {
+			expectedRoot := filepath.Clean(filepath.Join(rootMount.Root, relativeRoot))
+			if pathWithin(expectedRoot, filepath.Clean(targetMount.Root)) {
+				return true, nil
+			}
+		}
+	}
+	for _, candidate := range mounts {
+		candidatePath := filepath.Clean(candidate.Mountpoint)
+		if !pathWithin(root, candidatePath) || candidate.Major != targetMount.Major || candidate.Minor != targetMount.Minor {
+			continue
+		}
+		if coveringMount(mounts, candidatePath) != candidate {
+			continue
+		}
+		if filepath.Clean(candidate.Root) == filepath.Clean(targetMount.Root) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func coveringMount(mounts []*mountinfo.Info, path string) *mountinfo.Info {
+	var covering *mountinfo.Info
+	for _, mount := range mounts {
+		mountpoint := filepath.Clean(mount.Mountpoint)
+		if !pathWithin(mountpoint, path) {
+			continue
+		}
+		if covering == nil || len(mountpoint) > len(covering.Mountpoint) || len(mountpoint) == len(covering.Mountpoint) && mount.ID > covering.ID {
+			covering = mount
+		}
+	}
+	return covering
+}
+
+func topMountAtPath(mounts []*mountinfo.Info) *mountinfo.Info {
+	var top *mountinfo.Info
+	for _, mount := range mounts {
+		if top == nil || mount.ID > top.ID {
+			top = mount
+		}
+	}
+	return top
+}
+
+func pathWithin(root, path string) bool {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
 }
 
 func sourceMounted(source string) (bool, error) {

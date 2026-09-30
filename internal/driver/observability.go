@@ -16,6 +16,18 @@ type fallbackCause struct {
 	reason string
 }
 
+type fallbackMode uint8
+
+const (
+	fallbackModeEmergency fallbackMode = iota
+	fallbackModeResolved
+)
+
+type fallbackSemantics struct {
+	mode   fallbackMode
+	noExec bool
+}
+
 const (
 	fallbackClassExpected   = "expected"
 	fallbackClassUnexpected = "unexpected"
@@ -59,10 +71,22 @@ func fallbackCauseForResolution(err error) fallbackCause {
 }
 
 func (s *Server) useFallback(ctx context.Context, req *csi.NodePublishVolumeRequest, cause fallbackCause, trigger error) error {
+	return s.publishFallbackWithSemantics(ctx, req, cause, trigger, fallbackSemantics{mode: fallbackModeEmergency, noExec: true})
+}
+
+func (s *Server) useFallbackWithPolicy(ctx context.Context, req *csi.NodePublishVolumeRequest, cause fallbackCause, trigger error, policy *cache.Policy) error {
+	semantics := fallbackSemantics{mode: fallbackModeEmergency, noExec: true}
+	if policy != nil {
+		semantics = fallbackSemantics{mode: fallbackModeResolved, noExec: policy.NoExec}
+	}
+	return s.publishFallbackWithSemantics(ctx, req, cause, trigger, semantics)
+}
+
+func (s *Server) publishFallbackWithSemantics(ctx context.Context, req *csi.NodePublishVolumeRequest, cause fallbackCause, trigger error, semantics fallbackSemantics) error {
 	if cause.class == fallbackClassUnexpected {
 		s.markUnexpectedBackendFailure(ctx, cause, trigger)
 	}
-	err := s.publishFallback(ctx, req)
+	err := s.publishFallback(ctx, req, semantics)
 	if err == nil && s.metrics != nil {
 		s.metrics.RecordPublish(publishOutcomeFallback)
 		s.metrics.RecordFallback(cause.class, cause.reason)
@@ -75,7 +99,7 @@ func (s *Server) markUnexpectedBackendFailure(ctx context.Context, cause fallbac
 	if s.metrics != nil {
 		s.metrics.RecordBackendFailure(cause.reason)
 	}
-	s.logger.WarnContext(ctx, "primary cache backend operation failed", "stage", cause.reason, "error", trigger)
+	s.logger.WarnContext(ctx, "cache backend operation failed", "stage", cause.reason, "error", trigger)
 }
 
 func (s *Server) recordNormalPublish(result string) {

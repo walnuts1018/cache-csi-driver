@@ -113,110 +113,103 @@ type Metadata struct {
 	Retired         []RetiredGeneration `json:"retired,omitempty"`
 }
 
-func (manager *generationManager) indexObjectMetadata(meta Metadata) {
-	s := manager.store
-	_, recoveringDegraded := s.degraded[meta.Identity]
-	if previous, exists := s.metadataByIdentity[meta.Identity]; exists {
-		s.removeFallbackReservation(previous)
-		s.retiredGenerationCount -= len(previous.Retired)
+func (manager *generationManager) indexObjectMetadata(store *Store, meta Metadata) {
+	_, recoveringDegraded := manager.degraded[meta.Identity]
+	if previous, exists := manager.metadataByIdentity[meta.Identity]; exists {
+		manager.removeFallbackReservation(previous)
+		manager.retiredGenerationCount -= len(previous.Retired)
 		for _, lease := range previous.Leases {
-			delete(s.leaseIndex, lease.ID)
+			delete(manager.leaseIndex, lease.ID)
 		}
 	} else if recoveringDegraded {
-		for leaseID, identity := range s.leaseIndex {
+		for leaseID, identity := range manager.leaseIndex {
 			if identity != meta.Identity || slices.ContainsFunc(meta.Leases, func(lease Lease) bool { return lease.ID == leaseID }) {
 				continue
 			}
-			delete(s.leaseIndex, leaseID)
+			delete(manager.leaseIndex, leaseID)
 		}
 	}
-	s.metadataByIdentity[meta.Identity] = meta
-	s.addFallbackReservation(meta)
-	s.retiredGenerationCount += len(meta.Retired)
-	delete(s.degraded, meta.Identity)
+	manager.metadataByIdentity[meta.Identity] = meta
+	manager.addFallbackReservation(meta)
+	manager.retiredGenerationCount += len(meta.Retired)
+	delete(manager.degraded, meta.Identity)
 	for _, lease := range meta.Leases {
-		s.leaseIndex[lease.ID] = meta.Identity
+		manager.leaseIndex[lease.ID] = meta.Identity
 	}
-	for projectID, reservations := range s.projectReservations {
+	for projectID, reservations := range store.projectQuotaRegistry.projectReservations {
 		previousLength := len(reservations)
 		kept := slices.DeleteFunc(reservations, func(reservation projectReservation) bool {
 			return reservation.Identity == meta.Identity && reservation.TrashID == "" && !metadataHasProjectReservation(meta, projectID, reservation.Generation)
 		})
 		if len(kept) != previousLength {
-			s.projectRegistryDirty = true
+			store.projectQuotaRegistry.projectRegistryDirty = true
 		}
 		if len(kept) == 0 {
-			delete(s.projectReservations, projectID)
+			delete(store.projectQuotaRegistry.projectReservations, projectID)
 		} else {
-			s.projectReservations[projectID] = kept
+			store.projectQuotaRegistry.projectReservations[projectID] = kept
 		}
 		if len(kept) != previousLength {
-			s.syncProjectReservationIndexes(projectID)
+			store.syncProjectReservationIndexes(projectID)
 		}
 	}
 	for _, retired := range meta.Retired {
 		if retired.ProjectID == 0 {
 			continue
 		}
-		s.addProjectReservation(retired.ProjectID, projectReservation{Identity: meta.Identity, Generation: retired.Generation})
+		store.addProjectReservation(retired.ProjectID, projectReservation{Identity: meta.Identity, Generation: retired.Generation})
 	}
 	if meta.ProjectID != 0 {
-		s.addProjectReservation(meta.ProjectID, projectReservation{Identity: meta.Identity, Generation: meta.Generation})
+		store.addProjectReservation(meta.ProjectID, projectReservation{Identity: meta.Identity, Generation: meta.Generation})
 	}
 }
 
-func (manager *generationManager) indexMetadata(meta Metadata) {
-	s := manager.store
-	s.projectRegistryMu.Lock()
-	defer s.projectRegistryMu.Unlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.indexObjectMetadata(meta)
+func (manager *generationManager) indexMetadata(store *Store, meta Metadata) {
+	store.projectQuotaRegistry.projectRegistryMu.Lock()
+	defer store.projectQuotaRegistry.projectRegistryMu.Unlock()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.generationManager.indexObjectMetadata(store, meta)
 }
 
-func (manager *generationManager) markDegraded(identity string, cause error) {
-	s := manager.store
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.markDegradedLocked(identity, cause)
+func (manager *generationManager) markDegraded(store *Store, identity string, cause error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	manager.markDegradedLocked(identity, cause)
 }
 
 func (manager *generationManager) markDegradedLocked(identity string, cause error) {
-	s := manager.store
-	if previous, exists := s.metadataByIdentity[identity]; exists {
-		s.removeFallbackReservation(previous)
-		s.retiredGenerationCount -= len(previous.Retired)
+	if previous, exists := manager.metadataByIdentity[identity]; exists {
+		manager.removeFallbackReservation(previous)
+		manager.retiredGenerationCount -= len(previous.Retired)
 	}
-	delete(s.metadataByIdentity, identity)
-	s.degraded[identity] = fmt.Errorf("%w: %v", ErrDegradedMetadata, cause)
+	delete(manager.metadataByIdentity, identity)
+	manager.degraded[identity] = fmt.Errorf("%w: %v", ErrDegradedMetadata, cause)
 }
 
 func (manager *generationManager) addFallbackReservation(meta Metadata) {
-	s := manager.store
 	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) > 0 && meta.Policy.MaxBytes > 0 {
-		s.fallbackReservedBytes += meta.Policy.MaxBytes
+		manager.fallbackReservedBytes += meta.Policy.MaxBytes
 	}
 }
 
 func (manager *generationManager) removeFallbackReservation(meta Metadata) {
-	s := manager.store
 	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) > 0 && meta.Policy.MaxBytes > 0 {
-		s.fallbackReservedBytes -= meta.Policy.MaxBytes
+		manager.fallbackReservedBytes -= meta.Policy.MaxBytes
 	}
 }
 
-func (manager *generationManager) indexDegradedLeaseIDs(identity string, meta Metadata) {
-	s := manager.store
+func (manager *generationManager) indexDegradedLeaseIDs(store *Store, identity string, meta Metadata) {
 	if meta.Identity != identity {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	for _, lease := range meta.Leases {
 		if lease.ID == "" || len(lease.ID) > 1024 || strings.ContainsRune(lease.ID, '\x00') {
 			continue
 		}
-		s.leaseIndex[lease.ID] = identity
+		manager.leaseIndex[lease.ID] = identity
 	}
 }
 
@@ -290,30 +283,29 @@ func validSharingPolicy(policy string) bool {
 	return policy == "" || policy == SharingPolicyShared || policy == SharingPolicyExclusive
 }
 
-func (manager *generationManager) readObjectMetadata(identity string) (Metadata, error) {
-	s := manager.store
-	s.mu.Lock()
-	if err := s.degraded[identity]; err != nil {
-		s.mu.Unlock()
+func (component *generationManager) readObjectMetadata(store *Store, identity string) (Metadata, error) {
+	store.mu.Lock()
+	if err := store.generationManager.degraded[identity]; err != nil {
+		store.mu.Unlock()
 		return Metadata{}, err
 	}
-	s.mu.Unlock()
-	meta, err := s.readMetadata(filepath.Join(s.root, identity))
+	store.mu.Unlock()
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.metadataRepository.root, identity))
 	if err != nil {
-		s.markDegraded(identity, err)
-		s.mu.Lock()
-		degradedErr := s.degraded[identity]
-		s.mu.Unlock()
+		store.markDegraded(identity, err)
+		store.mu.Lock()
+		degradedErr := store.generationManager.degraded[identity]
+		store.mu.Unlock()
 		return Metadata{}, fmt.Errorf("read cache metadata: %w", degradedErr)
 	}
 	if err := validateMetadata(identity, meta); err != nil {
-		s.markDegraded(identity, err)
-		s.mu.Lock()
-		degradedErr := s.degraded[identity]
-		s.mu.Unlock()
+		store.markDegraded(identity, err)
+		store.mu.Lock()
+		degradedErr := store.generationManager.degraded[identity]
+		store.mu.Unlock()
 		return Metadata{}, degradedErr
 	}
-	s.indexMetadata(meta)
+	store.indexMetadata(meta)
 	return meta, nil
 }
 
@@ -388,28 +380,28 @@ func (s *Store) writeMetadata(entry string, meta Metadata) error {
 	if err != nil {
 		return err
 	}
-	relative, err := s.relative(entry)
+	relative, err := s.metadataRepository.relative(entry)
 	if err != nil {
 		return err
 	}
 	if filepath.Dir(relative) == "." && (filepath.Base(relative) != meta.Identity || meta.Generation == "") {
 		return errors.New("cache metadata identity or generation is inconsistent")
 	}
-	if err := s.writeAtomicMetadata(relative, data); err != nil {
+	if err := s.metadataRepository.writeAtomicMetadata(relative, data); err != nil {
 		return err
 	}
-	s.projectRegistryMu.Lock()
-	defer s.projectRegistryMu.Unlock()
+	s.projectQuotaRegistry.projectRegistryMu.Lock()
+	defer s.projectQuotaRegistry.projectRegistryMu.Unlock()
 	s.mu.Lock()
 	switch {
 	case filepath.Dir(relative) == "." && filepath.Base(relative) != trashDirectoryName:
 		s.indexObjectMetadata(meta)
 	case filepath.Dir(relative) == trashDirectoryName:
 		trashID := filepath.Base(relative)
-		s.trashMetadata[trashID] = meta
+		s.trashCollector.trashMetadata[trashID] = meta
 		s.addMetadataReservations(meta, trashID)
 	}
-	registryDirty := s.projectRegistryDirty
+	registryDirty := s.projectQuotaRegistry.projectRegistryDirty
 	s.mu.Unlock()
 	if registryDirty {
 		_ = s.persistProjectReservationsLocked()
@@ -428,4 +420,28 @@ func validIdentity(identity string) bool {
 	}
 	_, err := hex.DecodeString(identity)
 	return err == nil
+}
+
+func (s *Store) indexObjectMetadata(meta Metadata) {
+	s.generationManager.indexObjectMetadata(s, meta)
+}
+
+func (s *Store) indexMetadata(meta Metadata) {
+	s.generationManager.indexMetadata(s, meta)
+}
+
+func (s *Store) markDegraded(identity string, cause error) {
+	s.generationManager.markDegraded(s, identity, cause)
+}
+
+func (s *Store) removeFallbackReservation(meta Metadata) {
+	s.generationManager.removeFallbackReservation(meta)
+}
+
+func (s *Store) indexDegradedLeaseIDs(identity string, meta Metadata) {
+	s.generationManager.indexDegradedLeaseIDs(s, identity, meta)
+}
+
+func (s *Store) readObjectMetadata(identity string) (Metadata, error) {
+	return s.generationManager.readObjectMetadata(s, identity)
 }

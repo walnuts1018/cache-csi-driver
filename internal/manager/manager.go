@@ -80,6 +80,8 @@ type Options struct {
 	Client           kubernetes.Interface
 	InspectMount     MountInspector
 	FallbackStore    *cache.Store
+	EmergencyStore   *cache.Store
+	AllowPodEviction bool
 	AllowForceDelete bool
 	Logger           *slog.Logger
 	Metrics          *metrics.Metrics
@@ -115,12 +117,20 @@ func New(store *cache.Store, options Options) *Manager {
 		stores = append(stores, options.FallbackStore)
 		storeNames = append(storeNames, "fallback")
 	}
+	if options.EmergencyStore != nil && options.EmergencyStore != store && options.EmergencyStore != options.FallbackStore {
+		stores = append(stores, options.EmergencyStore)
+		storeNames = append(storeNames, "fallback_emergency")
+	}
+	client := options.Client
+	if !options.AllowPodEviction {
+		client = nil
+	}
 	manager := &Manager{
 		stores:           stores,
 		storeNames:       storeNames,
 		interval:         options.Interval,
 		pressureInterval: options.PressureInterval,
-		client:           options.Client,
+		client:           client,
 		inspectMount:     options.InspectMount,
 		allowForceDelete: options.AllowForceDelete,
 		logger:           options.Logger,

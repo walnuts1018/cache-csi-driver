@@ -4,6 +4,6 @@ package main
 
 import "errors"
 
-func mountFallbackTmpfs(string, int64) error {
+func mountFallbackTmpfs(string, int64, bool) error {
 	return errors.New("fallback tmpfs requires Linux")
 }

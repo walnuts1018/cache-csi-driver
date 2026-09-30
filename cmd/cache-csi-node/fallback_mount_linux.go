@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func mountFallbackTmpfs(path string, size int64) error {
+func mountFallbackTmpfs(path string, size int64, noExec bool) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return err
 	}
@@ -28,7 +28,10 @@ func mountFallbackTmpfs(path string, size int64) error {
 	if err != nil {
 		return fmt.Errorf("resolve fallback mount path: %w", err)
 	}
-	flags := uintptr(unix.MS_NODEV | unix.MS_NOSUID | unix.MS_NOEXEC)
+	flags := uintptr(unix.MS_NODEV | unix.MS_NOSUID)
+	if noExec {
+		flags |= unix.MS_NOEXEC
+	}
 	mounts, err := mountsAtPath(path)
 	if err != nil {
 		return fmt.Errorf("inspect fallback mount: %w", err)
@@ -51,7 +54,14 @@ func mountFallbackTmpfs(path string, size int64) error {
 	if mount == nil || mount.FSType != "tmpfs" {
 		return errors.New("fallback root is not mounted as tmpfs")
 	}
-	for _, required := range []string{"nodev", "nosuid", "noexec"} {
+	if strings.Contains(","+mount.Options+",", ",noexec,") != noExec {
+		return errors.New("fallback tmpfs noexec option does not match its configured policy")
+	}
+	requiredOptions := []string{"nodev", "nosuid"}
+	if noExec {
+		requiredOptions = append(requiredOptions, "noexec")
+	}
+	for _, required := range requiredOptions {
 		if !strings.Contains(","+mount.Options+",", ","+required+",") {
 			return fmt.Errorf("fallback tmpfs is missing the %s mount option", required)
 		}

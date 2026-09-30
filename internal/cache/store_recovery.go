@@ -15,7 +15,7 @@ import (
 func (s *Store) rebuildIndexes() error {
 	registryMissing := s.loadProjectRegistry()
 
-	entries, err := s.readDir(s.root)
+	entries, err := s.metadataRepository.readDir(s.metadataRepository.root)
 	if err != nil {
 		return err
 	}
@@ -23,10 +23,10 @@ func (s *Store) rebuildIndexes() error {
 		if !entry.IsDir() || entry.Name() == trashDirectoryName {
 			continue
 		}
-		path := filepath.Join(s.root, entry.Name())
-		meta, err := s.readMetadata(path)
+		path := filepath.Join(s.metadataRepository.root, entry.Name())
+		meta, err := s.metadataRepository.readMetadata(path)
 		if errors.Is(err, os.ErrNotExist) {
-			generations, generationErr := s.readDir(filepath.Join(path, "generations"))
+			generations, generationErr := s.metadataRepository.readDir(filepath.Join(path, "generations"))
 			if generationErr == nil && hasGenerationDirectory(generations) {
 				s.markDegraded(entry.Name(), errors.New("cache metadata is missing while generations remain"))
 			} else if generationErr != nil && !errors.Is(generationErr, os.ErrNotExist) {
@@ -46,7 +46,7 @@ func (s *Store) rebuildIndexes() error {
 		s.indexMetadata(meta)
 	}
 
-	trashEntries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
+	trashEntries, err := s.metadataRepository.readDir(filepath.Join(s.metadataRepository.root, trashDirectoryName))
 	if err != nil {
 		return err
 	}
@@ -54,8 +54,8 @@ func (s *Store) rebuildIndexes() error {
 		if !entry.IsDir() {
 			continue
 		}
-		trashPath := filepath.Join(s.root, trashDirectoryName, entry.Name())
-		meta, err := s.readMetadata(trashPath)
+		trashPath := filepath.Join(s.metadataRepository.root, trashDirectoryName, entry.Name())
+		meta, err := s.metadataRepository.readMetadata(trashPath)
 		if err == nil {
 			err = validateMetadata(meta.Identity, meta)
 		}
@@ -66,27 +66,27 @@ func (s *Store) rebuildIndexes() error {
 			}
 			continue
 		}
-		s.projectRegistryMu.Lock()
+		s.projectQuotaRegistry.projectRegistryMu.Lock()
 		s.mu.Lock()
-		s.trashMetadata[entry.Name()] = meta
+		s.trashCollector.trashMetadata[entry.Name()] = meta
 		s.addMetadataReservations(meta, entry.Name())
 		s.mu.Unlock()
-		s.projectRegistryMu.Unlock()
+		s.projectQuotaRegistry.projectRegistryMu.Unlock()
 	}
 	s.mu.Lock()
-	degradedIdentities := make([]string, 0, len(s.degraded))
-	for identity := range s.degraded {
+	degradedIdentities := make([]string, 0, len(s.generationManager.degraded))
+	for identity := range s.generationManager.degraded {
 		degradedIdentities = append(degradedIdentities, identity)
 	}
 	s.mu.Unlock()
 	if registryMissing {
 		for _, identity := range degradedIdentities {
 			if filepath.Dir(identity) == "." {
-				s.projectRegistryMu.Lock()
+				s.projectQuotaRegistry.projectRegistryMu.Lock()
 				s.mu.Lock()
 				s.addUnknownProjectReservation(identity, "")
 				s.mu.Unlock()
-				s.projectRegistryMu.Unlock()
+				s.projectQuotaRegistry.projectRegistryMu.Unlock()
 			}
 		}
 	}
@@ -108,7 +108,7 @@ func hasUntrackedObjectPayload(entries []os.DirEntry) bool {
 
 func (s *Store) discardUntrackedGenerations(entry string) error {
 	generations := filepath.Join(entry, "generations")
-	entries, err := s.readDir(generations)
+	entries, err := s.metadataRepository.readDir(generations)
 	if errors.Is(err, os.ErrNotExist) {
 		entries = nil
 	}
@@ -121,7 +121,7 @@ func (s *Store) discardUntrackedGenerations(entry string) error {
 		s.markDegraded(filepath.Base(entry), cause)
 		return fmt.Errorf("%w: %v", ErrDegradedMetadata, cause)
 	}
-	entryContents, err := s.readDir(entry)
+	entryContents, err := s.metadataRepository.readDir(entry)
 	if err != nil {
 		return err
 	}
@@ -148,8 +148,8 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 		return "", "", false, errors.New("absolute target path and source matcher are required")
 	}
 	s.mu.Lock()
-	identities := make([]string, 0, len(s.degraded))
-	for identity := range s.degraded {
+	identities := make([]string, 0, len(s.generationManager.degraded))
+	for identity := range s.generationManager.degraded {
 		if validIdentity(identity) {
 			identities = append(identities, identity)
 		}
@@ -159,13 +159,13 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 	for _, identity := range identities {
 		unlockIdentity := s.lockIdentity(identity)
 		s.mu.Lock()
-		_, degraded := s.degraded[identity]
+		_, degraded := s.generationManager.degraded[identity]
 		s.mu.Unlock()
 		if !degraded {
 			unlockIdentity()
 			continue
 		}
-		generations, err := s.readDir(filepath.Join(s.root, identity, "generations"))
+		generations, err := s.metadataRepository.readDir(filepath.Join(s.metadataRepository.root, identity, "generations"))
 		if errors.Is(err, os.ErrNotExist) {
 			generations = nil
 		} else if err != nil {
@@ -176,7 +176,7 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 			if !generation.IsDir() {
 				continue
 			}
-			source := filepath.Join(s.root, identity, "generations", generation.Name())
+			source := filepath.Join(s.metadataRepository.root, identity, "generations", generation.Name())
 			matches, err := sameSource(source, target)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -196,7 +196,7 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 			matchedSource = source
 		}
 		if !hasGenerationDirectory(generations) {
-			source := filepath.Join(s.root, identity)
+			source := filepath.Join(s.metadataRepository.root, identity)
 			matches, err := sameSource(source, target)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -226,13 +226,13 @@ func (s *Store) CleanupDegradedObject(identity string, sourceMounted func(source
 	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	s.mu.Lock()
-	if _, degraded := s.degraded[identity]; !degraded {
+	if _, degraded := s.generationManager.degraded[identity]; !degraded {
 		s.mu.Unlock()
 		return nil
 	}
 	s.mu.Unlock()
-	objectPath := filepath.Join(s.root, identity)
-	generations, err := s.readDir(filepath.Join(objectPath, "generations"))
+	objectPath := filepath.Join(s.metadataRepository.root, identity)
+	generations, err := s.metadataRepository.readDir(filepath.Join(objectPath, "generations"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect degraded cache generations before cleanup: %w", err)
 	}
@@ -269,8 +269,8 @@ func (s *Store) RecoverDegraded(ctx context.Context, verifyMount func(source str
 		return errors.New("mount verifier is not configured")
 	}
 	s.mu.Lock()
-	identities := make([]string, 0, len(s.degraded))
-	for identity := range s.degraded {
+	identities := make([]string, 0, len(s.generationManager.degraded))
+	for identity := range s.generationManager.degraded {
 		if validIdentity(identity) {
 			identities = append(identities, identity)
 		}
@@ -285,10 +285,10 @@ func (s *Store) RecoverDegraded(ctx context.Context, verifyMount func(source str
 		}
 		unlockIdentity := s.lockIdentity(identity)
 		s.mu.Lock()
-		_, degraded := s.degraded[identity]
+		_, degraded := s.generationManager.degraded[identity]
 		s.mu.Unlock()
 		if degraded {
-			path := filepath.Join(s.root, identity)
+			path := filepath.Join(s.metadataRepository.root, identity)
 			if err := s.quarantineDegradedObjectChecked(ctx, path, identity, verifyMount); err != nil {
 				recoveryErr = errors.Join(recoveryErr, fmt.Errorf("recover degraded cache %s: %w", identity, err))
 			}
@@ -311,7 +311,7 @@ func (s *Store) RecoverLeasesContext(ctx context.Context, verifyMount func(sourc
 	if verifyMount == nil {
 		return errors.New("mount verifier is not configured")
 	}
-	entries, err := s.readDir(s.root)
+	entries, err := s.metadataRepository.readDir(s.metadataRepository.root)
 	if err != nil {
 		return err
 	}
@@ -321,7 +321,7 @@ func (s *Store) RecoverLeasesContext(ctx context.Context, verifyMount func(sourc
 		}
 		if entry.IsDir() && entry.Name() != trashDirectoryName {
 			unlockIdentity := s.lockIdentity(entry.Name())
-			if err := s.recoverObjectLeases(ctx, filepath.Join(s.root, entry.Name()), entry.Name(), verifyMount); err != nil {
+			if err := s.recoverObjectLeases(ctx, filepath.Join(s.metadataRepository.root, entry.Name()), entry.Name(), verifyMount); err != nil {
 				unlockIdentity()
 				return err
 			}
@@ -336,7 +336,7 @@ func (s *Store) recoverObjectLeases(ctx context.Context, path, identity string, 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	meta, err := s.readMetadata(path)
+	meta, err := s.metadataRepository.readMetadata(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s.recoverMissingMetadataObject(ctx, path, identity, verifyMount)
 	}
@@ -354,9 +354,9 @@ func (s *Store) recoverMissingMetadataObject(ctx context.Context, path, identity
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	generations, err := s.readDir(filepath.Join(path, "generations"))
+	generations, err := s.metadataRepository.readDir(filepath.Join(path, "generations"))
 	if errors.Is(err, os.ErrNotExist) || err == nil && !hasGenerationDirectory(generations) {
-		contents, readErr := s.readDir(path)
+		contents, readErr := s.metadataRepository.readDir(path)
 		if readErr != nil {
 			s.markDegraded(identity, readErr)
 			return nil
@@ -426,7 +426,7 @@ func (s *Store) recoverValidObjectLeases(ctx context.Context, path, identity str
 		return nil
 	}
 	generationPath := filepath.Join(path, "generations", meta.Generation)
-	if statErr := s.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
+	if statErr := s.metadataRepository.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
 		meta.Leases = slices.DeleteFunc(meta.Leases, func(lease Lease) bool { return lease.Generation == "" || lease.Generation == meta.Generation })
 		meta.Generation = uuid.NewV7().String()
 		meta.CreatedAt = time.Now().UTC()
@@ -472,7 +472,7 @@ func (s *Store) recoverDirtyObject(path, identity string, meta Metadata) error {
 		s.markDegraded(identity, err)
 		return nil
 	}
-	if err := s.ensureDirectory(path); err != nil {
+	if err := s.metadataRepository.ensureDirectory(path); err != nil {
 		return fmt.Errorf("create cache object after recovery: %w", err)
 	}
 	meta = Metadata{
@@ -524,16 +524,16 @@ func (s *Store) quarantineForRecovery(ctx context.Context, path, identity string
 }
 
 func (s *Store) quarantineDegradedObjectChecked(ctx context.Context, path, identity string, verifyMount func(string, Lease, Policy) (bool, error)) error {
-	if err := s.stat(path); err != nil {
+	if err := s.metadataRepository.stat(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			delete(s.degraded, identity)
+			delete(s.generationManager.degraded, identity)
 			return nil
 		}
 		s.markDegraded(identity, err)
 		return fmt.Errorf("inspect degraded cache object: %w", err)
 	}
 	generationsPath := filepath.Join(path, "generations")
-	generations, err := s.readDir(generationsPath)
+	generations, err := s.metadataRepository.readDir(generationsPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.markDegraded(identity, err)
 		return fmt.Errorf("inspect degraded cache generations: %w", err)

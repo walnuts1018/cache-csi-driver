@@ -29,6 +29,9 @@ func (systemMounter) sameCacheMount(source, target string, readOnly, noExec bool
 func (systemMounter) sameCacheSource(source, target string) (bool, error) {
 	return sameCacheSource(source, target)
 }
+func (systemMounter) sourceWithinRoot(string, string) (bool, error) {
+	return false, errors.New("mount source inspection requires Linux")
+}
 func (systemMounter) sourceMounted(string) (bool, error) {
 	return false, errors.New("mount inspection requires Linux")
 }

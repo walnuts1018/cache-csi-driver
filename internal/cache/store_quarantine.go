@@ -16,17 +16,17 @@ func (s *Store) ScheduleQuarantine(identity string, sourceMounted func(string) (
 	if !validIdentity(identity) || sourceMounted == nil {
 		return errors.New("valid degraded cache identity and mount inspector are required")
 	}
-	s.collectorMu.Lock()
-	collectorAvailable := s.collectorStarted && !s.collectorFinished
-	s.collectorMu.Unlock()
+	s.trashCollector.collectorMu.Lock()
+	collectorAvailable := s.trashCollector.collectorStarted && !s.trashCollector.collectorFinished
+	s.trashCollector.collectorMu.Unlock()
 	if !collectorAvailable {
 		return errors.New("cache trash collector is unavailable")
 	}
 	request := quarantineRequest{identity: identity, sourceMounted: sourceMounted}
 	select {
-	case <-s.stopTrash:
+	case <-s.trashCollector.stopTrash:
 		return errors.New("cache store is closed")
-	case s.quarantineRequests <- request:
+	case s.trashCollector.quarantineRequests <- request:
 		return nil
 	default:
 		return fmt.Errorf("schedule degraded cache quarantine: %w", ErrQuarantineQueueFull)

@@ -38,3 +38,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "cache-csi-driver.validatePressureSettings" -}}
+{{- if and .Values.pressure.allowPodEviction (not .Values.rbac.createPodEvictions) -}}
+{{- fail "pressure.allowPodEviction requires rbac.createPodEvictions" -}}
+{{- end -}}
+{{- if and .Values.rbac.createPodEvictions (not .Values.pressure.allowPodEviction) -}}
+{{- fail "rbac.createPodEvictions requires pressure.allowPodEviction" -}}
+{{- end -}}
+{{- if and .Values.pressure.allowForceDelete (not .Values.pressure.allowPodEviction) -}}
+{{- fail "pressure.allowForceDelete requires pressure.allowPodEviction" -}}
+{{- end -}}
+{{- if and .Values.pressure.allowForceDelete (not .Values.rbac.deletePodsAtCriticalPressure) -}}
+{{- fail "pressure.allowForceDelete requires rbac.deletePodsAtCriticalPressure" -}}
+{{- end -}}
+{{- if and .Values.rbac.deletePodsAtCriticalPressure (not .Values.pressure.allowForceDelete) -}}
+{{- fail "rbac.deletePodsAtCriticalPressure requires pressure.allowForceDelete" -}}
+{{- end -}}
+{{- end -}}

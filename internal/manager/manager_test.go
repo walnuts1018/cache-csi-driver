@@ -80,7 +80,7 @@ func TestCriticalForceDeleteUsesUIDPreconditionAndCooldown(t *testing.T) {
 		}
 	})
 	client := kubefake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "cache-user", Namespace: "workloads", UID: types.UID("pod-uid")}})
-	manager := New(store, Options{Client: client, AllowForceDelete: true})
+	manager := New(store, Options{Client: client, AllowPodEviction: true, AllowForceDelete: true})
 	lease := cache.Lease{Namespace: "workloads", PodName: "cache-user", PodUID: "pod-uid"}
 	manager.evictWithBackoff(t.Context(), cache.PressureVictim{Lease: lease})
 	manager.evictWithBackoff(t.Context(), cache.PressureVictim{Lease: lease, ForceDelete: true})

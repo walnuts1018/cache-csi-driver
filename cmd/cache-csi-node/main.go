@@ -48,41 +48,39 @@ func run(logger *slog.Logger) error {
 	metricsAddress := flag.String("metrics-address", ":9807", "Prometheus metrics HTTP listen address")
 	cacheRoot := flag.String("cache-root", "/var/lib/cache-csi", "cache storage directory")
 	requireCacheRootMountpoint := flag.Bool("require-cache-root-mountpoint", false, "require cache-root to be a filesystem mountpoint before measuring filesystem-wide pressure")
-	fallbackRoot := flag.String("fallback-root", "/run/cache-csi/fallback", "temporary cache directory used when Kubernetes API resolution fails")
+	fallbackRoot := flag.String("fallback-root", "/run/cache-csi/fallback", "bounded temporary cache directory used when the primary cache cannot serve a volume")
 	fallbackMaxBytes := flag.String("fallback-max-bytes", "1Gi", "maximum total size of the fallback tmpfs filesystem")
 	fallbackVolumeMaxBytes := flag.String("fallback-volume-max-bytes", "128Mi", "maximum size reserved for one fallback cache volume")
+	fallbackEmergencyRoot := flag.String("fallback-emergency-root", "/run/cache-csi/fallback-emergency", "isolated tmpfs root used when the regular fallback store cannot allocate a volume")
+	fallbackEmergencyMaxBytes := flag.String("fallback-emergency-max-bytes", "64Mi", "maximum aggregate writable generation capacity in emergency fallback")
+	fallbackEmergencyRootMaxBytes := flag.String("fallback-emergency-root-max-bytes", "16Mi", "maximum size of the emergency fallback Store metadata tmpfs")
+	fallbackEmergencyVolumeMaxBytes := flag.String("fallback-emergency-volume-max-bytes", "4Mi", "maximum size reserved for one emergency cache volume")
+	fallbackTerminalRoot := flag.String("fallback-terminal-root", "/run/cache-csi/fallback-terminal", "small tmpfs root for read-only terminal fallback mounts")
+	fallbackTerminalRootMaxBytes := flag.String("fallback-terminal-root-max-bytes", "4Mi", "maximum size of the terminal fallback tmpfs")
 	nodeID := flag.String("node-id", os.Getenv("NODE_NAME"), "Kubernetes node name")
 	kubeletRoot := flag.String("kubelet-root", "/var/lib/kubelet", "kubelet root directory")
 	gcInterval := flag.Duration("gc-interval", 30*time.Second, "cache garbage collection interval")
 	highFreePercent := flag.Int("pressure-high-free-percent", 25, "free-byte percentage at which cache pressure collection stops")
 	lowFreePercent := flag.Int("pressure-low-free-percent", 20, "free-byte percentage at which cache pressure collection starts")
-	criticalFreePercent := flag.Int("pressure-critical-free-percent", 0, "free-byte percentage below which ForceDelete policies become eligible; --allow-force-delete is required for Pod deletion; zero disables critical escalation")
+	criticalFreePercent := flag.Int("pressure-critical-free-percent", 0, "free-byte percentage below which ForceDelete policies become eligible; --allow-pod-eviction and --allow-force-delete are required for Pod deletion; zero disables critical escalation")
 	highInodeFreePercent := flag.Int("pressure-high-inode-free-percent", 15, "free-inode percentage at which cache pressure collection stops")
 	lowInodeFreePercent := flag.Int("pressure-low-inode-free-percent", 10, "free-inode percentage at which cache pressure collection starts")
-	criticalInodeFreePercent := flag.Int("pressure-critical-inode-free-percent", 0, "free-inode percentage below which ForceDelete policies become eligible; --allow-force-delete is required for Pod deletion; zero disables critical escalation")
+	criticalInodeFreePercent := flag.Int("pressure-critical-inode-free-percent", 0, "free-inode percentage below which ForceDelete policies become eligible; --allow-pod-eviction and --allow-force-delete are required for Pod deletion; zero disables critical escalation")
+	allowPodEviction := flag.Bool("allow-pod-eviction", false, "allow cache pressure handling to request Pod eviction")
 	allowForceDelete := flag.Bool("allow-force-delete", false, "allow ForceDelete pressure policies to bypass PodDisruptionBudgets using UID-preconditioned Pod deletion")
 	projectIDStart := flag.Uint("project-id-start", 2_000_000_000, "first project ID reserved for cache identities")
 	projectIDCount := flag.Uint("project-id-count", 1_000_000, "number of project IDs reserved for cache identities")
 	flag.Parse()
 
-	if *gcInterval <= 0 {
-		return fmt.Errorf("gc interval must be greater than zero")
+	if err := validateRuntimeConfig(*gcInterval, *allowPodEviction, *allowForceDelete, *projectIDStart, *projectIDCount, *nodeID); err != nil {
+		return err
 	}
-	if uint64(*projectIDStart) > uint64(^uint32(0)) || uint64(*projectIDCount) > uint64(^uint32(0)) {
-		return fmt.Errorf("project ID range values must fit within uint32")
-	}
-	if *nodeID == "" {
-		return fmt.Errorf("node ID must be configured")
-	}
-	paths, err := resolveRuntimePaths(*cacheRoot, *fallbackRoot, *kubeletRoot, *fallbackMaxBytes, *fallbackVolumeMaxBytes, *endpoint)
+	paths, err := resolveRuntimePaths(*cacheRoot, *fallbackRoot, *fallbackEmergencyRoot, *fallbackTerminalRoot, *kubeletRoot, *fallbackMaxBytes, *fallbackVolumeMaxBytes, *fallbackEmergencyMaxBytes, *fallbackEmergencyRootMaxBytes, *fallbackEmergencyVolumeMaxBytes, *fallbackTerminalRootMaxBytes, *endpoint)
 	if err != nil {
 		return err
 	}
-	if err := mountFallbackTmpfs(*fallbackRoot, paths.fallbackSize); err != nil {
-		return fmt.Errorf("prepare bounded fallback filesystem: %w", err)
-	}
-	if err := driver.PreflightMountAPI(); err != nil {
-		return fmt.Errorf("preflight Linux mount APIs: %w", err)
+	if err := prepareFallbackFilesystems(*fallbackRoot, paths.fallbackSize, *fallbackEmergencyRoot, paths.fallbackEmergencyRootSize, *fallbackTerminalRoot, paths.fallbackTerminalRootSize); err != nil {
+		return err
 	}
 
 	pressure := cache.PressureConfig{
@@ -108,6 +106,11 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("initialize fallback cache store: %w", errors.Join(err, store.Close()))
 	}
 	defer func() { _ = fallbackStore.Close() }()
+	emergencyStore, err := cache.NewStore(*fallbackEmergencyRoot, cache.StoreOptions{UnmountGeneration: driver.UnmountFallbackGeneration})
+	if err != nil {
+		return fmt.Errorf("initialize emergency fallback cache store: %w", errors.Join(err, fallbackStore.Close(), store.Close()))
+	}
+	defer func() { _ = emergencyStore.Close() }()
 	metricSet := metrics.New()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -115,29 +118,42 @@ func run(logger *slog.Logger) error {
 	if resolver != nil {
 		resolver.Start(ctx)
 	}
+	managerClient := kubernetes.Interface(nil)
+	if *allowPodEviction {
+		managerClient = client
+	}
 	cacheManager := manager.New(store, manager.Options{
 		Interval:         *gcInterval,
-		Client:           client,
+		Client:           managerClient,
 		InspectMount:     driver.VerifyCacheMount,
 		FallbackStore:    fallbackStore,
+		EmergencyStore:   emergencyStore,
 		Logger:           logger,
 		Metrics:          metricSet,
+		AllowPodEviction: *allowPodEviction,
 		AllowForceDelete: *allowForceDelete,
 	})
-	if client == nil {
+	if !*allowPodEviction {
+		logger.Info("Pod pressure eviction is disabled")
+	} else if client == nil {
 		logger.Warn("Pod pressure eviction is unavailable because the in-cluster Kubernetes client could not be created")
 	}
 
 	service := driver.New(store, resolver, quota.XFS{Binary: "xfs_quota"}, driver.Options{
-		NodeID:                 *nodeID,
-		KubeletRoot:            *kubeletRoot,
-		FallbackRoot:           *fallbackRoot,
-		FallbackStore:          fallbackStore,
-		FallbackMaxBytes:       paths.fallbackSize,
-		FallbackVolumeMaxBytes: paths.fallbackVolumeSize,
-		VendorVersion:          version,
-		Metrics:                metricSet,
-		Logger:                 logger,
+		NodeID:                          *nodeID,
+		KubeletRoot:                     *kubeletRoot,
+		FallbackRoot:                    *fallbackRoot,
+		FallbackStore:                   fallbackStore,
+		FallbackMaxBytes:                paths.fallbackMaxBytes,
+		FallbackVolumeMaxBytes:          paths.fallbackVolumeSize,
+		FallbackEmergencyRoot:           *fallbackEmergencyRoot,
+		FallbackEmergencyStore:          emergencyStore,
+		FallbackEmergencyMaxBytes:       paths.fallbackEmergencyMaxBytes,
+		FallbackEmergencyVolumeMaxBytes: paths.fallbackEmergencyVolumeSize,
+		FallbackTerminalRoot:            *fallbackTerminalRoot,
+		VendorVersion:                   version,
+		Metrics:                         metricSet,
+		Logger:                          logger,
 	})
 	grpcServer := grpc.NewServer()
 	csi.RegisterIdentityServer(grpcServer, service)
@@ -230,6 +246,38 @@ func run(logger *slog.Logger) error {
 	return nil
 }
 
+func validateRuntimeConfig(gcInterval time.Duration, allowPodEviction, allowForceDelete bool, projectIDStart, projectIDCount uint, nodeID string) error {
+	if gcInterval <= 0 {
+		return fmt.Errorf("gc interval must be greater than zero")
+	}
+	if allowForceDelete && !allowPodEviction {
+		return fmt.Errorf("allow-force-delete requires --allow-pod-eviction")
+	}
+	if uint64(projectIDStart) > uint64(^uint32(0)) || uint64(projectIDCount) > uint64(^uint32(0)) {
+		return fmt.Errorf("project ID range values must fit within uint32")
+	}
+	if nodeID == "" {
+		return fmt.Errorf("node ID must be configured")
+	}
+	return nil
+}
+
+func prepareFallbackFilesystems(fallbackRoot string, fallbackSize int64, emergencyRoot string, emergencySize int64, terminalRoot string, terminalSize int64) error {
+	if err := mountFallbackTmpfs(fallbackRoot, fallbackSize, true); err != nil {
+		return fmt.Errorf("prepare bounded fallback filesystem: %w", err)
+	}
+	if err := mountFallbackTmpfs(emergencyRoot, emergencySize, true); err != nil {
+		return fmt.Errorf("prepare emergency fallback filesystem: %w", err)
+	}
+	if err := mountFallbackTmpfs(terminalRoot, terminalSize, false); err != nil {
+		return fmt.Errorf("prepare terminal fallback filesystem: %w", err)
+	}
+	if err := driver.PreflightMountAPI(); err != nil {
+		return fmt.Errorf("preflight Linux mount APIs: %w", err)
+	}
+	return nil
+}
+
 func serveMetrics(ctx context.Context, server *http.Server, listener net.Listener) error {
 	serveDone := make(chan error, 1)
 	go func() {
@@ -257,15 +305,22 @@ func serveMetrics(ctx context.Context, server *http.Server, listener net.Listene
 }
 
 type runtimePaths struct {
-	socketPath         string
-	fallbackSize       int64
-	fallbackVolumeSize int64
+	socketPath                  string
+	fallbackSize                int64
+	fallbackMaxBytes            int64
+	fallbackVolumeSize          int64
+	fallbackEmergencyMaxBytes   int64
+	fallbackEmergencyRootSize   int64
+	fallbackEmergencyVolumeSize int64
+	fallbackTerminalRootSize    int64
 }
 
-func resolveRuntimePaths(cacheRoot, fallbackRoot, kubeletRoot, fallbackMaxBytes, fallbackVolumeMaxBytes, endpoint string) (runtimePaths, error) {
+func resolveRuntimePaths(cacheRoot, fallbackRoot, fallbackEmergencyRoot, fallbackTerminalRoot, kubeletRoot, fallbackMaxBytes, fallbackVolumeMaxBytes, fallbackEmergencyMaxBytes, fallbackEmergencyRootMaxBytes, fallbackEmergencyVolumeMaxBytes, fallbackTerminalRootMaxBytes, endpoint string) (runtimePaths, error) {
 	for _, item := range []struct{ name, path string }{
 		{name: "cache root", path: cacheRoot},
 		{name: "fallback root", path: fallbackRoot},
+		{name: "emergency fallback root", path: fallbackEmergencyRoot},
+		{name: "terminal fallback root", path: fallbackTerminalRoot},
 		{name: "kubelet root", path: kubeletRoot},
 	} {
 		if !filepath.IsAbs(item.path) {
@@ -280,6 +335,28 @@ func resolveRuntimePaths(cacheRoot, fallbackRoot, kubeletRoot, fallbackMaxBytes,
 	if err != nil {
 		return runtimePaths{}, fmt.Errorf("parse fallback per-volume maximum: %w", err)
 	}
+	fallbackEmergencyVolumeSize, err := fallbackFilesystemSize(fallbackEmergencyVolumeMaxBytes)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("parse fallback emergency per-volume maximum: %w", err)
+	}
+	fallbackEmergencySize, err := fallbackFilesystemSize(fallbackEmergencyMaxBytes)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("parse emergency fallback aggregate generation maximum: %w", err)
+	}
+	fallbackEmergencyRootSize, err := fallbackFilesystemSize(fallbackEmergencyRootMaxBytes)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("parse emergency fallback root maximum: %w", err)
+	}
+	fallbackTerminalRootSize, err := fallbackFilesystemSize(fallbackTerminalRootMaxBytes)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("parse terminal fallback root maximum: %w", err)
+	}
+	if fallbackEmergencyVolumeSize < int64(os.Getpagesize()) {
+		return runtimePaths{}, fmt.Errorf("fallback emergency per-volume maximum must be at least one page (%d bytes)", os.Getpagesize())
+	}
+	if fallbackEmergencyVolumeSize > fallbackEmergencySize {
+		return runtimePaths{}, errors.New("fallback emergency per-volume maximum must not exceed the emergency aggregate maximum")
+	}
 	if fallbackVolumeSize > fallbackSize {
 		return runtimePaths{}, errors.New("fallback per-volume maximum must not exceed the aggregate fallback maximum")
 	}
@@ -291,12 +368,26 @@ func resolveRuntimePaths(cacheRoot, fallbackRoot, kubeletRoot, fallbackMaxBytes,
 	if err != nil {
 		return runtimePaths{}, fmt.Errorf("resolve fallback root: %w", err)
 	}
+	canonicalEmergencyFallbackRoot, err := canonicalPath(fallbackEmergencyRoot)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("resolve emergency fallback root: %w", err)
+	}
+	canonicalTerminalFallbackRoot, err := canonicalPath(fallbackTerminalRoot)
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("resolve terminal fallback root: %w", err)
+	}
 	canonicalKubeletRoot, err := canonicalPath(kubeletRoot)
 	if err != nil {
 		return runtimePaths{}, fmt.Errorf("resolve kubelet root: %w", err)
 	}
-	if pathsOverlap(canonicalCacheRoot, canonicalFallbackRoot) || pathsOverlap(canonicalKubeletRoot, canonicalFallbackRoot) {
-		return runtimePaths{}, fmt.Errorf("fallback root must not overlap the cache root or kubelet root")
+	if pathsOverlap(canonicalCacheRoot, canonicalFallbackRoot) || pathsOverlap(canonicalKubeletRoot, canonicalFallbackRoot) || pathsOverlap(canonicalEmergencyFallbackRoot, canonicalFallbackRoot) || pathsOverlap(canonicalTerminalFallbackRoot, canonicalFallbackRoot) {
+		return runtimePaths{}, fmt.Errorf("fallback root must not overlap the cache root, emergency fallback root, terminal fallback root, or kubelet root")
+	}
+	if pathsOverlap(canonicalCacheRoot, canonicalEmergencyFallbackRoot) || pathsOverlap(canonicalKubeletRoot, canonicalEmergencyFallbackRoot) || pathsOverlap(canonicalTerminalFallbackRoot, canonicalEmergencyFallbackRoot) {
+		return runtimePaths{}, fmt.Errorf("emergency fallback root must not overlap the cache root, terminal fallback root, or kubelet root")
+	}
+	if pathsOverlap(canonicalCacheRoot, canonicalTerminalFallbackRoot) || pathsOverlap(canonicalKubeletRoot, canonicalTerminalFallbackRoot) {
+		return runtimePaths{}, fmt.Errorf("terminal fallback root must not overlap the cache root or kubelet root")
 	}
 	if pathsOverlap(canonicalCacheRoot, canonicalKubeletRoot) {
 		return runtimePaths{}, fmt.Errorf("cache root must not overlap the kubelet root")
@@ -305,7 +396,16 @@ func resolveRuntimePaths(cacheRoot, fallbackRoot, kubeletRoot, fallbackMaxBytes,
 	if err != nil {
 		return runtimePaths{}, err
 	}
-	return runtimePaths{socketPath: socketPath, fallbackSize: fallbackSize, fallbackVolumeSize: fallbackVolumeSize}, nil
+	return runtimePaths{
+		socketPath:                  socketPath,
+		fallbackSize:                fallbackSize,
+		fallbackMaxBytes:            fallbackSize,
+		fallbackVolumeSize:          fallbackVolumeSize,
+		fallbackEmergencyMaxBytes:   fallbackEmergencySize,
+		fallbackEmergencyRootSize:   fallbackEmergencyRootSize,
+		fallbackEmergencyVolumeSize: fallbackEmergencyVolumeSize,
+		fallbackTerminalRootSize:    fallbackTerminalRootSize,
+	}, nil
 }
 
 func fallbackFilesystemSize(value string) (int64, error) {
