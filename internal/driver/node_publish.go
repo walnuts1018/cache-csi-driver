@@ -171,6 +171,13 @@ func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublish
 	if !mounted {
 		return "", nil
 	}
+	terminalSame, err := s.verifyTerminalFallbackMount(req)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "verify terminal fallback mount: %v", err)
+	}
+	if terminalSame {
+		return publishOutcomeFallback, nil
+	}
 	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	metadataDegraded := errors.Is(err, cache.ErrDegradedMetadata)
 	if metadataDegraded {
@@ -210,13 +217,6 @@ func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublish
 	}
 	if verifiedDegradedMount {
 		return publishOutcomeHit, nil
-	}
-	terminalSame, err := s.verifyTerminalFallbackMount(req)
-	if err != nil {
-		return "", status.Errorf(codes.Internal, "verify terminal fallback mount: %v", err)
-	}
-	if terminalSame {
-		return publishOutcomeFallback, nil
 	}
 	if metadataDegraded {
 		return "", status.Error(codes.Internal, "cache volume metadata is unreadable")
