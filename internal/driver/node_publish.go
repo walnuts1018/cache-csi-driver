@@ -796,7 +796,13 @@ func (s *Server) publishFallbackOnStoreOrTerminal(ctx context.Context, req *csi.
 		return tierErr.rpcErr
 	}
 	if releaseErr := store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
-		return status.Errorf(codes.Internal, "fallback publish failed: %v; release fallback lease before retry failed: %v", tierErr.rpcErr, releaseErr)
+		s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("fallback_lease_release_failed"), releaseErr)
+		s.logger.WarnContext(ctx, "fallback lease could not be released before changing tiers", "volumeID", req.GetVolumeId(), "root", store.Root(), "error", releaseErr)
+		if s.isFallbackStore(store) {
+			if err := s.mounter.unmountGeneration(allocation.Source); err != nil {
+				s.logger.WarnContext(ctx, "failed to unmount fallback generation before changing tiers", "source", allocation.Source, "error", err)
+			}
+		}
 	}
 	if store != s.emergencyStore && s.emergencyStore != nil {
 		allocation, acquireErr := s.emergencyStore.AcquireFallback(acquireOptions, requestedBytes, s.options.FallbackEmergencyVolumeMaxBytes, s.options.FallbackEmergencyMaxBytes)
@@ -819,22 +825,14 @@ func (s *Server) publishFallbackOnStore(ctx context.Context, req *csi.NodePublis
 		return &fallbackTierError{rpcErr: status.Errorf(codes.Internal, "begin fallback cache publish: %v", err), cause: err}
 	}
 	if err := s.mounter.prepareFallback(allocation.Source, allocation.MaxBytes, noExec); err != nil {
-		rpcErr := s.rollbackFallbackPublish(store, req, status.Errorf(codes.FailedPrecondition, "prepare bounded fallback cache: %v", err))
-		if status.Code(rpcErr) == codes.FailedPrecondition {
-			return &fallbackTierError{rpcErr: rpcErr, cause: err}
-		}
-		return rpcErr
+		return s.rollbackFallbackTierPublish(store, req, err, "prepare bounded fallback cache")
 	}
 	if err := ctx.Err(); err != nil {
 		return s.rollbackFallbackPublish(store, req, status.FromContextError(err).Err())
 	}
 	source, err := store.Expose(identity)
 	if err != nil {
-		rpcErr := s.rollbackFallbackPublish(store, req, status.Errorf(codes.FailedPrecondition, "expose fallback cache: %v", err))
-		if status.Code(rpcErr) == codes.FailedPrecondition {
-			return &fallbackTierError{rpcErr: rpcErr, cause: err}
-		}
-		return rpcErr
+		return s.rollbackFallbackTierPublish(store, req, err, "expose fallback cache")
 	}
 	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
 	if err != nil {
@@ -899,4 +897,13 @@ func (s *Server) rollbackFallbackPublish(store *cache.Store, req *csi.NodePublis
 		return status.Errorf(codes.Internal, "fallback publish failed: %v; release fallback lease failed: %v", publishErr, err)
 	}
 	return publishErr
+}
+
+func (s *Server) rollbackFallbackTierPublish(store *cache.Store, req *csi.NodePublishVolumeRequest, cause error, operation string) error {
+	rpcErr := status.Errorf(codes.FailedPrecondition, "%s: %v", operation, cause)
+	if releaseErr := store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
+		rpcErr = status.Errorf(codes.Internal, "%s failed: %v; release fallback lease failed: %v", operation, cause, releaseErr)
+		cause = errors.Join(cause, releaseErr)
+	}
+	return &fallbackTierError{rpcErr: rpcErr, cause: cause}
 }
