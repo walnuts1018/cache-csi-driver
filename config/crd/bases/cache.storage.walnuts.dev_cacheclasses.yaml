@@ -126,10 +126,10 @@ spec:
                   rule: '!self.contains(''/'') && !self.contains(''\\'') && !self.contains(''\u0000'')'
               scope:
                 default: ServiceAccount
-                description: Scope defines the workload trust boundary included in
-                  cache identity. Namespace allows all workloads in a namespace to
-                  share identity; ServiceAccount isolates workloads by ServiceAccount
-                  UID.
+                description: Scope defines the workload isolation scope included in
+                  cache identity, not an authorization boundary. Namespace shares
+                  identity across a namespace; ServiceAccount separates identities
+                  by ServiceAccount UID.
                 enum:
                 - ServiceAccount
                 - Namespace

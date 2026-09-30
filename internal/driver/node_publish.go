@@ -440,7 +440,7 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 }
 
 func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolumeRequest, identity string, lease cache.Lease, policy cache.Policy) error {
-	source, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
+	_, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 	if err != nil {
 		if cause, ok := fallbackCauseForError(err, "cache_acquire_failed"); ok {
 			return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, cause, err)
@@ -461,7 +461,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 		}
 		return s.useFallback(ctx, req, policy.MaxBytes, true, cache.PressurePolicyUnusedOnly, unexpectedFallbackCause("cache_acquire_failed"), err)
 	}
-	source = storedSource
+	source := storedSource
 	policy = storedPolicy
 	policy.NoExec = storedLease.NoExec
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {

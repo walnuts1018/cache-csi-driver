@@ -18,6 +18,7 @@ import (
 
 const firstLeaseID = "first"
 const otherLeaseID = "other"
+const secondName = "second"
 
 func TestAcquireFallbackReservesPerVolumeAndAggregateLimits(t *testing.T) {
 	t.Parallel()
@@ -134,7 +135,7 @@ func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 
 	nextPath, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: "second", Target: filepath.Join(t.TempDir(), "second")},
+		Lease:    Lease{ID: secondName, Target: filepath.Join(t.TempDir(), secondName)},
 		Policy:   policy,
 	})
 	if err != nil {
@@ -196,7 +197,7 @@ func TestFallbackObjectIsExclusiveAndDiscardedAfterLastRelease(t *testing.T) {
 	}
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: "second-fallback-lease", Target: filepath.Join(t.TempDir(), "second")},
+		Lease:    Lease{ID: "second-fallback-lease", Target: filepath.Join(t.TempDir(), secondName)},
 		Policy:   policy,
 	}); !errors.Is(err, ErrExclusivePolicyConflict) {
 		t.Fatalf("second lease error = %v, want exclusive policy conflict", err)
@@ -538,7 +539,7 @@ func TestAcquireRejectsQuotaChangeWhileGenerationIsActive(t *testing.T) {
 	}
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: "second", Target: filepath.Join(t.TempDir(), "second")},
+		Lease:    Lease{ID: secondName, Target: filepath.Join(t.TempDir(), secondName)},
 		Policy:   Policy{QuotaEnabled: true, MaxBytes: 2048},
 	}); !errors.Is(err, ErrQuotaPolicyConflict) {
 		t.Fatal("active generation accepted a different quota limit")
@@ -1428,7 +1429,7 @@ func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
 	}
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), "second")},
+		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), secondName)},
 		Policy:   policy,
 	}); !errors.Is(err, ErrPressureActive) {
 		t.Fatalf("second active lease error = %v, want ErrPressureActive", err)
@@ -1438,7 +1439,7 @@ func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
 	}
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), "second")},
+		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), secondName)},
 		Policy:   policy,
 	}); !errors.Is(err, ErrPressureActive) {
 		t.Fatalf("new lease after old generation release error = %v, want ErrPressureActive", err)
@@ -1524,7 +1525,110 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	}
 }
 
+func TestAcquirePreservesIdleGenerationPolicySnapshot(t *testing.T) {
+	t.Parallel()
+	initialPolicy := Policy{
+		SharingPolicy:  SharingPolicyShared,
+		PressurePolicy: PressurePolicyUnusedOnly,
+		Retention:      time.Hour,
+		NoExec:         true,
+	}
+	store, err := newStore(t.TempDir(), StoreOptions{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	identity := stableIdentity("idle-policy-snapshot")
+	firstTarget := filepath.Join(t.TempDir(), "first-idle")
+	firstPath, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "first-idle-lease", Target: firstTarget},
+		Policy:   initialPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Release("first-idle-lease", firstTarget); err != nil {
+		t.Fatal(err)
+	}
+
+	updatedPolicy := initialPolicy
+	updatedPolicy.PressurePolicy = PressurePolicyForceDelete
+	updatedPolicy.Retention = 2 * time.Hour
+	updatedPolicy.NoExec = false
+	secondTarget := filepath.Join(t.TempDir(), "second-idle")
+	secondPath, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "second-idle-lease", Target: secondTarget},
+		Policy:   updatedPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondPath != firstPath {
+		t.Fatalf("reused generation path = %q, want %q", secondPath, firstPath)
+	}
+	_, lease, _, storedPolicy, found, err := store.LeaseDetails("second-idle-lease")
+	if err != nil || !found {
+		t.Fatalf("second idle lease found = %t, error = %v", found, err)
+	}
+	if lease.NoExec != initialPolicy.NoExec {
+		t.Fatalf("second idle lease noexec = %t, want generation snapshot %t", lease.NoExec, initialPolicy.NoExec)
+	}
+	if storedPolicy != initialPolicy {
+		t.Fatalf("second idle lease policy = %+v, want generation snapshot %+v", storedPolicy, initialPolicy)
+	}
+}
+
+func TestAcquireRejectsQuotaChangeWhileRetiredGenerationExists(t *testing.T) {
+	t.Parallel()
+	policy := Policy{
+		SharingPolicy:  SharingPolicyShared,
+		PressurePolicy: PressurePolicyEvict,
+		QuotaEnabled:   true,
+		MaxBytes:       1024,
+	}
+	store, identity, _, firstTarget, _ := pressureLease(t, "retired-quota-policy", policy, 2, false)
+	store.pressure = PressureConfig{}
+	store.pressureActive = false
+	secondTarget := filepath.Join(t.TempDir(), "second-retired")
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "second-retired-lease", Target: secondTarget},
+		Policy:   policy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPublish("second-retired-lease", secondTarget); err != nil {
+		t.Fatal(err)
+	}
+	store.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
+	store.pressureActive = true
+	if victims, err := store.PressureVictims(); err != nil || len(victims) != 2 {
+		t.Fatalf("pressure victims = %+v, error = %v; want both shared leases", victims, err)
+	}
+	if err := store.Release(firstLeaseID, firstTarget); err != nil {
+		t.Fatal(err)
+	}
+	store.pressure = PressureConfig{}
+	store.pressureActive = false
+	updatedPolicy := policy
+	updatedPolicy.MaxBytes = 2048
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "new-quota-lease", Target: filepath.Join(t.TempDir(), "new-quota")},
+		Policy:   updatedPolicy,
+	}); !errors.Is(err, ErrQuotaPolicyConflict) {
+		t.Fatalf("acquire with changed quota while a retired generation remains = %v, want ErrQuotaPolicyConflict", err)
+	}
+}
+
 func TestAcquireWaitsForCollectionOfSameIdentity(t *testing.T) {
+	t.Parallel()
 	enteredDetach := make(chan struct{})
 	continueDetach := make(chan struct{})
 	var enteredOnce sync.Once
@@ -1606,6 +1710,7 @@ func TestAcquireWaitsForCollectionOfSameIdentity(t *testing.T) {
 }
 
 func TestAcquireClaimsLeaseIDAcrossIdentities(t *testing.T) {
+	t.Parallel()
 	store, err := newStore(t.TempDir(), StoreOptions{}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -1623,7 +1728,7 @@ func TestAcquireClaimsLeaseIDAcrossIdentities(t *testing.T) {
 	}
 	start := make(chan struct{})
 	results := make(chan acquireResult, 2)
-	for _, name := range []string{"first", "second"} {
+	for _, name := range []string{"first", secondName} {
 		identity := stableIdentity("lease-claim-" + name)
 		target := filepath.Join(t.TempDir(), name)
 		go func() {

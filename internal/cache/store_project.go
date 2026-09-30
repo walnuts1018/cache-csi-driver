@@ -306,12 +306,6 @@ func (s *Store) addUnknownProjectReservation(identity, trashID string) {
 	s.projectRegistryDirty = true
 }
 
-func (s *Store) persistProjectReservations() error {
-	s.projectRegistryMu.Lock()
-	defer s.projectRegistryMu.Unlock()
-	return s.persistProjectReservationsLocked()
-}
-
 func (s *Store) persistProjectReservationsLocked() error {
 	s.mu.Lock()
 	if s.projectRegistryDamaged || !s.projectRegistryDirty {
@@ -386,12 +380,6 @@ func (s *Store) persistProjectReservationsLocked() error {
 	s.projectRegistryDirty = false
 	s.mu.Unlock()
 	return nil
-}
-
-func (s *Store) projectReservation(projectID uint32, identity, generation string) (projectReservation, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.projectReservationLocked(projectID, identity, generation)
 }
 
 func (s *Store) projectReservationLocked(projectID uint32, identity, generation string) (projectReservation, bool) {

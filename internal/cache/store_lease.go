@@ -143,14 +143,12 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 			return "", false, ErrExclusivePolicyConflict
 		}
 	}
-	if s.activeLeaseCount(meta) > 0 {
-		if meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes {
-			return "", false, ErrQuotaPolicyConflict
-		}
-		options.Policy = meta.Policy
-		options.Lease.NoExec = meta.Policy.NoExec
+	activeLeases := s.activeLeaseCount(meta)
+	quotaPolicyChanged := meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes
+	if quotaPolicyChanged && (activeLeases > 0 || len(meta.Retired) > 0) {
+		return "", false, ErrQuotaPolicyConflict
 	}
-	if len(meta.Retired) == 0 && s.activeLeaseCount(meta) == 0 && (meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
+	if len(meta.Retired) == 0 && activeLeases == 0 && (quotaPolicyChanged || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
 		if err := s.rejectUnderPressure(); err != nil {
 			return "", false, err
 		}
@@ -164,12 +162,18 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 		return s.createLease(entry, options, meta)
 	}
 	generationPath := filepath.Join(entry, "generations", meta.Generation)
+	generationExists := true
 	if err := s.stat(generationPath); errors.Is(err, os.ErrNotExist) {
+		generationExists = false
 		if err := s.rejectUnderPressure(); err != nil {
 			return "", false, err
 		}
 	} else if err != nil {
 		return "", false, fmt.Errorf("inspect cache generation: %w", err)
+	}
+	if generationExists {
+		options.Policy = meta.Policy
+		options.Lease.NoExec = meta.Policy.NoExec
 	}
 	return s.acquireExisting(entry, options, meta)
 }

@@ -89,6 +89,7 @@ func (s *Store) ReclaimPressure(ctx context.Context) error {
 	}
 	candidates := s.unusedPressureCandidates()
 	s.mu.Unlock()
+	slices.SortFunc(candidates, func(left, right pressureCandidate) int { return left.lastUsed.Compare(right.lastUsed) })
 	nextCandidate := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -164,6 +165,12 @@ type pressureCandidate struct {
 	lastUsed time.Time
 }
 
+type pressureVictimCandidate struct {
+	identity string
+	meta     Metadata
+	path     string
+}
+
 func (s *Store) unusedPressureCandidates() []pressureCandidate {
 	candidates := make([]pressureCandidate, 0, len(s.metadataByIdentity))
 	for identity, meta := range s.metadataByIdentity {
@@ -172,7 +179,6 @@ func (s *Store) unusedPressureCandidates() []pressureCandidate {
 		}
 		candidates = append(candidates, pressureCandidate{identity: identity, path: filepath.Join(s.root, identity), lastUsed: meta.LastUsed})
 	}
-	slices.SortFunc(candidates, func(left, right pressureCandidate) int { return left.lastUsed.Compare(right.lastUsed) })
 	return candidates
 }
 
@@ -185,16 +191,6 @@ func pressureCleanupResult(err error) error {
 
 func (s *Store) underLowWatermark(fs unix.Statfs_t) bool {
 	return below(fs.Bavail, fs.Blocks, s.pressure.LowFreePercent) || below(fs.Ffree, fs.Files, s.pressure.LowInodeFreePercent)
-}
-
-func (s *Store) pressureActiveLocked() (bool, error) {
-	usage, err := filesystemUsage(s.root)
-	if err != nil {
-		return false, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.updatePressure(usage), nil
 }
 
 func (s *Store) updatePressure(fs unix.Statfs_t) bool {
@@ -244,119 +240,130 @@ func (s *Store) PressureVictims() ([]PressureVictim, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	type candidate struct {
-		identity string
-		meta     Metadata
-		path     string
+	underPressure, criticalPressure, identities, candidates, unusedCachePending := s.pressureVictimSnapshot(fs)
+	if !underPressure || unusedCachePending {
+		return nil, nil
 	}
-	var candidates []candidate
+	slices.SortFunc(candidates, func(left, right pressureVictimCandidate) int {
+		return left.meta.LastUsed.Compare(right.meta.LastUsed)
+	})
+	for _, candidate := range candidates {
+		victims, pressureCleared, err := s.retirePressureCandidate(candidate)
+		if err != nil {
+			return nil, err
+		}
+		if pressureCleared {
+			return nil, nil
+		}
+		if len(victims) > 0 {
+			return victims, nil
+		}
+	}
+	return s.retiredPressureVictims(identities, criticalPressure)
+}
+
+func (s *Store) pressureVictimSnapshot(fs unix.Statfs_t) (bool, bool, []string, []pressureVictimCandidate, bool) {
+	s.mu.Lock()
 	underPressure := s.updatePressure(fs)
 	if !underPressure {
 		s.mu.Unlock()
-		return nil, nil
+		return false, false, nil, nil, false
 	}
 	criticalPressure := s.underCriticalWatermark(fs)
 	identities := make([]string, 0, len(s.metadataByIdentity))
+	candidates := make([]pressureVictimCandidate, 0)
 	for identity, meta := range s.metadataByIdentity {
 		identities = append(identities, identity)
-		if underPressure && len(meta.Leases) == 0 {
+		if len(meta.Leases) == 0 {
 			if _, detachFailed := s.pressureDetachFailed[identity]; !detachFailed {
 				s.mu.Unlock()
-				return nil, nil
+				return true, criticalPressure, identities, nil, true
 			}
 		}
 		if policyAllowsPressureTermination(meta.Policy.PressurePolicy) && s.activeLeaseCount(meta) > 0 && !s.hasPreparingGenerationLease(meta, meta.Generation) {
-			candidates = append(candidates, candidate{identity: identity, meta: meta, path: filepath.Join(s.root, identity)})
+			candidates = append(candidates, pressureVictimCandidate{identity: identity, meta: meta, path: filepath.Join(s.root, identity)})
 		}
 	}
-	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
 	s.mu.Unlock()
-	if underPressure {
-		for _, candidate := range candidates {
-			unlockIdentity := s.identityLocks.lock(candidate.identity)
-			meta, err := s.readObjectMetadata(candidate.identity)
-			if err != nil || len(meta.Leases) == 0 || !policyAllowsPressureTermination(meta.Policy.PressurePolicy) || s.hasPreparingGenerationLease(meta, meta.Generation) {
-				unlockIdentity()
-				continue
-			}
-			fs, err := filesystemUsage(s.root)
-			if err != nil {
-				unlockIdentity()
-				return nil, err
-			}
-			s.mu.Lock()
-			underPressure = s.updatePressure(fs)
-			criticalPressure = s.underCriticalWatermark(fs)
-			s.mu.Unlock()
-			if !underPressure {
-				unlockIdentity()
-				return nil, nil
-			}
-			victims := make([]PressureVictim, 0, len(meta.Leases))
-			for index := range meta.Leases {
-				if meta.Leases[index].Generation == "" || meta.Leases[index].Generation == meta.Generation {
-					meta.Leases[index].Generation = meta.Generation
-					victims = append(victims, PressureVictim{Lease: meta.Leases[index], ForceDelete: shouldForceDelete(meta.Policy.PressurePolicy, criticalPressure)})
-				}
-			}
-			if len(victims) == 0 {
-				unlockIdentity()
-				continue
-			}
-			meta.Retired = append(meta.Retired, RetiredGeneration{
-				Generation:      meta.Generation,
-				ProjectID:       meta.ProjectID,
-				ProjectAssigned: meta.ProjectAssigned,
-				QuotaBytes:      meta.QuotaBytes,
-				Policy:          meta.Policy,
-			})
-			meta.Generation = uuid.NewV7().String()
-			meta.CreatedAt = time.Now().UTC()
-			replacementPath := filepath.Join(candidate.path, "generations", meta.Generation)
-			if err := s.ensureDirectory(replacementPath); err != nil {
-				unlockIdentity()
-				return nil, fmt.Errorf("create replacement cache generation before Pod eviction: %w", err)
-			}
-			meta.ProjectID = 0
-			meta.ProjectAssigned = false
-			meta.QuotaBytes = 0
-			meta.Dirty = false
-			if err := s.writeMetadata(candidate.path, meta); err != nil {
-				_ = s.detachToTrash(replacementPath)
-				unlockIdentity()
-				return nil, fmt.Errorf("retire cache generation before Pod eviction: %w", err)
-			}
-			unlockIdentity()
-			return victims, nil
+	return true, criticalPressure, identities, candidates, false
+}
+
+func (s *Store) retirePressureCandidate(candidate pressureVictimCandidate) ([]PressureVictim, bool, error) {
+	unlockIdentity := s.identityLocks.lock(candidate.identity)
+	defer unlockIdentity()
+	meta, err := s.readObjectMetadata(candidate.identity)
+	if err != nil || s.activeLeaseCount(meta) == 0 || !policyAllowsPressureTermination(meta.Policy.PressurePolicy) || s.hasPreparingGenerationLease(meta, meta.Generation) {
+		return nil, false, nil
+	}
+	fs, err := filesystemUsage(s.root)
+	if err != nil {
+		return nil, false, err
+	}
+	s.mu.Lock()
+	underPressure := s.updatePressure(fs)
+	criticalPressure := s.underCriticalWatermark(fs)
+	s.mu.Unlock()
+	if !underPressure {
+		return nil, true, nil
+	}
+	victims := make([]PressureVictim, 0, len(meta.Leases))
+	for index := range meta.Leases {
+		if meta.Leases[index].Generation == "" || meta.Leases[index].Generation == meta.Generation {
+			meta.Leases[index].Generation = meta.Generation
+			victims = append(victims, PressureVictim{Lease: meta.Leases[index], ForceDelete: shouldForceDelete(meta.Policy.PressurePolicy, criticalPressure)})
 		}
-		for _, identity := range identities {
-			unlockIdentity := s.identityLocks.lock(identity)
-			meta, err := s.readObjectMetadata(identity)
-			if err != nil {
-				unlockIdentity()
+	}
+	if len(victims) == 0 {
+		return nil, false, nil
+	}
+	meta.Retired = append(meta.Retired, RetiredGeneration{
+		Generation:      meta.Generation,
+		ProjectID:       meta.ProjectID,
+		ProjectAssigned: meta.ProjectAssigned,
+		QuotaBytes:      meta.QuotaBytes,
+		Policy:          meta.Policy,
+	})
+	meta.Generation = uuid.NewV7().String()
+	meta.CreatedAt = time.Now().UTC()
+	replacementPath := filepath.Join(candidate.path, "generations", meta.Generation)
+	if err := s.ensureDirectory(replacementPath); err != nil {
+		return nil, false, fmt.Errorf("create replacement cache generation before Pod eviction: %w", err)
+	}
+	meta.ProjectID = 0
+	meta.ProjectAssigned = false
+	meta.QuotaBytes = 0
+	meta.Dirty = false
+	if err := s.writeMetadata(candidate.path, meta); err != nil {
+		_ = s.detachToTrash(replacementPath)
+		return nil, false, fmt.Errorf("retire cache generation before Pod eviction: %w", err)
+	}
+	return victims, false, nil
+}
+
+func (s *Store) retiredPressureVictims(identities []string, criticalPressure bool) ([]PressureVictim, error) {
+	for _, identity := range identities {
+		unlockIdentity := s.identityLocks.lock(identity)
+		meta, err := s.readObjectMetadata(identity)
+		if err != nil {
+			unlockIdentity()
+			continue
+		}
+		for _, retired := range meta.Retired {
+			if !policyAllowsPressureTermination(retired.Policy.PressurePolicy) || s.hasPreparingGenerationLease(meta, retired.Generation) {
 				continue
 			}
-			for _, retired := range meta.Retired {
-				if !policyAllowsPressureTermination(retired.Policy.PressurePolicy) {
-					continue
-				}
-				if s.hasPreparingGenerationLease(meta, retired.Generation) {
-					continue
-				}
-				victims := make([]PressureVictim, 0)
-				for _, lease := range meta.Leases {
-					if lease.Generation == retired.Generation && !lease.Preparing {
-						victims = append(victims, PressureVictim{Lease: lease, ForceDelete: shouldForceDelete(retired.Policy.PressurePolicy, criticalPressure)})
-					}
-				}
-				if len(victims) > 0 {
-					unlockIdentity()
-					return victims, nil
+			victims := make([]PressureVictim, 0)
+			for _, lease := range meta.Leases {
+				if lease.Generation == retired.Generation && !lease.Preparing {
+					victims = append(victims, PressureVictim{Lease: lease, ForceDelete: shouldForceDelete(retired.Policy.PressurePolicy, criticalPressure)})
 				}
 			}
-			unlockIdentity()
+			if len(victims) > 0 {
+				unlockIdentity()
+				return victims, nil
+			}
 		}
+		unlockIdentity()
 	}
 	return nil, nil
 }

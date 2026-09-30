@@ -58,7 +58,7 @@ type CacheClassSpec struct {
 	// +kubebuilder:default=Exclusive
 	// +kubebuilder:validation:Enum=Shared;Exclusive
 	SharingPolicy SharingPolicy `json:"sharingPolicy,omitempty"`
-	// Scope defines the workload trust boundary included in cache identity. Namespace allows all workloads in a namespace to share identity; ServiceAccount isolates workloads by ServiceAccount UID.
+	// Scope defines the workload isolation scope included in cache identity, not an authorization boundary. Namespace shares identity across a namespace; ServiceAccount separates identities by ServiceAccount UID.
 	// +kubebuilder:default=ServiceAccount
 	// +kubebuilder:validation:Enum=ServiceAccount;Namespace
 	Scope CacheScope `json:"scope,omitempty"`
