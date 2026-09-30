@@ -16,6 +16,17 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
+	if filepath.IsAbs(req.GetVolumePublishPath()) {
+		if _, ok := kubeletcompat.ParsePodTarget(s.options.KubeletRoot, req.GetVolumePublishPath()); ok {
+			terminalSame, err := s.terminalFallbackMount(req.GetVolumeId(), req.GetVolumePublishPath())
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "verify terminal fallback mount: %v", err)
+			}
+			if terminalSame {
+				return &csi.NodeGetVolumeHealthResponse{VolumeHealth: &csi.VolumeHealth{VolumeId: req.GetVolumeId()}}, nil
+			}
+		}
+	}
 	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	metadataDegraded := false
 	if err != nil {
@@ -51,13 +62,6 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 			return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeLeaseMissing", "cache volume publish path is invalid")}, nil
 		}
 		lease.Target = req.GetVolumePublishPath()
-		terminalSame, terminalErr := s.terminalFallbackMount(req.GetVolumeId(), lease.Target)
-		if terminalErr != nil {
-			return nil, status.Errorf(codes.Internal, "verify terminal fallback mount: %v", terminalErr)
-		}
-		if terminalSame {
-			return &csi.NodeGetVolumeHealthResponse{VolumeHealth: &csi.VolumeHealth{VolumeId: req.GetVolumeId()}}, nil
-		}
 		if metadataDegraded {
 			return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
 		}

@@ -65,6 +65,14 @@ func (s *Server) publishWhileStoreNotReady(ctx context.Context, req *csi.NodePub
 		}
 		return s.useFallbackWithPolicy(ctx, req, expectedFallbackCause("store_recovering"), nil, &policy)
 	}
+	terminalSame, err := s.verifyTerminalFallbackMount(req)
+	if err != nil {
+		return status.Errorf(codes.Internal, "verify terminal fallback mount while cache store is recovering: %v", err)
+	}
+	if terminalSame {
+		s.recordFallbackReuse()
+		return nil
+	}
 	for _, store := range s.fallbackStores() {
 		_, lease, source, _, found, err := store.LeaseDetails(req.GetVolumeId())
 		if err != nil {
@@ -89,14 +97,6 @@ func (s *Server) publishWhileStoreNotReady(ctx context.Context, req *csi.NodePub
 		return status.Errorf(codes.Internal, "verify degraded cache mount while cache store is recovering: %v", verifyErr)
 	}
 	if verifiedDegradedMount {
-		s.recordFallbackReuse()
-		return nil
-	}
-	terminalSame, err := s.verifyTerminalFallbackMount(req)
-	if err != nil {
-		return status.Errorf(codes.Internal, "verify terminal fallback mount while cache store is recovering: %v", err)
-	}
-	if terminalSame {
 		s.recordFallbackReuse()
 		return nil
 	}
@@ -744,7 +744,7 @@ func (s *Server) publishTerminalFallback(ctx context.Context, req *csi.NodePubli
 }
 
 func shouldRetryEmergencyFallback(err error) bool {
-	return errors.Is(err, cache.ErrFallbackCapacity) || errors.Is(err, cache.ErrDegradedMetadata) || errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
+	return errors.Is(err, cache.ErrFallbackCapacity) || errors.Is(err, cache.ErrDegradedMetadata) || errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.EROFS) || errors.Is(err, syscall.EIO) || errors.Is(err, syscall.EACCES)
 }
 
 func shouldUseTerminalFallback(err error) bool {
@@ -752,7 +752,7 @@ func shouldUseTerminalFallback(err error) bool {
 	if !ok {
 		return false
 	}
-	return errors.Is(tierErr.cause, cache.ErrFallbackCapacity) || errors.Is(tierErr.cause, cache.ErrDegradedMetadata) || errors.Is(tierErr.cause, syscall.ENOSPC) || errors.Is(tierErr.cause, syscall.EDQUOT)
+	return shouldRetryEmergencyFallback(tierErr.cause)
 }
 
 type fallbackTierError struct {
@@ -779,7 +779,7 @@ func fallbackAcquireError(err error) error {
 func (s *Server) publishFallbackOnStoreOrTerminal(ctx context.Context, req *csi.NodePublishVolumeRequest, store *cache.Store, identity string, allocation cache.FallbackAllocation, acquireOptions cache.AcquireOptions, requestedBytes int64, semantics fallbackSemantics) error {
 	err := s.publishFallbackOnStore(ctx, req, store, identity, allocation)
 	if err == nil {
-		return err
+		return nil
 	}
 	tierErr, tierFailure := errors.AsType[*fallbackTierError](err)
 	if !tierFailure || !shouldUseTerminalFallback(err) {

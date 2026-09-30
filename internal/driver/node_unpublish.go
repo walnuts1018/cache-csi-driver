@@ -75,6 +75,7 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 	if err := removeTargetDirectory(req.GetTargetPath()); err != nil {
 		return status.Errorf(codes.Internal, "remove cache mount target: %v", err)
 	}
+	s.removeTerminalFallbackSource(ctx, terminalSource)
 	s.finishUnpublishCleanup(ctx, req.GetVolumeId(), active, degraded)
 	return nil
 }
