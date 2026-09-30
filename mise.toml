@@ -62,7 +62,6 @@ docker run --detach --privileged --platform "linux/$go_arch" --name "$container_
     /tmp/csi-sanity/cache-csi-node \
       -endpoint unix:///tmp/csi-sanity/csi.sock \
       -cache-root /tmp/csi-sanity/cache \
-      -fallback-root /tmp/csi-sanity/fallback \
       -kubelet-root /tmp/csi-sanity/kubelet \
       -node-id csi-sanity-test &
     driver_pid=$!
@@ -108,7 +107,7 @@ docker run --rm --privileged --platform "linux/$go_arch" \
   -v "$tmp_dir:/tmp/cache-csi-mount-api:ro" \
   --entrypoint /tmp/cache-csi-mount-api/mount-api.test \
   ubuntu:26.04 \
-  -test.v -test.count=1 -test.run '^Test(MountUsesOpenTreeMountSetattrMoveMount|RecoverPreparingLeaseAfterDriverRestartWithAttachedMount|FallbackGenerationTmpfsEnforcesItsByteLimit|RecoverCorruptFallbackUnmountsGenerationBeforeQuarantine)$'
+  -test.v -test.count=1 -test.run '^Test(MountUsesOpenTreeMountSetattrMoveMount|RecoverPreparingLeaseAfterDriverRestartWithAttachedMount)$'
 """
 
 [tasks."test:xfs-quota"]

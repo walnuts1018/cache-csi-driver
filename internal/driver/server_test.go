@@ -13,6 +13,7 @@ import (
 	cachev1alpha1 "github.com/walnuts1018/cache-csi-driver/api/v1alpha1"
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 	"github.com/walnuts1018/cache-csi-driver/internal/kube"
+	"github.com/walnuts1018/cache-csi-driver/internal/nodehealth"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -25,7 +26,6 @@ const (
 	testPodName            = "pod"
 	testPodUID             = "pod-uid"
 	testServiceAccountName = "builder"
-	testOneMi              = "1Mi"
 )
 
 func TestNodeGetCapabilitiesAdvertisesImplementedRPCs(t *testing.T) {
@@ -198,12 +198,11 @@ func TestNodePublishRejectsReaderOnlyAccessMode(t *testing.T) {
 	}
 }
 
-func TestNodePublishUsesBoundedFallbackUntilCacheStoreRecoveryCompletes(t *testing.T) {
+func TestNodePublishWaitsForCacheStoreRecovery(t *testing.T) {
 	t.Parallel()
 
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 	request := newPublishRequest(t, server.options.KubeletRoot, "store-not-ready")
-	request.VolumeContext["maxBytes"] = testOneMi
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -224,27 +223,14 @@ func TestNodePublishUsesBoundedFallbackUntilCacheStoreRecoveryCompletes(t *testi
 		t.Fatal("cache store became ready before lease recovery")
 	}
 
-	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
-		t.Fatalf("publish while the normal cache store is recovering: %v", err)
+	if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.Unavailable {
+		t.Fatalf("publish before store recovery error = %v, want Unavailable", err)
 	}
-	_, _, _, policy, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId())
-	if err != nil || !found {
-		t.Fatalf("fallback lease found = %t, error = %v; want a bounded fallback lease", found, err)
+	if mounts.mountCalls != 0 {
+		t.Fatalf("mount calls = %d, want no mount before store recovery", mounts.mountCalls)
 	}
-	if policy.MaxBytes != 1<<20 || mounts.mountCalls != 1 || mounts.mounts[request.GetTargetPath()].noExec {
-		t.Fatalf("fallback policy = %+v, mount calls = %d, mount = %+v; want 1Mi and CacheClass execution policy", policy, mounts.mountCalls, mounts.mounts[request.GetTargetPath()])
-	}
-	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
-		t.Fatalf("idempotent fallback republish while the normal store is recovering: %v", err)
-	}
-	if mounts.mountCalls != 1 {
-		t.Fatalf("idempotent fallback republish called mount %d times, want one", mounts.mountCalls)
-	}
-
-	unknownMount := newPublishRequest(t, server.options.KubeletRoot, "store-not-ready-unknown-mount")
-	mounts.mounts[unknownMount.GetTargetPath()] = testMount{source: filepath.Join(store.Root(), "unknown", "generations", "unknown")}
-	if _, err := server.NodePublishVolume(t.Context(), unknownMount); status.Code(err) != codes.Unavailable {
-		t.Fatalf("publish over an unverified mount during store recovery error = %v, want Unavailable", err)
+	if _, err := os.Lstat(request.GetTargetPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target path stat error = %v, want not-exist", err)
 	}
 }
 
@@ -310,25 +296,17 @@ func TestNodePublishRollsBackLeaseWhenQuotaConfigurationFails(t *testing.T) {
 	request.VolumeContext["maxBytes"] = "1Mi"
 
 	_, err := server.NodePublishVolume(t.Context(), request)
-	if err != nil {
-		t.Fatalf("publish with fallback after quota configuration failure: %v", err)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("publish after quota configuration failure error = %v, want Unavailable", err)
 	}
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(request.GetVolumeId()); leaseErr != nil || found {
 		t.Fatalf("cache lease found = %t, error = %v; want the failed lease rolled back", found, leaseErr)
 	}
-	if _, lease, _, policy, found, leaseErr := server.fallbackStore.LeaseDetails(request.GetVolumeId()); leaseErr != nil || !found {
-		t.Fatalf("fallback lease found = %t, error = %v; want bounded fallback after quota failure", found, leaseErr)
-	} else if policy.MaxBytes != 1<<20 || !lease.NoExec || !policy.NoExec {
-		t.Fatalf("fallback lease policy = (%+v, %+v), want 1Mi and noexec", lease, policy)
+	if mounts.mountCalls != 0 {
+		t.Fatalf("mount calls = %d, want no mount after quota configuration failure", mounts.mountCalls)
 	}
-	if mounts.mountCalls != 1 || !mounts.mounts[request.GetTargetPath()].noExec {
-		t.Fatalf("mount calls = %d, mount = %+v; want one noexec fallback mount", mounts.mountCalls, mounts.mounts[request.GetTargetPath()])
-	}
-	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
-		t.Fatalf("idempotent republish of bounded fallback: %v", err)
-	}
-	if mounts.mountCalls != 1 {
-		t.Fatalf("idempotent fallback republish called mount %d times, want one", mounts.mountCalls)
+	if snapshot := server.options.Health.Current(); snapshot.Phase != "Unavailable" || snapshot.Reason != "CacheQuotaUnavailable" {
+		t.Fatalf("cache node health = %+v, want CacheQuotaUnavailable", snapshot)
 	}
 }
 
@@ -340,8 +318,8 @@ func TestNodePublishRollsBackLeaseWhenDetachedMountSetupFails(t *testing.T) {
 	mounts.mountErr = errors.New("mount attributes failed")
 
 	_, err := server.NodePublishVolume(t.Context(), request)
-	if status.Code(err) != codes.Internal {
-		t.Fatalf("publish error = %v, want Internal", err)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("publish error = %v, want Unavailable", err)
 	}
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(request.GetVolumeId()); leaseErr != nil || found {
 		t.Fatalf("cache lease found = %t, error = %v; want lease rollback before mount attachment", found, leaseErr)
@@ -351,18 +329,18 @@ func TestNodePublishRollsBackLeaseWhenDetachedMountSetupFails(t *testing.T) {
 	}
 }
 
-func TestNodePublishUsesFallbackForExclusiveSharingConflict(t *testing.T) {
+func TestNodePublishRejectsExclusiveSharingConflict(t *testing.T) {
 	t.Parallel()
 
-	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{SharingPolicy: cachev1alpha1.SharingPolicyExclusive, PressurePolicy: cachev1alpha1.PressurePolicyEvict, NoExec: true}, nil)
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{SharingPolicy: cachev1alpha1.SharingPolicyExclusive, NoExec: true}, nil)
 	first := newPublishRequest(t, server.options.KubeletRoot, "exclusive-first")
 	if _, err := server.NodePublishVolume(t.Context(), first); err != nil {
 		t.Fatal(err)
 	}
 	second := newPublishRequest(t, server.options.KubeletRoot, "exclusive-second")
 
-	if _, err := server.NodePublishVolume(t.Context(), second); err != nil {
-		t.Fatalf("publish with conflicting shared identity: %v", err)
+	if _, err := server.NodePublishVolume(t.Context(), second); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("publish with conflicting exclusive identity error = %v, want FailedPrecondition", err)
 	}
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(first.GetVolumeId()); leaseErr != nil || !found {
 		t.Fatalf("first cache lease found = %t, error = %v; want the active lease preserved", found, leaseErr)
@@ -370,16 +348,15 @@ func TestNodePublishUsesFallbackForExclusiveSharingConflict(t *testing.T) {
 	if _, _, _, _, found, leaseErr := store.LeaseDetails(second.GetVolumeId()); leaseErr != nil || found {
 		t.Fatalf("second cache lease found = %t, error = %v; want the conflicting lease absent from the shared cache", found, leaseErr)
 	}
-	if _, _, source, policy, found, err := server.fallbackStore.LeaseDetails(second.GetVolumeId()); err != nil || !found {
-		t.Fatalf("fallback lease found = %t, error = %v; want an isolated fallback lease", found, err)
-	} else if policy.PressurePolicy != string(cachev1alpha1.PressurePolicyEvict) || !policy.NoExec {
-		t.Fatalf("fallback policy = %+v, want Evict and noexec preserved", policy)
-	} else if mounts.mounts[second.GetTargetPath()].source != source {
-		t.Fatalf("second target source = %q, want fallback source %q", mounts.mounts[second.GetTargetPath()].source, source)
+	if mounts.mountCalls != 1 {
+		t.Fatalf("mount calls = %d, want only the first cache mount", mounts.mountCalls)
+	}
+	if _, mounted := mounts.mounts[second.GetTargetPath()]; mounted {
+		t.Fatal("conflicting volume received a different cache mount")
 	}
 }
 
-func TestNodePublishUsesFallbackForDegradedMetadataWithoutQuota(t *testing.T) {
+func TestNodePublishRecreatesCacheAfterDegradedMetadata(t *testing.T) {
 	t.Parallel()
 
 	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{NoExec: true}, nil)
@@ -408,10 +385,12 @@ func TestNodePublishUsesFallbackForDegradedMetadataWithoutQuota(t *testing.T) {
 	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
 		t.Fatalf("publish after local metadata corruption: %v", err)
 	}
-	if _, _, source, policy, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId()); err != nil || !found {
-		t.Fatalf("fallback lease found = %t, error = %v; want an isolated fallback lease", found, err)
-	} else if !policy.NoExec || mounts.mounts[request.GetTargetPath()].source != source {
-		t.Fatalf("fallback mount source or policy = %q, %+v; want a noexec isolated cache", mounts.mounts[request.GetTargetPath()].source, policy)
+	_, lease, source, policy, found, err := store.LeaseDetails(request.GetVolumeId())
+	if err != nil || !found {
+		t.Fatalf("cache lease found = %t, error = %v; want a new primary cache lease", found, err)
+	}
+	if !policy.NoExec || lease.NoExec != policy.NoExec || mounts.mounts[request.GetTargetPath()].source != source {
+		t.Fatalf("cache mount source or policy = %q, %+v; want a new noexec generation", mounts.mounts[request.GetTargetPath()].source, policy)
 	}
 }
 
@@ -432,7 +411,7 @@ func TestNodePublishKeepsVerifiedDegradedMountAvailable(t *testing.T) {
 	}
 }
 
-func TestNodePublishKeepsQuotaIdentityConflictHard(t *testing.T) {
+func TestNodePublishRejectsQuotaIdentityConflict(t *testing.T) {
 	t.Parallel()
 
 	spec := cachev1alpha1.CacheClassSpec{
@@ -449,13 +428,11 @@ func TestNodePublishKeepsQuotaIdentityConflictHard(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := newPublishRequest(t, server.options.KubeletRoot, "quota-exclusive-second")
-	if _, err := server.NodePublishVolume(t.Context(), second); err != nil {
-		t.Fatalf("second publish should use an isolated fallback cache: %v", err)
+	if _, err := server.NodePublishVolume(t.Context(), second); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("second publish with an exclusive quota conflict error = %v, want FailedPrecondition", err)
 	}
-	if _, _, _, policy, found, err := server.fallbackStore.LeaseDetails(second.GetVolumeId()); err != nil || !found {
-		t.Fatalf("fallback lease found = %t, error = %v; want fallback for exclusive quota conflict", found, err)
-	} else if policy.MaxBytes != 128<<20 {
-		t.Fatalf("fallback maxBytes = %d, want the node fallback volume limit of 128Mi", policy.MaxBytes)
+	if _, _, _, _, found, err := server.store.LeaseDetails(second.GetVolumeId()); err != nil || found {
+		t.Fatalf("second cache lease found = %t, error = %v; want no lease after conflict", found, err)
 	}
 }
 
@@ -505,79 +482,34 @@ func TestNodeUnpublishUnmountsAndReleasesCacheLease(t *testing.T) {
 	}
 }
 
-func TestResolverUnavailablePublishesRestrictedFallbackAndUnpublishes(t *testing.T) {
+func TestResolverUnavailableDoesNotPublishCache(t *testing.T) {
 	t.Parallel()
 
-	server, mounts, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 	server.resolver = nil
 	request := newPublishRequest(t, server.options.KubeletRoot, "api-unavailable-volume")
 	request.Readonly = true
 
-	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
-		t.Fatal(err)
+	if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.Unavailable {
+		t.Fatalf("publish without a CacheClass resolver error = %v, want Unavailable", err)
 	}
-	state, mounted := mounts.mounts[request.GetTargetPath()]
-	if !mounted || !state.readOnly || !state.noExec {
-		t.Fatalf("published mount = %+v, present=%t; want readonly and noexec", state, mounted)
+	if _, mounted := mounts.mounts[request.GetTargetPath()]; mounted || mounts.mountCalls != 0 {
+		t.Fatalf("mount state = %+v, calls = %d; want no mount after resolver failure", mounts.mounts[request.GetTargetPath()], mounts.mountCalls)
 	}
-	identity, err := cache.FallbackIdentity(request.GetVolumeId())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, lease, source, policy, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId())
-	if err != nil || !found {
-		t.Fatalf("fallback lease found = %t, error = %v", found, err)
-	}
-	if lease.Target != request.GetTargetPath() || !lease.NoExec || !lease.ReadOnly || policy.SharingPolicy != cache.SharingPolicyExclusive || !policy.DiscardOnLastRelease {
-		t.Fatalf("fallback lease policy = (%+v, %+v), identity = %s", lease, policy, identity)
-	}
-	if filepath.Dir(filepath.Dir(filepath.Dir(source))) != server.fallbackStore.Root() {
-		t.Fatalf("fallback source %q is outside fallback Store root %q", source, server.fallbackStore.Root())
-	}
-	if err := os.WriteFile(filepath.Join(source, "private"), []byte("fallback data"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := server.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
-		VolumeId:   request.GetVolumeId(),
-		TargetPath: request.GetTargetPath(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, mounted := mounts.mounts[request.GetTargetPath()]; mounted {
-		t.Fatal("mount remains after cleanup")
-	}
-	if _, err := os.Stat(filepath.Join(server.fallbackStore.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("fallback object remains in the object namespace after unpublish: %v", err)
-	}
-	if _, _, _, _, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId()); err != nil || found {
-		t.Fatalf("fallback lease after unpublish found = %t, error = %v", found, err)
-	}
-	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
-		t.Fatalf("republish fallback volume: %v", err)
-	}
-	_, _, newSource, _, found, err := server.fallbackStore.LeaseDetails(request.GetVolumeId())
-	if err != nil || !found {
-		t.Fatalf("republished fallback lease found = %t, error = %v", found, err)
-	}
-	if newSource == source {
-		t.Fatal("fallback republish reused the prior generation")
-	}
-	if _, err := os.Stat(filepath.Join(newSource, "private")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("data from the previous fallback lifecycle is visible after republish: %v", err)
+	if _, _, _, _, found, err := store.LeaseDetails(request.GetVolumeId()); err != nil || found {
+		t.Fatalf("cache lease found = %t, error = %v; want no lease after resolver failure", found, err)
 	}
 }
 
-func TestFallbackClassificationForResolutionErrorsAndCancellation(t *testing.T) {
+func TestResolutionErrorsDoNotPublishCache(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name         string
-		resolver     ClassResolver
-		maxBytes     string
-		cancel       bool
-		wantStatus   codes.Code
-		wantFallback bool
+		name       string
+		resolver   ClassResolver
+		maxBytes   string
+		cancel     bool
+		wantStatus codes.Code
 	}{
 		{
 			name:       "CacheClass not found",
@@ -590,10 +522,9 @@ func TestFallbackClassificationForResolutionErrorsAndCancellation(t *testing.T) 
 			wantStatus: codes.FailedPrecondition,
 		},
 		{
-			name:         "informer cache has not synced",
-			resolver:     &testResolver{err: kube.ErrResolverNotSynced},
-			wantStatus:   codes.OK,
-			wantFallback: true,
+			name:       "informer cache has not synced",
+			resolver:   &testResolver{err: kube.ErrResolverNotSynced},
+			wantStatus: codes.Unavailable,
 		},
 		{
 			name:       "ServiceAccount does not exist",
@@ -601,11 +532,10 @@ func TestFallbackClassificationForResolutionErrorsAndCancellation(t *testing.T) 
 			wantStatus: codes.FailedPrecondition,
 		},
 		{
-			name:         "maxBytes uses a bounded fallback when resolver is unavailable",
-			resolver:     nil,
-			maxBytes:     "1Mi",
-			wantStatus:   codes.OK,
-			wantFallback: true,
+			name:       "resolver is unavailable",
+			resolver:   nil,
+			maxBytes:   "1Mi",
+			wantStatus: codes.Unavailable,
 		},
 		{
 			name:       "cancelled request",
@@ -617,7 +547,7 @@ func TestFallbackClassificationForResolutionErrorsAndCancellation(t *testing.T) 
 	for index, test := range cases {
 		server, _, _ := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
 		server.resolver = test.resolver
-		volumeID := fmt.Sprintf("fallback-rejected-%d", index)
+		volumeID := fmt.Sprintf("resolver-unavailable-%d", index)
 		request := newPublishRequest(t, server.options.KubeletRoot, volumeID)
 		if test.maxBytes != "" {
 			request.VolumeContext["maxBytes"] = test.maxBytes
@@ -632,15 +562,11 @@ func TestFallbackClassificationForResolutionErrorsAndCancellation(t *testing.T) 
 		if got := status.Code(err); got != test.wantStatus {
 			t.Errorf("%s: publish status = %s, want %s (error: %v)", test.name, got, test.wantStatus, err)
 		}
-		identity, err := cache.FallbackIdentity(volumeID)
-		if err != nil {
-			t.Fatal(err)
+		if _, mounted := server.mounter.(*testMounter).mounts[request.GetTargetPath()]; mounted {
+			t.Errorf("%s: mount was created after resolution failed", test.name)
 		}
-		_, statErr := os.Stat(filepath.Join(server.fallbackStore.Root(), identity))
-		if test.wantFallback && statErr != nil {
-			t.Errorf("%s: fallback object was not created: %v", test.name, statErr)
-		} else if !test.wantFallback && !errors.Is(statErr, os.ErrNotExist) {
-			t.Errorf("%s: fallback object was created: %v", test.name, statErr)
+		if _, _, _, _, found, leaseErr := server.store.LeaseDetails(volumeID); leaseErr != nil || found {
+			t.Errorf("%s: cache lease found = %t, error = %v; want no lease", test.name, found, leaseErr)
 		}
 	}
 }
@@ -1087,25 +1013,15 @@ func newTestServer(t *testing.T, spec cachev1alpha1.CacheClassSpec, quotaError e
 			t.Error(err)
 		}
 	})
-	fallbackStore, err := cache.NewStore(filepath.Join(root, "fallback"), cache.StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := fallbackStore.Close(); err != nil {
-			t.Error(err)
-		}
-	})
 	resolver := &testResolver{spec: spec}
 	var quota ProjectQuota
 	if quotaError != nil {
 		quota = &testQuota{err: quotaError}
 	}
 	server := New(store, resolver, quota, Options{
-		KubeletRoot:   filepath.Join(root, "kubelet"),
-		FallbackRoot:  filepath.Join(root, "fallback"),
-		FallbackStore: fallbackStore,
+		KubeletRoot: filepath.Join(root, "kubelet"),
 	})
+	server.options.Health.Set(nodehealth.PhaseReady, "TestReady", false)
 	mounts := &testMounter{mounts: make(map[string]testMount)}
 	server.mounter = mounts
 	return server, mounts, store
@@ -1178,9 +1094,6 @@ func (mounts *testMounter) mount(source, target string, readOnly, noExec bool) e
 	mounts.mounts[target] = testMount{source: source, readOnly: readOnly, noExec: noExec}
 	return nil
 }
-
-func (*testMounter) prepareFallback(string, int64, bool) error { return nil }
-func (*testMounter) unmountGeneration(string) error            { return nil }
 
 func (mounts *testMounter) unmount(target string) error {
 	mounts.unmountCalls++

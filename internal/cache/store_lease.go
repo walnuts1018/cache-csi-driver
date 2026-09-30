@@ -19,12 +19,6 @@ type AcquireOptions struct {
 	Policy   Policy
 }
 
-type FallbackAllocation struct {
-	Source   string
-	MaxBytes int64
-	NoExec   bool
-}
-
 func Identity(namespaceUID, cacheClass, cacheClassUID, cacheKey, schema string) (string, error) {
 	if namespaceUID == "" || cacheClass == "" || cacheClassUID == "" || cacheKey == "" {
 		return "", errors.New("namespace UID, cacheClass, cacheClass UID, and cacheKey are required")
@@ -46,13 +40,6 @@ func IdentityWithServiceAccount(namespaceUID, serviceAccountUID, cacheClass, cac
 		return "", errors.New("service account UID or cacheKey contains an invalid character")
 	}
 	return stableIdentity(namespaceUID + "\x00" + serviceAccountUID + "\x00" + cacheClass + "\x00" + cacheClassUID + "\x00" + cacheKey + "\x00" + schema), nil
-}
-
-func FallbackIdentity(volumeID string) (string, error) {
-	if volumeID == "" || strings.ContainsRune(volumeID, '\x00') {
-		return "", errors.New("valid volume ID is required")
-	}
-	return stableIdentity("fallback\x00" + volumeID), nil
 }
 
 func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
@@ -206,75 +193,6 @@ func (s *Store) rejectUnderPressure() error {
 		return ErrPressureActive
 	}
 	return nil
-}
-
-func (s *Store) AcquireFallback(options AcquireOptions, requestedBytes, perVolumeMaxBytes, totalMaxBytes int64) (FallbackAllocation, error) {
-	if err := validateAcquireOptions(options); err != nil {
-		return FallbackAllocation{}, err
-	}
-	if perVolumeMaxBytes <= 0 || totalMaxBytes <= 0 {
-		return FallbackAllocation{}, errors.New("fallback cache limits must be positive")
-	}
-	unlockLease := s.lockLease(options.Lease.ID)
-	defer unlockLease()
-	unlockIdentity := s.lockIdentity(options.Identity)
-	defer unlockIdentity()
-	s.leaseManager.fallbackMu.Lock()
-	defer s.leaseManager.fallbackMu.Unlock()
-
-	if identity, meta, found, err := s.findLease(options.Lease.ID); err != nil {
-		return FallbackAllocation{}, err
-	} else if found {
-		if identity != options.Identity {
-			return FallbackAllocation{}, ErrFallbackLeaseConflict
-		}
-		leaseIndex := slices.IndexFunc(meta.Leases, func(lease Lease) bool { return lease.ID == options.Lease.ID })
-		if leaseIndex < 0 || meta.Leases[leaseIndex].Target != options.Lease.Target || meta.Leases[leaseIndex].ReadOnly != options.Lease.ReadOnly {
-			return FallbackAllocation{}, ErrFallbackLeaseConflict
-		}
-		storedLease := meta.Leases[leaseIndex]
-		_, storedPolicy, err := leaseGenerationAndPolicy(meta, storedLease)
-		if err != nil {
-			return FallbackAllocation{}, err
-		}
-		if storedPolicy.MaxBytes <= 0 {
-			return FallbackAllocation{}, fmt.Errorf("%w: stored fallback cache limit %d is invalid", ErrDegradedMetadata, storedPolicy.MaxBytes)
-		}
-		if storedPolicy.MaxBytes > totalMaxBytes {
-			return FallbackAllocation{}, fmt.Errorf("%w: stored fallback cache limit %d exceeds aggregate limit %d", ErrFallbackCapacity, storedPolicy.MaxBytes, totalMaxBytes)
-		}
-		options.Policy = storedPolicy
-		options.Lease.NoExec = storedLease.NoExec
-		path, _, err := s.acquireLocked(options)
-		return FallbackAllocation{Source: path, MaxBytes: storedPolicy.MaxBytes, NoExec: storedLease.NoExec}, err
-	}
-	s.mu.Lock()
-	degradedCount := len(s.generationManager.degraded)
-	reserved := s.generationManager.fallbackReservedBytes
-	s.mu.Unlock()
-	if degradedCount != 0 {
-		return FallbackAllocation{}, ErrDegradedMetadata
-	}
-	if reserved < 0 {
-		return FallbackAllocation{}, fmt.Errorf("%w: fallback cache reservations are negative", ErrDegradedMetadata)
-	}
-	if reserved > totalMaxBytes {
-		return FallbackAllocation{}, fmt.Errorf("%w: fallback cache reservations %d exceed aggregate limit %d", ErrFallbackCapacity, reserved, totalMaxBytes)
-	}
-	available := totalMaxBytes - reserved
-	limit := perVolumeMaxBytes
-	if requestedBytes > 0 {
-		limit = min(limit, requestedBytes)
-	}
-	limit = min(limit, available)
-	pageSize := int64(os.Getpagesize())
-	limit -= limit % pageSize
-	if limit <= 0 {
-		return FallbackAllocation{}, ErrFallbackCapacity
-	}
-	options.Policy.MaxBytes = limit
-	path, _, err := s.acquireLocked(options)
-	return FallbackAllocation{Source: path, MaxBytes: limit, NoExec: options.Lease.NoExec}, err
 }
 
 func validateAcquireOptions(options AcquireOptions) error {
@@ -622,13 +540,6 @@ func (s *Store) Release(leaseID, target string) error {
 			return fmt.Errorf("detach released cache generation: %w", err)
 		}
 		meta.Retired = slices.Delete(meta.Retired, retiredIndex, retiredIndex+1)
-	}
-	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) == 0 {
-		if err := s.detachToTrash(entry); err != nil {
-			s.markDegraded(identity, err)
-			return fmt.Errorf("discard released cache object: %w", err)
-		}
-		return nil
 	}
 	if err := s.writeMetadata(entry, meta); err != nil {
 		s.markDegraded(identity, err)

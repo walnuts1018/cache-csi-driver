@@ -23,23 +23,15 @@ var ErrPressureReclaimIncomplete = errors.New("cache pressure reclaim is incompl
 
 var ErrPressureActive = errors.New("cache pool is under pressure")
 
-var ErrFallbackCapacity = errors.New("fallback cache capacity is exhausted")
-
-var ErrFallbackLeaseConflict = errors.New("fallback cache lease ID is already in use")
-
-var ErrFallbackObjectMounted = errors.New("fallback cache object remains mounted")
-
 var ErrStoreNotReady = errors.New("cache store indexes are not ready")
 
 const pressureStateNormal = "normal"
 
 type PressureConfig struct {
-	HighFreePercent          int
-	LowFreePercent           int
-	CriticalFreePercent      int
-	HighInodeFreePercent     int
-	LowInodeFreePercent      int
-	CriticalInodeFreePercent int
+	HighFreePercent      int
+	LowFreePercent       int
+	HighInodeFreePercent int
+	LowInodeFreePercent  int
 }
 
 type StoreOptions struct {
@@ -78,14 +70,12 @@ type generationManager struct {
 	metadataByIdentity     map[string]Metadata
 	leaseIndex             map[string]string
 	degraded               map[string]error
-	fallbackReservedBytes  int64
 	retiredGenerationCount int
 }
 
 type leaseManager struct {
 	identityLocks keyedMutexes
 	leaseLocks    keyedMutexes
-	fallbackMu    sync.Mutex
 }
 
 // projectQuotaRegistryはcache metadataをcanonical sourceとしてproject ID予約indexを管理します。永続registryはmetadataから再構築でき、保存失敗はdirty状態のまま再試行します。
@@ -102,10 +92,9 @@ type projectQuotaRegistry struct {
 }
 
 type pressureManager struct {
-	pressure             PressureConfig
-	pressureActive       bool
-	pressureState        string
-	pressureDetachFailed map[string]struct{}
+	pressure       PressureConfig
+	pressureActive bool
+	pressureState  string
 }
 
 type trashCollector struct {
@@ -167,13 +156,12 @@ func (m *keyedMutexes) lock(key string) func() {
 }
 
 type RuntimeStats struct {
-	Ready                 bool
-	PressureState         string
-	DegradedObjects       int
-	CacheObjects          int
-	RetiredGenerations    int
-	FallbackReservedBytes int64
-	TrashObjectsDeleted   uint64
+	Ready               bool
+	PressureState       string
+	DegradedObjects     int
+	CacheObjects        int
+	RetiredGenerations  int
+	TrashObjectsDeleted uint64
 }
 
 func (s *Store) Root() string { return s.metadataRepository.root }
@@ -182,13 +170,12 @@ func (s *Store) RuntimeStats() RuntimeStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return RuntimeStats{
-		Ready:                 s.ready.Load(),
-		PressureState:         s.pressureManager.pressureState,
-		DegradedObjects:       len(s.generationManager.degraded),
-		CacheObjects:          len(s.generationManager.metadataByIdentity),
-		RetiredGenerations:    s.generationManager.retiredGenerationCount,
-		FallbackReservedBytes: s.generationManager.fallbackReservedBytes,
-		TrashObjectsDeleted:   s.trashCollector.trashDeleted,
+		Ready:               s.ready.Load(),
+		PressureState:       s.pressureManager.pressureState,
+		DegradedObjects:     len(s.generationManager.degraded),
+		CacheObjects:        len(s.generationManager.metadataByIdentity),
+		RetiredGenerations:  s.generationManager.retiredGenerationCount,
+		TrashObjectsDeleted: s.trashCollector.trashDeleted,
 	}
 }
 
@@ -346,7 +333,7 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		generationManager:    generationManager{metadataByIdentity: make(map[string]Metadata), leaseIndex: make(map[string]string), degraded: make(map[string]error)},
 		leaseManager:         leaseManager{},
 		projectQuotaRegistry: projectQuotaRegistry{projectIDStart: options.ProjectIDStart, projectIDCount: options.ProjectIDCount, projectReservations: make(map[uint32][]projectReservation), projectOwnersByID: make(map[uint32]projectReservationKey), projectIDByGeneration: make(map[projectReservationKey]uint32), unknownProjectReservations: make(map[string]string)},
-		pressureManager:      pressureManager{pressure: options.Pressure, pressureState: pressureStateNormal, pressureDetachFailed: make(map[string]struct{})},
+		pressureManager:      pressureManager{pressure: options.Pressure, pressureState: pressureStateNormal},
 		trashCollector:       trashCollector{trashMetadata: make(map[string]Metadata), stopTrash: make(chan struct{}), trashDone: make(chan struct{}), trashRequests: make(chan chan error)},
 		unmountGeneration:    options.UnmountGeneration,
 		initDone:             make(chan struct{}),
@@ -413,12 +400,10 @@ func (s *Store) resetIndexState() {
 	clear(s.projectQuotaRegistry.projectIDByGeneration)
 	clear(s.projectQuotaRegistry.unknownProjectReservations)
 	clear(s.trashCollector.trashMetadata)
-	clear(s.pressureManager.pressureDetachFailed)
 	s.projectQuotaRegistry.projectRegistryDamaged = false
 	s.projectQuotaRegistry.projectRegistryDirty = false
 	s.pressureManager.pressureActive = false
 	s.pressureManager.pressureState = pressureStateNormal
-	s.generationManager.fallbackReservedBytes = 0
 	s.generationManager.retiredGenerationCount = 0
 	s.trashCollector.trashCursor = ""
 }

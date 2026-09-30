@@ -388,20 +388,6 @@ func (s *Store) recoverValidObjectLeases(ctx context.Context, path, identity str
 	if uncertain {
 		return nil
 	}
-	if meta.Policy.DiscardOnLastRelease {
-		if len(active) == 0 {
-			if err := s.detachToTrash(path); err != nil {
-				s.markDegraded(identity, err)
-			}
-			return nil
-		}
-		meta.Leases = active
-		meta.Dirty = true
-		if err := s.writeMetadata(path, meta); err != nil {
-			s.markDegraded(identity, err)
-		}
-		return nil
-	}
 	allLeasesActive := len(active) == len(meta.Leases)
 	if allLeasesActive && (len(active) > 0 || !wasDirty || meta.Policy.CrashRecoveryReuse) {
 		meta.Leases = active

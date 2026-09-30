@@ -15,12 +15,6 @@ func newMounter() mounter { return systemMounter{} }
 func (systemMounter) mount(source, target string, readOnly, noExec bool) error {
 	return mount(source, target, readOnly, noExec)
 }
-func (systemMounter) prepareFallback(string, int64, bool) error {
-	return errors.New("bounded fallback generations require Linux")
-}
-func (systemMounter) unmountGeneration(string) error {
-	return errors.New("bounded fallback generations require Linux")
-}
 func (systemMounter) unmount(target string) error           { return unmount(target) }
 func (systemMounter) mountedAt(target string) (bool, error) { return mountedAt(target) }
 func (systemMounter) sameCacheMount(source, target string, readOnly, noExec bool) (bool, error) {
@@ -51,7 +45,4 @@ func sameCacheSource(string, string) (bool, error) {
 }
 func filesystemReadOnly(string) (bool, error) {
 	return false, errors.New("filesystem inspection requires Linux")
-}
-func UnmountFallbackGeneration(string) error {
-	return errors.New("bounded fallback generations require Linux")
 }

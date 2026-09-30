@@ -12,85 +12,11 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 const firstLeaseID = "first"
 const otherLeaseID = "other"
 const secondName = "second"
-
-func TestAcquireFallbackReservesPerVolumeAndAggregateLimits(t *testing.T) {
-	t.Parallel()
-	var cleaned []string
-	store, err := NewStore(t.TempDir(), StoreOptions{UnmountGeneration: func(path string) error {
-		cleaned = append(cleaned, path)
-		return nil
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-
-	pageSize := int64(os.Getpagesize())
-	acquire := func(id string, requested int64) (string, int64, error) {
-		identity, err := FallbackIdentity(id)
-		if err != nil {
-			return "", 0, err
-		}
-		target := filepath.Join(t.TempDir(), id)
-		allocation, err := store.AcquireFallback(AcquireOptions{
-			Identity: identity,
-			Lease:    Lease{ID: id, Target: target},
-			Policy:   Policy{ClassName: "fallback", SharingPolicy: SharingPolicyExclusive, DiscardOnLastRelease: true},
-		}, requested, 8*pageSize, 10*pageSize)
-		return allocation.Source, allocation.MaxBytes, err
-	}
-
-	firstPath, firstBytes, err := acquire("fallback-first", 20*pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if firstBytes != 8*pageSize {
-		t.Fatalf("first fallback allocation = %d, want per-volume maximum %d", firstBytes, 8*pageSize)
-	}
-	_, secondBytes, err := acquire("fallback-second", 8*pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if secondBytes != 2*pageSize {
-		t.Fatalf("second fallback allocation = %d, want remaining aggregate capacity %d", secondBytes, 2*pageSize)
-	}
-	if _, _, err := acquire("fallback-third", pageSize); !errors.Is(err, ErrFallbackCapacity) {
-		t.Fatalf("acquire beyond aggregate fallback limit error = %v, want ErrFallbackCapacity", err)
-	}
-
-	firstIdentity, _ := FallbackIdentity("fallback-first")
-	_, firstLease, _, _, found, err := store.LeaseDetails("fallback-first")
-	if err != nil || !found {
-		t.Fatalf("first fallback lease found = %t, error = %v", found, err)
-	}
-	if err := store.Release("fallback-first", firstLease.Target); err != nil {
-		t.Fatal(err)
-	}
-	if len(cleaned) != 1 || cleaned[0] != firstPath {
-		t.Fatalf("cleaned generations = %v, want [%q]", cleaned, firstPath)
-	}
-	_, thirdBytes, err := acquire("fallback-third", 8*pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if thirdBytes != 8*pageSize {
-		t.Fatalf("third fallback allocation after release = %d, want %d", thirdBytes, 8*pageSize)
-	}
-	if _, err := os.Stat(filepath.Join(store.Root(), firstIdentity)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("released fallback object remains in the object namespace: %v", err)
-	}
-}
 
 func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 	t.Parallel()
@@ -162,109 +88,6 @@ func TestAcquireDiscardsDirtyGenerationBeforeExposure(t *testing.T) {
 	}
 }
 
-func TestFallbackObjectIsExclusiveAndDiscardedAfterLastRelease(t *testing.T) {
-	t.Parallel()
-	store, err := NewStore(t.TempDir(), StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-
-	identity, err := FallbackIdentity("fallback-volume")
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherIdentity, err := FallbackIdentity("other-fallback-volume")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if identity == otherIdentity {
-		t.Fatal("different fallback volume IDs share an identity")
-	}
-	policy := Policy{SharingPolicy: SharingPolicyExclusive, DiscardOnLastRelease: true, NoExec: true}
-	target := filepath.Join(t.TempDir(), "mount")
-	lease := Lease{ID: "fallback-volume", Target: target, NoExec: true}
-	source, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(source, "private"), []byte("fallback data"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "second-fallback-lease", Target: filepath.Join(t.TempDir(), secondName)},
-		Policy:   policy,
-	}); !errors.Is(err, ErrExclusivePolicyConflict) {
-		t.Fatalf("second lease error = %v, want exclusive policy conflict", err)
-	}
-	if err := store.Release(lease.ID, lease.Target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("released fallback object remains in the object namespace: %v", err)
-	}
-	if _, found, err := store.ReleaseTarget(lease.ID); err != nil || found {
-		t.Fatalf("released fallback lease found = %t, error = %v", found, err)
-	}
-	newSource, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if newSource == source {
-		t.Fatal("fallback object reused the generation from the previous volume lifecycle")
-	}
-	if _, err := os.Stat(filepath.Join(newSource, "private")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("previous fallback data is visible after a new lifecycle: %v", err)
-	}
-}
-
-func TestFallbackRecoveryDiscardsUnmountedOrphan(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	store, err := NewStore(root, StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity, err := FallbackIdentity("fallback-orphan")
-	if err != nil {
-		t.Fatal(err)
-	}
-	policy := Policy{SharingPolicy: SharingPolicyExclusive, DiscardOnLastRelease: true, NoExec: true}
-	lease := Lease{ID: "fallback-orphan", Target: filepath.Join(t.TempDir(), "mount"), NoExec: true}
-	if _, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: lease, Policy: policy}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	recovered, err := NewStore(root, StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := recovered.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	if err := recovered.RecoverLeases(func(source string, recoveredLease Lease, recoveredPolicy Policy) (bool, error) {
-		if source != filepath.Join(root, identity, "generations", recoveredLease.Generation) || recoveredLease.ID != lease.ID || recoveredPolicy != policy {
-			t.Errorf("recovery verifier arguments = (%q, %+v, %+v)", source, recoveredLease, recoveredPolicy)
-		}
-		return false, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(root, identity)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unmounted fallback orphan remains after recovery: %v", err)
-	}
-}
-
 func TestRecoveryCommitsPreparingLeaseWhenMountIsVerified(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -319,7 +142,7 @@ func TestRecoveryCommitsPreparingLeaseWhenMountIsVerified(t *testing.T) {
 	}
 }
 
-func TestZeroRetentionDisablesTTLCollectionButKeepsPressureEligibility(t *testing.T) {
+func TestZeroRetentionDisablesTTLCollectionButKeepsPressureReclaimEligibility(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
 	if err != nil {
@@ -353,167 +176,6 @@ func TestZeroRetentionDisablesTTLCollectionButKeepsPressureEligibility(t *testin
 	store.mu.Unlock()
 	if !slices.ContainsFunc(candidates, func(candidate pressureCandidate) bool { return candidate.identity == identity }) {
 		t.Fatal("zero-retention cache was excluded from pressure reclaim")
-	}
-}
-
-func TestPressureVictimsSkipsMetadataScanWhenPressureIsOff(t *testing.T) {
-	t.Parallel()
-	store, err := NewStore(t.TempDir(), StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	identity := stableIdentity("pressure-off-metadata-scan")
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "pressure-off", Target: filepath.Join(t.TempDir(), "target")},
-		Policy:   Policy{PressurePolicy: PressurePolicyEvict},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	metadataPath := filepath.Join(store.Root(), identity, metadataName)
-	if err := os.WriteFile(metadataPath, []byte("{broken"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if victims, err := store.PressureVictims(); err != nil || len(victims) != 0 {
-		t.Fatalf("pressure-off victims = %+v, error = %v", victims, err)
-	}
-	if _, degraded := store.generationManager.degraded[identity]; degraded {
-		t.Fatal("pressure-off victim lookup read and degraded cache metadata")
-	}
-}
-
-func TestPressureDoesNotRetirePreparingLeaseBeforePublishCommit(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "pressure-used-block"), make([]byte, 8192), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := NewStore(root, StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	identity := stableIdentity("preparing-pressure-lease")
-	publishedTarget := filepath.Join(t.TempDir(), "published-mount")
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "published", Target: publishedTarget},
-		Policy:   Policy{PressurePolicy: PressurePolicyEvict},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CommitPublish("published", publishedTarget); err != nil {
-		t.Fatal(err)
-	}
-	target := filepath.Join(t.TempDir(), "mount")
-	options := AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "preparing", Target: target},
-		Policy:   Policy{PressurePolicy: PressurePolicyEvict},
-	}
-	var source string
-	for attempt := range 2 {
-		barrier := startAcquireBarrier(store, options)
-		t.Cleanup(barrier.release)
-		result := <-barrier.result
-		if result.err != nil {
-			t.Fatal(result.err)
-		}
-		if attempt == 0 && !result.created {
-			t.Fatal("initial publish did not create a new lease")
-		}
-		if attempt == 1 && (result.created || result.source != source) {
-			t.Fatalf("same-volume retry = (%q, %t), want existing source %q", result.source, result.created, source)
-		}
-		if attempt == 0 {
-			source = result.source
-			store.pressureManager.pressure = PressureConfig{
-				HighFreePercent:      100,
-				LowFreePercent:       99,
-				HighInodeFreePercent: 100,
-				LowInodeFreePercent:  99,
-			}
-			store.pressureManager.pressureActive = true
-		}
-		assertPreparingGenerationProtected(t, store, identity, result.source, options.Lease.ID, target)
-		barrier.release()
-		if err := store.CommitPublish(options.Lease.ID, target); err != nil {
-			t.Fatal(err)
-		}
-	}
-	victims, err := store.PressureVictims()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(victims) != 2 {
-		t.Fatalf("pressure victims after all leases are published = %+v, want both shared-generation leases", victims)
-	}
-}
-
-type acquireBarrierResult struct {
-	source  string
-	created bool
-	err     error
-}
-
-type acquireBarrier struct {
-	result chan acquireBarrierResult
-	resume chan struct{}
-	done   chan struct{}
-	once   sync.Once
-}
-
-func startAcquireBarrier(store *Store, options AcquireOptions) *acquireBarrier {
-	barrier := &acquireBarrier{
-		result: make(chan acquireBarrierResult, 1),
-		resume: make(chan struct{}),
-		done:   make(chan struct{}),
-	}
-	go func() {
-		defer close(barrier.done)
-		source, created, err := store.Acquire(options)
-		barrier.result <- acquireBarrierResult{source: source, created: created, err: err}
-		<-barrier.resume
-	}()
-	return barrier
-}
-
-func (barrier *acquireBarrier) release() {
-	barrier.once.Do(func() { close(barrier.resume) })
-	<-barrier.done
-}
-
-func assertPreparingGenerationProtected(t *testing.T, store *Store, identity, source, leaseID, target string) {
-	t.Helper()
-	victims, err := store.PressureVictims()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(victims) != 0 {
-		t.Fatalf("preparing lease pressure victims = %+v, want none", victims)
-	}
-	if !store.pressureManager.pressureActive {
-		t.Fatal("barrier test did not keep pressure active")
-	}
-	_, lease, currentSource, _, found, err := store.LeaseDetails(leaseID)
-	if err != nil || !found || !lease.Preparing || currentSource != source || lease.Target != target {
-		t.Fatalf("preparing lease details = (%+v, %q, %t, %v), want preparing source %q", lease, currentSource, found, err, source)
-	}
-	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if meta.Generation != filepath.Base(source) || len(meta.Retired) != 0 {
-		t.Fatalf("preparing generation state = (%q, %d retired), want unchanged generation %q", meta.Generation, len(meta.Retired), filepath.Base(source))
 	}
 }
 
@@ -627,12 +289,10 @@ func TestValidatePressureWatermarks(t *testing.T) {
 		{
 			name: "configured watermarks",
 			pressure: PressureConfig{
-				HighFreePercent:          25,
-				LowFreePercent:           20,
-				CriticalFreePercent:      10,
-				HighInodeFreePercent:     15,
-				LowInodeFreePercent:      10,
-				CriticalInodeFreePercent: 5,
+				HighFreePercent:      25,
+				LowFreePercent:       20,
+				HighInodeFreePercent: 15,
+				LowInodeFreePercent:  10,
 			},
 		},
 		{name: "disabled watermarks"},
@@ -651,20 +311,6 @@ func TestValidatePressureWatermarks(t *testing.T) {
 			},
 			wantErr: true,
 		},
-		{
-			name: "critical watermark is not lower",
-			pressure: PressureConfig{
-				HighFreePercent:     25,
-				LowFreePercent:      20,
-				CriticalFreePercent: 20,
-			},
-			wantErr: true,
-		},
-		{
-			name:     "critical watermark requires a paired low watermark",
-			pressure: PressureConfig{CriticalFreePercent: 5},
-			wantErr:  true,
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -672,50 +318,6 @@ func TestValidatePressureWatermarks(t *testing.T) {
 			err := validatePressure(test.pressure)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("validatePressure() error = %v, wantErr %v", err, test.wantErr)
-			}
-		})
-	}
-}
-
-func TestCriticalWatermarkDetection(t *testing.T) {
-	t.Parallel()
-	store := &Store{pressureManager: pressureManager{pressure: PressureConfig{CriticalFreePercent: 10, CriticalInodeFreePercent: 5}}}
-	tests := []struct {
-		name string
-		fs   unix.Statfs_t
-		want bool
-	}{
-		{name: "above both critical limits", fs: unix.Statfs_t{Bavail: 20, Blocks: 100, Ffree: 10, Files: 100}},
-		{name: "critical bytes", fs: unix.Statfs_t{Bavail: 9, Blocks: 100, Ffree: 10, Files: 100}, want: true},
-		{name: "critical inodes", fs: unix.Statfs_t{Bavail: 20, Blocks: 100, Ffree: 4, Files: 100}, want: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if got := store.underCriticalWatermark(test.fs); got != test.want {
-				t.Fatalf("underCriticalWatermark() = %t, want %t", got, test.want)
-			}
-		})
-	}
-}
-
-func TestForceDeletePolicyRequiresCriticalPressure(t *testing.T) {
-	t.Parallel()
-	for _, test := range []struct {
-		name     string
-		policy   string
-		critical bool
-		want     bool
-	}{
-		{name: "default remains unused", policy: "", critical: true},
-		{name: "eviction policy stays PDB respecting", policy: PressurePolicyEvict, critical: true},
-		{name: "force policy above critical watermark", policy: PressurePolicyForceDelete},
-		{name: "force policy at critical watermark", policy: PressurePolicyForceDelete, critical: true, want: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if got := shouldForceDelete(test.policy, test.critical); got != test.want {
-				t.Fatalf("shouldForceDelete() = %t, want %t", got, test.want)
 			}
 		})
 	}
@@ -801,9 +403,6 @@ func TestMetadataDamageIsIsolatedAndProjectReservationSurvivesRestart(t *testing
 	}
 	if err := store.Collect(time.Now()); err != nil {
 		t.Fatalf("collection stopped on an unrelated broken object: %v", err)
-	}
-	if _, err := store.PressureVictims(); err != nil {
-		t.Fatalf("pressure scan stopped on an unrelated broken object: %v", err)
 	}
 	if _, _, _, _, found, err := store.LeaseDetails("healthy"); err != nil || !found {
 		t.Fatalf("healthy lease lookup was affected by broken metadata: found=%v error=%v", found, err)
@@ -1405,55 +1004,13 @@ func TestAcquireDoesNotDiscardGenerationsWhenMetadataIsMissing(t *testing.T) {
 	}
 }
 
-func TestExclusivePolicyAppliesAcrossRetiredGeneration(t *testing.T) {
-	t.Parallel()
-	policy := Policy{SharingPolicy: SharingPolicyExclusive, PressurePolicy: PressurePolicyEvict}
-	store, identity, _, target, oldPath := pressureLease(t, "exclusive-cache", policy, 1, true)
-	victims, err := store.PressureVictims()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(victims) != 1 || victims[0].Lease.ID != firstLeaseID || victims[0].ForceDelete {
-		t.Fatalf("pressure victims = %+v, want the active exclusive lease", victims)
-	}
-	_, _, err = store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: firstLeaseID, Target: target},
-		Policy:   policy,
-	})
-	if !errors.Is(err, ErrLeaseGenerationRetired) {
-		t.Fatalf("same lease retry = %v, want ErrLeaseGenerationRetired", err)
-	}
-	if _, _, source, _, found, err := store.LeaseDetails(firstLeaseID); err != nil || !found || source != oldPath {
-		t.Fatalf("retired lease details = source %q, found %v, error %v; want %q", source, found, err, oldPath)
-	}
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), secondName)},
-		Policy:   policy,
-	}); !errors.Is(err, ErrPressureActive) {
-		t.Fatalf("second active lease error = %v, want ErrPressureActive", err)
-	}
-	if err := store.Release(firstLeaseID, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "second-exclusive", Target: filepath.Join(t.TempDir(), secondName)},
-		Policy:   policy,
-	}); !errors.Is(err, ErrPressureActive) {
-		t.Fatalf("new lease after old generation release error = %v, want ErrPressureActive", err)
-	}
-}
-
 func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	t.Parallel()
 
 	initialPolicy := Policy{
-		SharingPolicy:  SharingPolicyShared,
-		PressurePolicy: PressurePolicyUnusedOnly,
-		Retention:      time.Hour,
-		NoExec:         true,
+		SharingPolicy: SharingPolicyShared,
+		Retention:     time.Hour,
+		NoExec:        true,
 	}
 	store, err := newStore(t.TempDir(), StoreOptions{}, false)
 	if err != nil {
@@ -1477,7 +1034,6 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	updatedPolicy := initialPolicy
-	updatedPolicy.PressurePolicy = PressurePolicyForceDelete
 	updatedPolicy.Retention = 2 * time.Hour
 	updatedPolicy.NoExec = false
 	secondTarget := filepath.Join(t.TempDir(), "second-shared")
@@ -1491,8 +1047,6 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	if err := store.CommitPublish("second-shared-lease", secondTarget); err != nil {
 		t.Fatal(err)
 	}
-	store.pressureManager.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
-	store.pressureManager.pressureActive = true
 	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
 	if err != nil {
 		t.Fatal(err)
@@ -1513,13 +1067,6 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	if len(meta.Leases) != 2 || meta.Leases[0].Generation != meta.Leases[1].Generation {
 		t.Fatalf("shared leases = %+v, want both leases on the same generation", meta.Leases)
 	}
-	victims, err := store.PressureVictims()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(victims) != 0 {
-		t.Fatalf("pressure victims = %+v, want no victim under the generation snapshot policy", victims)
-	}
 	if err := store.Release(firstLeaseID, firstTarget); err != nil {
 		t.Fatal(err)
 	}
@@ -1528,10 +1075,9 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
 	t.Parallel()
 	initialPolicy := Policy{
-		SharingPolicy:  SharingPolicyShared,
-		PressurePolicy: PressurePolicyUnusedOnly,
-		Retention:      time.Hour,
-		NoExec:         true,
+		SharingPolicy: SharingPolicyShared,
+		Retention:     time.Hour,
+		NoExec:        true,
 	}
 	store, err := newStore(t.TempDir(), StoreOptions{}, false)
 	if err != nil {
@@ -1557,7 +1103,6 @@ func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
 	}
 
 	updatedPolicy := initialPolicy
-	updatedPolicy.PressurePolicy = PressurePolicyForceDelete
 	updatedPolicy.Retention = 2 * time.Hour
 	updatedPolicy.NoExec = false
 	secondTarget := filepath.Join(t.TempDir(), "second-idle")
@@ -1581,49 +1126,6 @@ func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
 	}
 	if storedPolicy != updatedPolicy {
 		t.Fatalf("second idle lease policy = %+v, want updated policy %+v", storedPolicy, updatedPolicy)
-	}
-}
-
-func TestAcquireRejectsQuotaChangeWhileRetiredGenerationExists(t *testing.T) {
-	t.Parallel()
-	policy := Policy{
-		SharingPolicy:  SharingPolicyShared,
-		PressurePolicy: PressurePolicyEvict,
-		QuotaEnabled:   true,
-		MaxBytes:       1024,
-	}
-	store, identity, _, firstTarget, _ := pressureLease(t, "retired-quota-policy", policy, 2, false)
-	store.pressureManager.pressure = PressureConfig{}
-	store.pressureManager.pressureActive = false
-	secondTarget := filepath.Join(t.TempDir(), "second-retired")
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "second-retired-lease", Target: secondTarget},
-		Policy:   policy,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CommitPublish("second-retired-lease", secondTarget); err != nil {
-		t.Fatal(err)
-	}
-	store.pressureManager.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
-	store.pressureManager.pressureActive = true
-	if victims, err := store.PressureVictims(); err != nil || len(victims) != 2 {
-		t.Fatalf("pressure victims = %+v, error = %v; want both shared leases", victims, err)
-	}
-	if err := store.Release(firstLeaseID, firstTarget); err != nil {
-		t.Fatal(err)
-	}
-	store.pressureManager.pressure = PressureConfig{}
-	store.pressureManager.pressureActive = false
-	updatedPolicy := policy
-	updatedPolicy.MaxBytes = 2048
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: "new-quota-lease", Target: filepath.Join(t.TempDir(), "new-quota")},
-		Policy:   updatedPolicy,
-	}); !errors.Is(err, ErrQuotaPolicyConflict) {
-		t.Fatalf("acquire with changed quota while a retired generation remains = %v, want ErrQuotaPolicyConflict", err)
 	}
 }
 
@@ -1774,35 +1276,6 @@ func waitForKeyedLockReferences(t *testing.T, locks *keyedMutexes, key string, w
 	t.Fatalf("keyed lock references for %q did not reach %d", key, want)
 }
 
-func TestRecoveryVerifierReceivesRetiredGenerationSourceAndPolicy(t *testing.T) {
-	t.Parallel()
-	policy := Policy{NoExec: true, SharingPolicy: SharingPolicyExclusive, PressurePolicy: PressurePolicyEvict}
-	store, identity, _, target, oldPath := pressureLease(t, "recovery-retired-cache", policy, 1, true)
-	if _, err := store.PressureVictims(); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.RecoverLeases(func(source string, lease Lease, recoveredPolicy Policy) (bool, error) {
-		if source != oldPath {
-			t.Errorf("recovered source = %q, want %q", source, oldPath)
-		}
-		if lease.ID != firstLeaseID || lease.Target != target || lease.Generation == "" {
-			t.Errorf("recovered lease = %+v, want retired lease %q at %q", lease, firstLeaseID, target)
-		}
-		if recoveredPolicy != policy {
-			t.Errorf("recovered policy = %+v, want %+v", recoveredPolicy, policy)
-		}
-		return true, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, source, recoveredPolicy, found, err := store.LeaseDetails(firstLeaseID); err != nil || !found || source != oldPath || recoveredPolicy != policy {
-		t.Fatalf("retired lease after recovery = (%q, %+v, %v, %v), want preserved lease", source, recoveredPolicy, found, err)
-	}
-	if _, err := os.Stat(filepath.Join(store.Root(), identity)); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
@@ -1844,8 +1317,6 @@ func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 	if len(trash) != len(identities) {
 		t.Fatalf("trash entries before pressure reclaim = %d, want %d", len(trash), len(identities))
 	}
-	store.pressureManager.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
-	store.pressureManager.pressureActive = true
 	if err := store.ReclaimPressure(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -1906,163 +1377,4 @@ func TestTrashCleanupSkipsFailedEntriesAcrossBatches(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(store.Root(), trashDirectoryName, "000")); err != nil {
 		t.Fatalf("temporarily unavailable entry was unexpectedly removed: %v", err)
 	}
-}
-
-func TestPressureVictimsRemainAvailableWhenTrashDeletionFails(t *testing.T) {
-	t.Parallel()
-	store, _, _, _, _ := pressureLease(t, "blocked-trash-victim", Policy{PressurePolicy: PressurePolicyEvict}, 1, true)
-	if err := store.CleanupTrash(t.Context()); err != nil {
-		t.Fatalf("wait for initial trash cleanup: %v", err)
-	}
-	blockedErr := errors.New("trash entry is temporarily unavailable")
-	store.trashCollector.removeTrashEntry = func(path string) error {
-		if filepath.Base(path) == "blocked" {
-			return blockedErr
-		}
-		return store.metadataRepository.removeAll(path)
-	}
-	blockedEntry := filepath.Join(store.Root(), trashDirectoryName, "blocked")
-	if err := os.Mkdir(blockedEntry, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ReclaimPressure(t.Context()); !errors.Is(err, ErrPressureReclaimIncomplete) {
-		t.Fatalf("pressure reclaim error = %v, want incomplete reclaim", err)
-	}
-	victims, err := store.PressureVictims()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(victims) != 1 || victims[0].Lease.ID != firstLeaseID || victims[0].ForceDelete {
-		t.Fatalf("pressure victims with undeleted trash = %+v, want active lease", victims)
-	}
-}
-
-func TestPressureRetiresLeasedGenerationUntilLastRelease(t *testing.T) {
-	t.Parallel()
-	store, identity, policy, target, oldPath := pressureLease(t, "pressure-cache", Policy{PressurePolicy: PressurePolicyEvict}, 0, true)
-	victims, err := store.PressureVictims()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(victims) != 1 || victims[0].Lease.ID != firstLeaseID || victims[0].ForceDelete {
-		t.Fatalf("pressure victims = %+v, want the active lease", victims)
-	}
-	if err := store.BeginPublish(firstLeaseID, target); !errors.Is(err, ErrLeaseGenerationRetired) {
-		t.Fatalf("begin publish for retired lease = %v, want ErrLeaseGenerationRetired", err)
-	}
-	if _, _, err := store.Acquire(AcquireOptions{
-		Identity: identity,
-		Lease:    Lease{ID: firstLeaseID, Target: target},
-		Policy:   policy,
-	}); !errors.Is(err, ErrLeaseGenerationRetired) {
-		t.Fatalf("retry acquire for retired lease = %v, want ErrLeaseGenerationRetired", err)
-	}
-	_, _, retiredPath, _, found, err := store.LeaseDetails(firstLeaseID)
-	if err != nil || !found || retiredPath != oldPath {
-		t.Fatalf("retired lease resolves to %q, found %v, error %v; want %q", retiredPath, found, err, oldPath)
-	}
-
-	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
-	if err != nil {
-		t.Fatal(err)
-	}
-	activeGeneration := meta.Generation
-	retries, err := store.PressureVictims()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(retries) != 1 || retries[0].Lease.ID != firstLeaseID || retries[0].ForceDelete {
-		t.Fatalf("pressure retry victims = %+v, want the retired lease", retries)
-	}
-	meta, err = store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if meta.Generation != activeGeneration {
-		t.Fatal("pressure rotated an empty active generation repeatedly")
-	}
-	if _, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: Lease{ID: "replacement", Target: filepath.Join(t.TempDir(), "replacement")}, Policy: policy}); !errors.Is(err, ErrPressureActive) {
-		t.Fatalf("replacement lease while pressure remains active error = %v, want ErrPressureActive", err)
-	}
-	if _, _, source, _, found, err := store.LeaseDetails(firstLeaseID); err != nil || !found || source != oldPath {
-		t.Fatalf("old lease stopped resolving before unpublish: source %q, found %v, error %v", source, found, err)
-	}
-
-	if err := store.Release(firstLeaseID, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("released retired generation still exists at its original path: %v", err)
-	}
-}
-
-func TestRetiredGenerationReservesProjectIDUntilDeleted(t *testing.T) {
-	t.Parallel()
-	store, identity, policy, target, _ := pressureLease(t, "pressure-quota-cache", Policy{PressurePolicy: PressurePolicyEvict, QuotaEnabled: true, MaxBytes: 1024}, 2, false)
-	oldProjectID, _, _, err := store.QuotaState(identity, policy.MaxBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.PressureVictims(); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Release(firstLeaseID, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := store.QuotaState(identity, policy.MaxBytes); err != nil {
-		t.Fatal(err)
-	}
-	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if meta.ProjectID == oldProjectID {
-		t.Fatal("replacement generation reused the retired generation's project ID")
-	}
-	store.pressureManager.pressure = PressureConfig{}
-	store.pressureManager.pressureActive = false
-	otherIdentity := stableIdentity("pressure-other-cache")
-	if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
-		t.Fatal("detached generation's project ID was reused before physical deletion")
-	}
-	if err := store.cleanupTrashBatch(); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := store.QuotaState(otherIdentity, 1024); err != nil {
-		t.Fatalf("project ID was not released after retired generation deletion: %v", err)
-	}
-}
-
-func pressureLease(t *testing.T, name string, policy Policy, projectIDCount uint32, startTrashCollector bool) (*Store, string, Policy, string, string) {
-	t.Helper()
-	if projectIDCount == 0 {
-		projectIDCount = 1
-	}
-	store, err := newStore(t.TempDir(), StoreOptions{
-		ProjectIDStart: 32000,
-		ProjectIDCount: projectIDCount,
-	}, startTrashCollector)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	identity := stableIdentity(name)
-	target := filepath.Join(t.TempDir(), firstLeaseID)
-	oldPath, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: Lease{ID: firstLeaseID, Target: target}, Policy: policy})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CommitPublish(firstLeaseID, target); err != nil {
-		t.Fatal(err)
-	}
-	store.pressureManager.pressure = PressureConfig{HighFreePercent: 100, LowFreePercent: 99}
-	store.pressureManager.pressureActive = true
-	return store, identity, policy, target, oldPath
 }

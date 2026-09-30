@@ -63,16 +63,6 @@ spec:
               noExec:
                 description: Mounts cache generations with execution disabled.
                 type: boolean
-              pressurePolicy:
-                default: UnusedOnly
-                description: Policy for active cache generations during filesystem
-                  pressure. ForceDelete requires the node's critical pressure watermark
-                  and explicit Pod delete RBAC.
-                enum:
-                - UnusedOnly
-                - Evict
-                - ForceDelete
-                type: string
               retention:
                 default: 72h
                 description: Maximum age of an unused cache before it becomes eligible

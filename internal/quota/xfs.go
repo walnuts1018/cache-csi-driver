@@ -21,6 +21,20 @@ type XFS struct {
 	Binary string
 }
 
+func (x XFS) Check(ctx context.Context, filesystemRoot string) error {
+	if err := x.validate(filesystemRoot); err != nil {
+		return err
+	}
+	state, err := x.runOutput(ctx, filesystemRoot, "-c", "state -p")
+	if err != nil {
+		return err
+	}
+	if !projectQuotaEnforced(state) {
+		return errors.New("XFS project quota accounting and enforcement must be enabled")
+	}
+	return nil
+}
+
 func (x XFS) AssignProject(ctx context.Context, filesystemRoot, generationPath string, projectID uint32) error {
 	if projectID == 0 {
 		return errors.New("project ID must be positive")
@@ -63,12 +77,8 @@ func (x XFS) Configure(ctx context.Context, filesystemRoot, generationPath strin
 	if err := x.validate(filesystemRoot); err != nil {
 		return err
 	}
-	state, err := x.runOutput(ctx, filesystemRoot, "-c", "state -p")
-	if err != nil {
+	if err := x.Check(ctx, filesystemRoot); err != nil {
 		return err
-	}
-	if !projectQuotaEnforced(state) {
-		return errors.New("XFS project quota accounting and enforcement must be enabled")
 	}
 	if err := x.AssignProject(ctx, filesystemRoot, generationPath, projectID); err != nil {
 		return err

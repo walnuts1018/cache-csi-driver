@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: health-controller
+spec:
+  replicas: {{ .Values.healthController.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "cache-csi-driver.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: health-controller
+  template:
+    metadata:
+      labels:
+        {{- include "cache-csi-driver.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: health-controller
+    spec:
+      serviceAccountName: {{ include "cache-csi-driver.healthControllerServiceAccountName" . }}
+      automountServiceAccountToken: true
+      priorityClassName: system-cluster-critical
+      terminationGracePeriodSeconds: 10
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: health-controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" (.Chart.AppVersion | trimPrefix "v")) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - health-controller
+            - --namespace=$(POD_NAMESPACE)
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            {{- toYaml .Values.healthController.resources | nindent 12 }}
+      {{- with .Values.healthController.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.healthController.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: health-controller
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "cache-csi-driver.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: health-controller

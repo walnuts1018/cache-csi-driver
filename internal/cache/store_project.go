@@ -42,6 +42,31 @@ type unknownProjectReservation struct {
 	TrashID  string `json:"trashID,omitempty"`
 }
 
+func (store *Store) ProjectRegistryError() error {
+	registry := &store.projectQuotaRegistry
+	registry.projectRegistryMu.Lock()
+	defer registry.projectRegistryMu.Unlock()
+
+	store.mu.Lock()
+	damaged := registry.projectRegistryDamaged
+	unknownReservations := len(registry.unknownProjectReservations)
+	dirty := registry.projectRegistryDirty
+	store.mu.Unlock()
+
+	if damaged {
+		return errors.New("project ID reservation registry is damaged")
+	}
+	if unknownReservations > 0 {
+		return errors.New("project ID reservations remain for quarantined cache objects")
+	}
+	if dirty {
+		if err := registry.persistProjectReservationsLocked(store); err != nil {
+			return fmt.Errorf("persist project ID reservation registry: %w", err)
+		}
+	}
+	return nil
+}
+
 func (registry *projectQuotaRegistry) loadProjectRegistry(store *Store) bool {
 	registry.projectRegistryMu.Lock()
 	defer registry.projectRegistryMu.Unlock()

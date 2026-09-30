@@ -39,20 +39,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
-{{- define "cache-csi-driver.validatePressureSettings" -}}
-{{- if and .Values.pressure.allowPodEviction (not .Values.rbac.createPodEvictions) -}}
-{{- fail "pressure.allowPodEviction requires rbac.createPodEvictions" -}}
+{{- define "cache-csi-driver.resourceName" -}}
+{{- $suffix := .suffix -}}
+{{- $prefixLength := int (sub 62 (len $suffix)) -}}
+{{- $prefix := include "cache-csi-driver.fullname" .root | trunc $prefixLength | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix $suffix | trimSuffix "-" -}}
 {{- end -}}
-{{- if and .Values.rbac.createPodEvictions (not .Values.pressure.allowPodEviction) -}}
-{{- fail "rbac.createPodEvictions requires pressure.allowPodEviction" -}}
-{{- end -}}
-{{- if and .Values.pressure.allowForceDelete (not .Values.pressure.allowPodEviction) -}}
-{{- fail "pressure.allowForceDelete requires pressure.allowPodEviction" -}}
-{{- end -}}
-{{- if and .Values.pressure.allowForceDelete (not .Values.rbac.deletePodsAtCriticalPressure) -}}
-{{- fail "pressure.allowForceDelete requires rbac.deletePodsAtCriticalPressure" -}}
-{{- end -}}
-{{- if and .Values.rbac.deletePodsAtCriticalPressure (not .Values.pressure.allowForceDelete) -}}
-{{- fail "rbac.deletePodsAtCriticalPressure requires pressure.allowForceDelete" -}}
-{{- end -}}
+
+{{- define "cache-csi-driver.healthControllerServiceAccountName" -}}
+{{- include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller") -}}
 {{- end -}}

@@ -21,12 +21,6 @@ const SharingPolicyShared = "Shared"
 
 const SharingPolicyExclusive = "Exclusive"
 
-const PressurePolicyUnusedOnly = "UnusedOnly"
-
-const PressurePolicyEvict = "Evict"
-
-const PressurePolicyForceDelete = "ForceDelete"
-
 type GenerationState string
 
 const (
@@ -34,11 +28,6 @@ const (
 	GenerationStateRetiring GenerationState = "Retiring"
 	GenerationStateRetired  GenerationState = "Retired"
 )
-
-type PressureVictim struct {
-	Lease       Lease
-	ForceDelete bool
-}
 
 type Lease struct {
 	ID         string `json:"id"`
@@ -62,17 +51,15 @@ type RetiredGeneration struct {
 }
 
 type Policy struct {
-	ClassName            string        `json:"className"`
-	ClassUID             string        `json:"classUID"`
-	SharingPolicy        string        `json:"sharingPolicy,omitempty"`
-	DiscardOnLastRelease bool          `json:"discardOnLastRelease,omitempty"`
-	NoExec               bool          `json:"noExec"`
-	SchemaVersion        string        `json:"schemaVersion"`
-	CrashRecoveryReuse   bool          `json:"crashRecoveryReuse"`
-	PressurePolicy       string        `json:"pressurePolicy,omitempty"`
-	QuotaEnabled         bool          `json:"quotaEnabled"`
-	MaxBytes             int64         `json:"maxBytes"`
-	Retention            time.Duration `json:"retention"`
+	ClassName          string        `json:"className"`
+	ClassUID           string        `json:"classUID"`
+	SharingPolicy      string        `json:"sharingPolicy,omitempty"`
+	NoExec             bool          `json:"noExec"`
+	SchemaVersion      string        `json:"schemaVersion"`
+	CrashRecoveryReuse bool          `json:"crashRecoveryReuse"`
+	QuotaEnabled       bool          `json:"quotaEnabled"`
+	MaxBytes           int64         `json:"maxBytes"`
+	Retention          time.Duration `json:"retention"`
 }
 
 type policyAlias Policy
@@ -116,7 +103,6 @@ type Metadata struct {
 func (manager *generationManager) indexObjectMetadata(store *Store, meta Metadata) {
 	_, recoveringDegraded := manager.degraded[meta.Identity]
 	if previous, exists := manager.metadataByIdentity[meta.Identity]; exists {
-		manager.removeFallbackReservation(previous)
 		manager.retiredGenerationCount -= len(previous.Retired)
 		for _, lease := range previous.Leases {
 			delete(manager.leaseIndex, lease.ID)
@@ -130,7 +116,6 @@ func (manager *generationManager) indexObjectMetadata(store *Store, meta Metadat
 		}
 	}
 	manager.metadataByIdentity[meta.Identity] = meta
-	manager.addFallbackReservation(meta)
 	manager.retiredGenerationCount += len(meta.Retired)
 	delete(manager.degraded, meta.Identity)
 	for _, lease := range meta.Leases {
@@ -180,23 +165,10 @@ func (manager *generationManager) markDegraded(store *Store, identity string, ca
 
 func (manager *generationManager) markDegradedLocked(identity string, cause error) {
 	if previous, exists := manager.metadataByIdentity[identity]; exists {
-		manager.removeFallbackReservation(previous)
 		manager.retiredGenerationCount -= len(previous.Retired)
 	}
 	delete(manager.metadataByIdentity, identity)
 	manager.degraded[identity] = fmt.Errorf("%w: %v", ErrDegradedMetadata, cause)
-}
-
-func (manager *generationManager) addFallbackReservation(meta Metadata) {
-	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) > 0 && meta.Policy.MaxBytes > 0 {
-		manager.fallbackReservedBytes += meta.Policy.MaxBytes
-	}
-}
-
-func (manager *generationManager) removeFallbackReservation(meta Metadata) {
-	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) > 0 && meta.Policy.MaxBytes > 0 {
-		manager.fallbackReservedBytes -= meta.Policy.MaxBytes
-	}
 }
 
 func (manager *generationManager) indexDegradedLeaseIDs(store *Store, identity string, meta Metadata) {
@@ -238,11 +210,8 @@ func validateMetadata(identity string, meta Metadata) error {
 	if !validSharingPolicy(meta.Policy.SharingPolicy) {
 		return errors.New("cache metadata has an unsupported sharing policy")
 	}
-	if !validPressurePolicy(meta.Policy.PressurePolicy) {
-		return errors.New("cache metadata has an unsupported pressure policy")
-	}
 	for _, retired := range meta.Retired {
-		if retired.Generation == "" || retired.State != "" && retired.State != GenerationStateRetiring && retired.State != GenerationStateRetired || retired.Policy.Retention < 0 || !validSharingPolicy(retired.Policy.SharingPolicy) || !validPressurePolicy(retired.Policy.PressurePolicy) {
+		if retired.Generation == "" || retired.State != "" && retired.State != GenerationStateRetiring && retired.State != GenerationStateRetired || retired.Policy.Retention < 0 || !validSharingPolicy(retired.Policy.SharingPolicy) {
 			return errors.New("cache metadata has an invalid retired generation policy")
 		}
 		hasLeases := slices.ContainsFunc(meta.Leases, func(lease Lease) bool {
@@ -273,10 +242,6 @@ func generationPolicyHash(policy Policy) (string, error) {
 	}
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:]), nil
-}
-
-func validPressurePolicy(policy string) bool {
-	return policy == "" || policy == PressurePolicyUnusedOnly || policy == PressurePolicyEvict || policy == PressurePolicyForceDelete
 }
 
 func validSharingPolicy(policy string) bool {
@@ -432,10 +397,6 @@ func (s *Store) indexMetadata(meta Metadata) {
 
 func (s *Store) markDegraded(identity string, cause error) {
 	s.generationManager.markDegraded(s, identity, cause)
-}
-
-func (s *Store) removeFallbackReservation(meta Metadata) {
-	s.generationManager.removeFallbackReservation(meta)
 }
 
 func (s *Store) indexDegradedLeaseIDs(identity string, meta Metadata) {

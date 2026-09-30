@@ -1,6 +1,6 @@
 # Cache CSI Driver
 
-Cache CSI DriverはKubernetesのCSI inline ephemeral volumeとしてNode-local cache directoryを提供します。Podのvolume leaseはPod削除時に解除しますが、cache dataはNode上に残り、同じ`CacheClass`と`cacheKey`を指定する後続Podから再利用できます。
+Cache CSI DriverはKubernetesのCSI inline ephemeral volumeとしてNode-local cache directoryを提供します。`NodePublishVolume`が成功した場合、そのNode上で要求された意味論を満たすcache generationを利用できます。Podのvolume leaseはPod削除時に解除しますが、cache dataはNode上に残り、同じ`CacheClass`と`cacheKey`を指定する後続Podから再利用できます。
 
 このdriverはKubernetes 1.37以降を対象とします。CSI inline volumeはbest-effort cacheであり、データの永続性、Node間共有、容量の予約を提供しません。Node障害、容量圧迫、CacheClassの保持期限、またはdriverのGCによりcacheはいつでも破棄されます。アプリケーションはcache miss後にデータを再生成できる必要があります。
 
@@ -15,19 +15,25 @@ helm install cache-csi-driver \
   --namespace kube-system
 ```
 
-このchartは`CacheClass` CRD、`CSIDriver`、ValidatingAdmissionPolicy、ClusterRole、ServiceAccount、Node DaemonSetをインストールします。ValidatingAdmissionPolicyは、namespaceに`cache.csi.walnuts.dev/allow-use=true`ラベルがない場合にCache CSI volumeを使うPodを拒否します。CacheClassを利用させるnamespaceには、namespaceラベルを変更できる利用者を管理した上で次のようにラベルを付けてください。
+このchartは`CacheClass` CRD、`CSIDriver`、MutatingAdmissionPolicy、ValidatingAdmissionPolicy、RBAC、ServiceAccount、Node DaemonSet、health-controller Deploymentをインストールします。ValidatingAdmissionPolicyは、namespaceに`cache.csi.walnuts.dev/allow-use=true`ラベルがない場合にCache CSI volumeを使うPodを拒否します。CacheClassを利用させるnamespaceには、namespaceラベルを変更できる利用者を管理した上で次のようにラベルを付けてください。
 
 ```sh
 kubectl label namespace default cache.csi.walnuts.dev/allow-use=true
 ```
 
-`admissionPolicy.enabled=true`ではPod作成時にCache CSIのinline ephemeral volumeを検証し、`ephemeral: true`、`cacheClass`、`cacheKey`を必須にして`maxBytes`以外の未知属性を拒否します。`maxBytes`を指定した場合は正のKubernetes quantityである必要があります。Helm valuesの`admissionPolicy.cacheClassAllowlist.enabled=true`を指定すると、namespace annotation `cache.storage.walnuts.dev/allowed-cache-classes`に列挙されたCacheClassだけを利用できます。値はカンマ区切りです。annotation keyはHelm valuesで変更できます。`admissionPolicy.enabled=false`でpolicyを無効化する場合は、同等の利用制限を別のAdmission設定で行ってください。ClusterRoleはNamespaceとServiceAccountに`get`、CacheClassに`get/list/watch`の権限を持ち、`rbac.createPodEvictions=true`を指定した場合に`pods/eviction`の作成権限を追加します。Podの直接削除権限は`rbac.deletePodsAtCriticalPressure=true`を指定した場合だけ追加されます。ServiceAccount tokenの自動mountは無効で、Kubernetes API tokenはdriver containerだけにprojected volumeとして渡します。Node pluginはmount system callを使うためprivileged containerとして動作し、mount属性付きmountの伝播にLinux kernel 5.12以降が必要です。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映され、`kubeletRootDir`と重複できません。
+Admission policyは必須です。Pod作成時にCache CSI inline ephemeral volumeを検証し、`ephemeral: true`、`cacheClass`、`cacheKey`を必須にして`maxBytes`以外の未知属性を拒否します。`maxBytes`を指定した場合は正のKubernetes quantityである必要があります。MutatingAdmissionPolicyはCache CSI volumeを持つPodの`spec.nodeSelector`へ`cache.csi.walnuts.dev/ready: "true"`を追加し、既存のselectorを保持します。既存selectorに同じkeyの別値がある場合、`spec.nodeName`が指定されている場合、または`default-scheduler`以外のschedulerを指定した場合はValidatingAdmissionPolicyがPodを拒否します。health-controllerはNamespace内のnode health Leaseを読み、Node labelを更新します。Helm valuesの`admissionPolicy.cacheClassAllowlist.enabled=true`を指定すると、namespace annotation `cache.storage.walnuts.dev/allowed-cache-classes`に列挙されたCacheClassだけを利用できます。値はカンマ区切りで、annotation keyはHelm valuesから変更できます。Node DaemonSetのServiceAccount token自動mountは無効で、Node plugin containerだけにprojected tokenを渡します。health-controllerだけはAPI access用ServiceAccount tokenを自動mountします。Node pluginはmount system callを使うためprivileged containerとして動作し、mount属性付きmountの伝播にLinux kernel 5.12以降が必要です。cacheは各Nodeの`/var/lib/cache-csi`に保存されます。保存先を変更する場合はHelm valuesの`cacheRootDir`を設定してください。この値はNode上のhostPathとpluginの引数の両方に反映され、`kubeletRootDir`と重複できません。
 
-CacheClassは各Node pluginのdynamic informer cacheから参照します。PodのNamespace、name、UID、ServiceAccount.nameはCSIの`podInfoOnMount`から取得します。NamespaceとServiceAccountのUIDはNodePublishの解決時にKubernetes APIへGETし、同一objectへの同時GETだけsingleflightで共有します。成功したUIDをTTL cacheへ保存しないため、一時的なAPI障害でidentityを確認できない場合に古いUIDを使わず、要求はbounded fallbackへ切り替わります。NamespaceまたはServiceAccountが存在しない場合やAPI accessが拒否された場合は設定・権限エラーとしてpublishを拒否します。CacheClass informerのcold start中はbounded fallbackを使います。NamespaceとServiceAccountのwatchは行わず、CacheClass informerのwatchだけがNode数に比例します。各publishではNamespaceとServiceAccount scopeのCacheClassに限りServiceAccountのUIDをAPIへ確認するため、大規模クラスタではpublish量とAPI serverのGET負荷を考慮してください。CSI socketは通常Storeのindex構築とlease recoveryより先に利用可能になり、復旧中の新規publish要求にはbounded fallbackを使います。通常cacheのmetadata異常、共有競合、quota設定失敗、pressure中の新規cache publishでも、volume IDごとに分離したfallback objectへ切り替えます。fallbackは通常fallbackと緊急fallbackに分かれます。CacheClassを解決できない場合は固定の安全な緊急scratchを使い、解決後にprimary backendで失敗した場合はCacheClassの`noExec`を維持します。通常fallbackではvolume attributeの`maxBytes`とNode側の`fallbackVolumeMaxBytes`のうち小さい値をgenerationごとのtmpfs上限にし、予約容量の合計は`fallbackMaxBytes`を超えません。通常fallbackの容量予約やmetadata書き込みが失敗した場合は、独立した`fallbackEmergencyRootDir`上の専用Storeへ切り替えます。緊急fallbackのgeneration容量は全volumeの合計で`fallbackEmergencyMaxBytes`に制限し、volumeごとの上限はvolume attributeの`maxBytes`と`fallbackEmergencyVolumeMaxBytes`の小さい方です。emergencyの集約枠やmetadata用tmpfsが使えない場合は、`fallbackTerminalRootDir`の上限付きtmpfs上にvolume IDごとのscratch directoryを作ります。terminal tierはCSIのread-only指定と解決済みCacheClassの`noExec`を維持し、CacheClassを解決できない場合だけ`noexec`を強制します。terminal tierの書き込み容量は全volumeで共有するtmpfs上限までとなり、上限に達した書き込みは`ENOSPC`になります。fallback mountには常に`nodev`と`nosuid`を付け、fallback用tmpfsのmount伝播に`Bidirectional`を使います。
+CacheClassは各Node pluginのdynamic informer cacheから参照します。PodのNamespace、name、UID、ServiceAccount.nameはCSIの`podInfoOnMount`から取得します。NamespaceとServiceAccountのUIDはNodePublishの解決時にKubernetes APIへGETし、同一objectへの同時GETだけsingleflightで共有します。成功したUIDをTTL cacheへ保存しないため、一時的なAPI障害でidentityを確認できない場合に古いUIDを使わず、NodePublishはエラーになります。NamespaceまたはServiceAccountが存在しない場合やAPI accessが拒否された場合も、設定・権限エラーとしてpublishを拒否します。CacheClass informerのcold start中や通常Storeのlease recovery中も、NodePublishは要求されたcacheを確保できないためエラーになります。NamespaceとServiceAccountのwatchは行わず、CacheClass informerのwatchだけがNode数に比例します。各publishではNamespaceとServiceAccount scopeのCacheClassに限りServiceAccountのUIDをAPIへ確認するため、大規模クラスタではpublish量とAPI serverのGET負荷を考慮してください。
+
+cache object単体のmetadataまたはgeneration構造に破損を検出した場合、Node pluginはそのobjectを再利用対象からatomicにquarantineし、空のgenerationを作成します。この処理が完了すればcache missとしてNodePublishを成功させます。cache rootのread-only化、filesystem I/O error、容量枯渇、安全なdirectory作成・rename・fsyncの失敗、必要なquota機構の障害など、Node全体がcacheを提供できない場合はNodePublishを失敗させ、要求されたcacheが使えると報告しません。要求したquotaに達したcacheは通常どおり`ENOSPC`になります。
+
+Node pluginはNamespace内で`app.kubernetes.io/component=node-health`ラベルを持つLeaseを管理します。Lease annotation `cache.csi.walnuts.dev/node-name`はNode名、`cache.csi.walnuts.dev/state`は`Starting`、`Recovering`、`Ready`、`Degraded`、`Unavailable`のいずれか、`cache.csi.walnuts.dev/reason`は状態の理由、`cache.csi.walnuts.dev/evict`はPod退避の要求を示します。health-controllerは更新期限内のLeaseにある`Ready`または`Degraded`だけを正常提供可能とみなし、Nodeへ`cache.csi.walnuts.dev/ready=true`を設定します。Leaseがない、更新期限を過ぎている、または状態が`Starting`、`Recovering`、`Unavailable`の場合はNode labelを削除します。`Degraded`は一部のobjectや回収処理に問題があるものの、新しいcache generationを正常に提供できる状態です。Leaseの`cache.csi.walnuts.dev/evict`が`true`の場合、health-controllerはそのNode上でCache CSI inline volumeを使うPodへEvictionを要求します。
+
+cache filesystemのpressure時はunused cacheの回収を試みます。回収に失敗しNodeが安全なcacheを提供できなくなった場合、Node pluginはLease stateを`Unavailable`にし、annotation `cache.csi.walnuts.dev/evict=true`を設定します。health-controllerはNode labelを削除し、該当Node上でCache CSI inline volumeを使うPodにKubernetes Eviction APIを呼び出します。Eviction APIはPodDisruptionBudgetを尊重するため、PDBが退避を拒否した場合はPodがNode上に残ることがあります。health-controllerはPodを直接削除せず、PDBを迂回しません。driver recoveryだけが必要な間は`Recovering`で新規配置を止め、既存mountが正常で退避要求がなければ既存Podはそのまま動作します。
 
 NodePublishとNodeUnpublishのtarget pathはkubelet root配下の`pods/<podUID>/volumes/kubernetes.io~csi/<volumeName>/mount`形式に限定し、NodePublishでは`podInfoOnMount`のPod UIDとの一致を検証します。既存path componentのsymbolic link traversalも拒否します。この検証はKubernetes 1.37.1のCSI mounterが生成するinline volume pathに対応しています。CSI socketはkubeletとrootだけがアクセスできるようにしてください。
 
-`preventPodSchedulingIfMissing`は既定で無効です。有効にするとCSI pluginが登録されていないNodeへのPod配置を防ぎますが、Cluster Autoscalerでは`--enable-csi-node-aware-scheduling=true`を設定した場合に有効化を推奨します。Karpenterなど他のautoscalerではCSI-aware schedulingの対応状況を確認してから有効にしてください。
+health-controllerが管理する`cache.csi.walnuts.dev/ready=true` labelを使い、MutatingAdmissionPolicyがCache CSI Podへ標準scheduler向けの`nodeSelector`を自動付与します。`spec.nodeName`を直接指定する手動配置と標準scheduler以外を使うCache CSI PodはAdmission policyで拒否されます。Cluster AutoscalerやKarpenterを使う場合は、ready labelがまだないNodeをautoscalerがCache CSI Podの配置候補として扱い、Node pluginのhealth Leaseが作成されてからPodを配置することを確認してください。Node templateに`cache.csi.walnuts.dev/ready=true`を固定設定すると、health-controllerがLeaseを確認する前にPodが配置されるおそれがあります。クラスター管理者がchartのAdmission policyを削除または置換した場合はこの保証がなくなるため、同等のmutationとvalidationを維持してください。
 
 ## CacheClassとPod volume
 
@@ -75,50 +81,34 @@ spec:
 | `image.repository` | `ghcr.io/walnuts1018/cache-csi-driver` | Node plugin image |
 | `image.tag` | ChartのappVersion | Node plugin image tag |
 | `cacheRootDir` | `/var/lib/cache-csi` | Node上のcache directory |
-| `fallbackRootDir` | `/run/cache-csi/fallback` | Node上の通常fallback Store root。plugin起動時にこのpathへ上限付きtmpfsをmount |
-| `fallbackMaxBytes` | `1Gi` | 全fallback volumeの容量予約上限 |
-| `fallbackVolumeMaxBytes` | `128Mi` | 通常fallback volumeごとの既定上限 |
-| `fallbackEmergencyRootDir` | `/run/cache-csi/fallback-emergency` | 隔離された緊急fallback Store root |
-| `fallbackEmergencyMaxBytes` | `64Mi` | 緊急fallback generationの集約容量上限 |
-| `fallbackEmergencyRootMaxBytes` | `16Mi` | 緊急fallback Store metadata用tmpfsの上限 |
-| `fallbackEmergencyVolumeMaxBytes` | `4Mi` | 緊急fallback volumeごとの容量上限 |
-| `fallbackTerminalRootDir` | `/run/cache-csi/fallback-terminal` | 最終手段のscratch root |
-| `fallbackTerminalRootMaxBytes` | `64Mi` | volume別terminal scratchが共有するtmpfsの上限 |
 | `metrics.port` | `9807` | Prometheus metrics endpointのport |
 | `kubeletRootDir` | `/var/lib/kubelet` | kubeletのroot directory |
 | `gcInterval` | `30s` | retention-based cache GC scan interval |
 | `pressure.highFreePercent` | `25` | cache filesystemの空き容量GC終了水位 |
 | `pressure.lowFreePercent` | `20` | cache filesystemの空き容量GC開始水位 |
-| `pressure.allowPodEviction` | `false` | pressure時のPod Evictionを許可 |
-| `pressure.allowForceDelete` | `false` | critical pressure時にPDBを迂回したPod削除を許可 |
-| `pressure.criticalFreePercent` | `0` | 強制削除を許可する空き容量の危険水位。`0`では無効 |
 | `pressure.highInodeFreePercent` | `15` | cache filesystemの空きinode GC終了水位 |
 | `pressure.lowInodeFreePercent` | `10` | cache filesystemの空きinode GC開始水位 |
-| `pressure.criticalInodeFreePercent` | `0` | 強制削除を許可する空きinodeの危険水位。`0`では無効 |
 | `driver.extraArgs` | `[]` | `--require-cache-root-mountpoint`などのNode plugin追加引数 |
 | `projectIDRange.start` | `2000000000` | XFS project quota用に予約するproject ID範囲の開始値 |
 | `projectIDRange.count` | `1000000` | XFS project quota用に予約するproject IDの個数 |
-| `csiDriver.preventPodSchedulingIfMissing` | `false` | CSI pluginが未登録のNodeへの配置を防止。CSI-aware schedulingに対応したautoscalerでのみ有効化 |
-| `admissionPolicy.enabled` | `true` | 許可ラベルのないnamespaceでのCache CSI利用を拒否 |
 | `admissionPolicy.cacheClassAllowlist.enabled` | `false` | namespace annotationで使用可能なCacheClassを制限 |
 | `admissionPolicy.cacheClassAllowlist.annotationKey` | `cache.storage.walnuts.dev/allowed-cache-classes` | CacheClass allowlistを保持するnamespace annotation |
-| `rbac.createPodEvictions` | `false` | `pressurePolicy: Evict`用のPod Eviction権限 |
-| `rbac.deletePodsAtCriticalPressure` | `false` | critical pressure時に直接Pod削除を許可 |
 | `nodeSelector` | `kubernetes.io/os: linux` | DaemonSetを配置するNode |
+| `healthController.resources` | requests `25m`/`64Mi`, limits `250m`/`256Mi` | health-controller Deploymentのresources |
+| `healthController.nodeSelector` | `kubernetes.io/os: linux` | health-controller Deploymentを配置するNode |
+| `healthController.tolerations` | `operator: Exists` | health-controller Deploymentのtolerations |
 
-Node pluginは`metrics.port`で`/metrics`を公開し、PodにはPrometheus scrape annotationを既定で付けます。metricsにはpublish結果、fallback原因、pressure状態、cache object数、degraded object数、fallback予約容量、trash削除数、Pod eviction結果、recovery時間を含みます。予期しないprimary backend障害が起きると`cache_csi_backend_degraded`を`1`にし、CSI storage healthもDegradedとして報告します。この状態はplugin processの起動中は保持され、別cacheのpublish成功では解除されません。
+Node pluginは`metrics.port`で`/metrics`を公開し、Node DaemonSet PodにはPrometheus scrape annotationを既定で付けます。Node plugin readiness probeは同じportの`/readyz`を確認します。health-controllerはNode health Leaseの状態と更新時刻に基づいて、schedulerが参照するNode labelを管理します。
 
 各cache identityの`.cache-csi.json`がlease、generation、policyの正本です。`.project-ids.json`はmetadataから再構築できるproject ID予約indexであり、registryが見つからない場合はmetadataとtrash entryから再構築します。metadata commit後にindexの永続化が失敗してもCSI operationは成功し、CSI storage healthをDegradedとして報告してbackground collectorが永続化を再試行します。registryの内容が壊れて予約状態を特定できない場合は、既存project IDの誤再利用を防ぐためXFS project quotaの新規割り当てを停止し、registryを自動上書きしません。
 
 `CacheClass.spec.storage.maxBytes`は、各cache identityに対してvolume側が要求できるquota上限です。`storage.backend: xfs-project`を指定し、volume attributeの`maxBytes`がこの上限を超える場合はmount要求を拒否します。volume attributeに`maxBytes`がない場合は`storage.defaultMaxBytes`を使い、未設定なら`storage.maxBytes`を使います。`xfs-project` backendにはどちらかの上限が必要です。`directory` backendではquota上限を指定できません。`examples/cacheclass-xfs-project.yaml`と`examples/pod-inline-cache-xfs-project.yaml`に設定例があります。
 
-pressure watermarksはCacheClassごとではなく、各Nodeの`cacheRootDir`が属するfilesystem全体に適用します。同じfilesystem上の他用途のデータ増加でもCache CSIのGCとPod evictionが始まるため、cache専用filesystemを推奨します。`--require-cache-root-mountpoint=true`を`driver.extraArgs`に指定すると、`cacheRootDir`が親directoryと異なるmount IDを持つfilesystem mount pointであることを起動時に検証します。この検証はfilesystemがCache CSI専用であることまでは保証しません。軽量なpressure monitorは`gcInterval`とは別に3秒ごとに空き容量とinodeを確認し、回収workerへ処理を依頼します。retention GC、degraded recovery、pressure reclaimは別workerで実行するため、大量のtrash削除中もwatermark監視を継続します。開始水位を下回ると未使用cacheを物理削除して終了水位までの回復を試みます。pressure中は、新しいCSI leaseによる通常cacheのpublishを止めてbounded fallbackへ切り替えます。既にmount済みのPodによる書き込みは継続するため、`directory` backendだけではfilesystemを満杯から守るhard limitを保証できません。`xfs-project` quotaとcache専用filesystemを推奨します。`retention`は未使用cacheの保持期間で、省略時はAPI serverのdefaultである`72h`です。明示的な`0s`ではretentionを理由にした回収を無効にしますが、pressure時の回収対象にはなります。`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
-
-`CacheClass.spec.pressurePolicy`の既定値`UnusedOnly`ではactive Podを終了させません。`Evict`は未使用cacheを回収した後もglobal pressureが続く場合にKubernetes Eviction APIで退去を要求します。Pod退去は既定で無効です。有効にする場合はHelm valuesの`pressure.allowPodEviction=true`と`rbac.createPodEvictions=true`の両方を指定してください。Eviction APIはPodDisruptionBudgetを尊重するため、拒否された場合やPodが退去しない場合にcacheの回収は保証されません。`ForceDelete`も通常pressure時には同じEviction APIを使うため、同じ2つの設定が必要です。`pressure.criticalFreePercent`または`pressure.criticalInodeFreePercent`で設定した、開始水位より低い危険水位を下回り、さらにHelm valuesの`pressure.allowForceDelete=true`が明示された場合だけUID precondition付きのPod Deleteをgrace period 0で要求します。直接削除はPodDisruptionBudgetを迂回します。既定の危険水位は`0`で無効であり、force delete gateとRBACも既定で無効です。直接削除を有効にする場合はHelm valuesの`pressure.allowPodEviction=true`、`pressure.allowForceDelete=true`、`rbac.createPodEvictions=true`、`rbac.deletePodsAtCriticalPressure=true`を指定してください。HelmはgateとRBACの不整合を検出して失敗します。`pressure.allowForceDelete`が無効の場合は、critical pressureでもPodDisruptionBudgetを尊重するEvictionへ切り替わります。必要なPodへのtermination要求より先にcache generationを退役させ、後続Podには空の新世代を割り当てます。退役世代は最後のleaseが解放されるまで保持します。
+pressure watermarksはCacheClassごとではなく、各Nodeの`cacheRootDir`が属するfilesystem全体に適用します。同じfilesystem上の他用途のデータ増加でもCache CSIのGCとNode health stateの変更が始まるため、cache専用filesystemを推奨します。`--require-cache-root-mountpoint=true`を`driver.extraArgs`に指定すると、`cacheRootDir`が親directoryと異なるmount IDを持つfilesystem mount pointであることを起動時に検証します。この検証はfilesystemがCache CSI専用であることまでは保証しません。軽量なpressure monitorは`gcInterval`とは別に3秒ごとに空き容量とinodeを確認し、回収workerへ処理を依頼します。retention GC、degraded recovery、pressure reclaimは別workerで実行するため、大量のtrash削除中もwatermark監視を継続します。開始水位を下回るとunused cacheの物理削除を行い、終了水位までの回復を試みます。回収後も安全なcacheを提供できない状態が続く場合、Node pluginはhealth Leaseを`Unavailable`にしてPod退避を要求します。health-controllerはNodeを新規配置の対象から外し、該当Node上でCache CSI volumeを使うPodへPodDisruptionBudgetを尊重するEvictionを要求します。EvictionがPDBに拒否された場合、PodはNode上に残ることがあります。既にmount済みのPodの書き込みは継続するため、`directory` backendだけではfilesystem全体が満杯になる前に必ず回収できるとは限りません。`xfs-project` quotaとcache専用filesystemを推奨します。個別cacheのquota到達はそのcacheだけの`ENOSPC`であり、Node health stateや他のPodの配置には影響しません。`retention`は未使用cacheの保持期間で、省略時はAPI serverのdefaultである`72h`です。明示的な`0s`ではretentionを理由にした回収を無効にしますが、pressure時の回収対象にはなります。`crashRecovery`はNode再起動後に未完了だったgenerationの扱いです。`noExec`を有効にするとcache volumeを`noexec`でmountします。
 
 `sharingPolicy`の既定値は`Exclusive`です。`Shared`を明示する場合、同じ`cacheKey`を使うPod同士で書き込みを調整し、cache実装が複数プロセスからの同時アクセスに対応している必要があります。再利用したファイルのmodeによってはUID/GIDが異なるPodから書き込めないため、実効UID/GIDも揃えてください。`scope`はcache identityのcollisionと分離の範囲を決める設定であり、認可やsecurity boundaryではありません。既定の`ServiceAccount` scopeではServiceAccount UIDごとにidentityが分かれますが、Pod作成権限を持つ利用者が任意の`serviceAccountName`を指定できる環境では、これだけでtenant間の認可は保証されません。tenantごとの認可が必要な場合は、Podの`spec.serviceAccountName`を許可された値に制限するAdmission policyなどを別途設定してください。`scope: Namespace`は同一Namespace内のすべてのServiceAccountで同じidentityを使うため、意図的にその範囲でcacheを共有する場合に指定します。
 
-generation作成時の有効policyはmetadataにsnapshotとして保存し、そのhashも記録します。identityに属するすべてのgenerationのleaseがある間はcurrent generationのsnapshotを維持します。CacheClass specの変更後は、identityのleaseがすべてなくなった後の次のpublishでhashを比較し、idle generationを回収して新policyのgenerationへ移行します。新policyが適用されるまで既存leaseが使うgenerationのretention、sharing、pressure、crash recovery、quotaは変わりません。quotaが異なるpublishはidentity内のleaseが残る間fallbackへ切り替わります。`schemaVersion`はアプリケーションのcache format互換性を変更するときに更新してください。
+generation作成時の有効policyはmetadataにsnapshotとして保存し、そのhashも記録します。identityに属するすべてのgenerationのleaseがある間はcurrent generationのsnapshotを維持します。CacheClass specの変更後は、identityのleaseがすべてなくなった後の次のpublishでhashを比較し、idle generationを回収して新policyのgenerationへ移行します。新policyが適用されるまで既存leaseが使うgenerationのretention、sharing、pressure、crash recovery、quotaは変わりません。active leaseが残る間にquotaの異なるpublish要求がある場合は、その要求を失敗させます。`schemaVersion`はアプリケーションのcache format互換性を変更するときに更新してください。
 
 NodeGetVolumeStatsとCSIの`GET_VOLUME_STATS` capabilityはadvertiseしません。directory backendではvolumeごとの正確なcapacityとavailableを取得できず、recursive size scanはlarge cacheでpressure pathに影響するためです。filesystem全体のcapacityをvolume単位の値として返すことはせず、cache usage semanticsを定義できた段階で実装します。
 

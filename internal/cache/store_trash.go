@@ -291,7 +291,6 @@ func (s *Store) restoreObjectTrashReservation(identity, trashID string) error {
 
 func (s *Store) indexObjectInTrash(identity, trashID string, meta Metadata) {
 	if previous, exists := s.generationManager.metadataByIdentity[identity]; exists {
-		s.removeFallbackReservation(previous)
 		s.generationManager.retiredGenerationCount -= len(previous.Retired)
 	}
 	delete(s.generationManager.metadataByIdentity, identity)

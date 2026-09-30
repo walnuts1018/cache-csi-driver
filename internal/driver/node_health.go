@@ -8,6 +8,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 	"github.com/walnuts1018/cache-csi-driver/internal/kubeletcompat"
+	"github.com/walnuts1018/cache-csi-driver/internal/nodehealth"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -16,43 +17,21 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
-	if filepath.IsAbs(req.GetVolumePublishPath()) {
-		if _, ok := kubeletcompat.ParsePodTarget(s.options.KubeletRoot, req.GetVolumePublishPath()); ok {
-			terminalSame, err := s.terminalFallbackMount(req.GetVolumeId(), req.GetVolumePublishPath())
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "verify terminal fallback mount: %v", err)
-			}
-			if terminalSame {
-				return &csi.NodeGetVolumeHealthResponse{VolumeHealth: &csi.VolumeHealth{VolumeId: req.GetVolumeId()}}, nil
-			}
-		}
-	}
 	_, lease, source, _, found, err := s.store.LeaseDetails(req.GetVolumeId())
-	metadataDegraded := false
-	if err != nil {
-		if errors.Is(err, cache.ErrDegradedMetadata) {
-			metadataDegraded = true
-		} else {
-			return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
+	if errors.Is(err, cache.ErrDegradedMetadata) {
+		if filepath.IsAbs(req.GetVolumePublishPath()) {
+			_, _, degraded, findErr := s.store.FindDegradedGenerationForTarget(req.GetVolumePublishPath(), s.mounter.sameCacheSource)
+			if findErr != nil {
+				return nil, status.Errorf(codes.Internal, "inspect degraded cache mount: %v", findErr)
+			}
+			if degraded {
+				return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
+			}
 		}
+		return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
 	}
-	if !found {
-		for _, fallbackStore := range s.fallbackStores() {
-			_, fallbackLease, fallbackSource, _, fallbackFound, fallbackErr := fallbackStore.LeaseDetails(req.GetVolumeId())
-			if errors.Is(fallbackErr, cache.ErrDegradedMetadata) {
-				metadataDegraded = true
-				continue
-			}
-			if fallbackErr != nil {
-				return nil, status.Errorf(codes.Internal, "read fallback cache lease: %v", fallbackErr)
-			}
-			if fallbackFound {
-				lease = fallbackLease
-				source = fallbackSource
-				found = true
-				break
-			}
-		}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read cache lease: %v", err)
 	}
 	if !found {
 		if !filepath.IsAbs(req.GetVolumePublishPath()) {
@@ -61,11 +40,15 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 		if _, ok := kubeletcompat.ParsePodTarget(s.options.KubeletRoot, req.GetVolumePublishPath()); !ok {
 			return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeLeaseMissing", "cache volume publish path is invalid")}, nil
 		}
-		lease.Target = req.GetVolumePublishPath()
-		if metadataDegraded {
+		if _, _, degraded, findErr := s.store.FindDegradedGenerationForTarget(req.GetVolumePublishPath(), s.mounter.sameCacheSource); findErr != nil {
+			return nil, status.Errorf(codes.Internal, "inspect degraded cache mount: %v", findErr)
+		} else if degraded {
 			return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
 		}
-		source = fallbackPath(s.options.FallbackRoot, req.GetVolumeId())
+		return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeLeaseMissing", "cache volume lease is missing")}, nil
+	}
+	if filepath.IsAbs(req.GetVolumePublishPath()) && req.GetVolumePublishPath() != lease.Target {
+		return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeTargetMismatch", "cache volume publish path does not match its lease")}, nil
 	}
 	mounted, err := s.mounter.mountedAt(lease.Target)
 	if err != nil {
@@ -74,31 +57,7 @@ func (s *Server) NodeGetVolumeHealth(_ context.Context, req *csi.NodeGetVolumeHe
 	if !mounted {
 		return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMountMissing", "cache volume mount is missing")}, nil
 	}
-	var same bool
-	if found {
-		same, err = s.mounter.sameCacheMount(source, lease.Target, lease.ReadOnly, lease.NoExec)
-	} else {
-		stores := append([]*cache.Store{s.store}, s.fallbackStores()...)
-		for _, store := range stores {
-			if store == nil {
-				continue
-			}
-			_, _, degraded, err := store.FindDegradedGenerationForTarget(lease.Target, s.mounter.sameCacheSource)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "inspect degraded cache mount: %v", err)
-			}
-			if degraded {
-				return &csi.NodeGetVolumeHealthResponse{VolumeHealth: unhealthyVolume(req.GetVolumeId(), "VolumeMetadataUnreadable", "cache volume metadata is unreadable")}, nil
-			}
-		}
-		for _, fallbackStore := range s.fallbackStores() {
-			source = fallbackPath(s.fallbackRootForStore(fallbackStore), req.GetVolumeId())
-			same, err = s.mounter.sameCacheSource(source, lease.Target)
-			if err != nil || same {
-				break
-			}
-		}
-	}
+	same, err := s.mounter.sameCacheMount(source, lease.Target, lease.ReadOnly, lease.NoExec)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "verify cache mount: %v", err)
 	}
@@ -113,73 +72,37 @@ func unhealthyVolume(volumeID, reason, message string) *csi.VolumeHealth {
 }
 
 func (s *Server) NodeGetStorageHealth(context.Context, *csi.NodeGetStorageHealthRequest) (*csi.NodeGetStorageHealthResponse, error) {
+	snapshot := s.options.Health.Current()
+	switch snapshot.Phase {
+	case nodehealth.PhaseStarting, nodehealth.PhaseRecovering:
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, string(snapshot.Phase), snapshot.Reason)
+	case nodehealth.PhaseUnavailable:
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, snapshot.Reason, "cache node is unavailable")
+	case nodehealth.PhaseDegraded:
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, snapshot.Reason, "cache node is degraded")
+	}
 	if !s.store.Ready() {
 		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheRecoveryInProgress", "cache store recovery is still in progress")
 	}
-	if s.backendDegraded.Load() {
-		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheBackendOperationFailed", "a cache backend operation failed since plugin startup; CSI publishes keep verified mounts active and use fallback when possible")
-	}
-	backends := []struct {
-		store             *cache.Store
-		recoveryReason    string
-		unavailableReason string
-		readOnlyReason    string
-		registryReason    string
-		name              string
-	}{
-		{
-			store:             s.store,
-			recoveryReason:    "CacheRecoveryInProgress",
-			unavailableReason: "CacheRootUnavailable",
-			readOnlyReason:    "CacheRootReadOnly",
-			registryReason:    "CacheProjectIDRegistryUnavailable",
-			name:              "cache",
-		},
-		{
-			store:             s.fallbackStore,
-			recoveryReason:    "FallbackRecoveryInProgress",
-			unavailableReason: "FallbackRootUnavailable",
-			readOnlyReason:    "FallbackRootReadOnly",
-			registryReason:    "FallbackProjectIDRegistryUnavailable",
-			name:              "fallback cache",
-		},
-		{
-			store:             s.emergencyStore,
-			recoveryReason:    "EmergencyFallbackRecoveryInProgress",
-			unavailableReason: "EmergencyFallbackRootUnavailable",
-			readOnlyReason:    "EmergencyFallbackRootReadOnly",
-			registryReason:    "EmergencyFallbackProjectIDRegistryUnavailable",
-			name:              "emergency fallback cache",
-		},
-	}
-	for _, backend := range backends {
-		if backend.store == nil {
-			continue
-		}
-		if !backend.store.Ready() {
-			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, backend.recoveryReason, backend.name+" store recovery is still in progress")
-		}
-		readOnly, err := s.mounter.filesystemReadOnly(backend.store.Root())
-		if err != nil {
-			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, backend.unavailableReason, backend.name+" filesystem cannot be inspected")
-		}
-		if readOnly {
-			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, backend.readOnlyReason, backend.name+" filesystem is read-only")
-		}
-		if err := backend.store.ProjectRegistryError(); err != nil {
-			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, backend.registryReason, backend.name+" project ID registry is unavailable")
-		}
-	}
-	terminalReadOnly, err := s.mounter.filesystemReadOnly(s.options.FallbackTerminalRoot)
+	readOnly, err := s.mounter.filesystemReadOnly(s.store.Root())
 	if err != nil {
-		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, "TerminalFallbackRootUnavailable", "terminal fallback filesystem cannot be inspected")
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, "CacheRootUnavailable", "cache filesystem cannot be inspected")
 	}
-	if terminalReadOnly {
-		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "TerminalFallbackRootReadOnly", "terminal fallback filesystem is read-only")
+	if readOnly {
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_UNREACHABLE, "CacheRootReadOnly", "cache filesystem is read-only")
+	}
+	if err := s.store.ProjectRegistryError(); err != nil {
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheProjectIDRegistryUnavailable", "cache project ID registry is unavailable")
+	}
+	if err := s.store.MetadataError(); err != nil {
+		if errors.Is(err, cache.ErrDegradedMetadata) {
+			return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheObjectDegraded", "one or more cache objects are being recovered")
+		}
+		return storageHealthResponse(csi.StorageHealthErrorType_STORAGE_DEGRADED, "CacheMetadataUnavailable", "cache metadata is unavailable")
 	}
 	return &csi.NodeGetStorageHealthResponse{}, nil
 }
 
-func storageHealthResponse(status csi.StorageHealthErrorType, reason, message string) (*csi.NodeGetStorageHealthResponse, error) {
-	return &csi.NodeGetStorageHealthResponse{BackendHealth: []*csi.NodeGetStorageHealthResponse_StorageBackendHealth{{Status: status, Reason: reason, Message: message}}}, nil
+func storageHealthResponse(statusCode csi.StorageHealthErrorType, reason, message string) (*csi.NodeGetStorageHealthResponse, error) {
+	return &csi.NodeGetStorageHealthResponse{BackendHealth: []*csi.NodeGetStorageHealthResponse_StorageBackendHealth{{Status: statusCode, Reason: reason, Message: message}}}, nil
 }

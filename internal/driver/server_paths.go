@@ -1,8 +1,6 @@
 package driver
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -78,52 +76,6 @@ func makeTargetDirectory(path string) error {
 	return nil
 }
 
-func makeTerminalFallbackDirectory(root, volumeID string) (string, error) {
-	root = filepath.Clean(root)
-	if !filepath.IsAbs(root) || volumeID == "" {
-		return "", errors.New("terminal fallback source path is invalid")
-	}
-	path := fallbackPath(root, volumeID)
-	rootInfo, err := os.Lstat(root)
-	if err != nil {
-		return "", err
-	}
-	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
-		return "", errors.New("terminal fallback root is not a real directory")
-	}
-	if err := os.Mkdir(path, 0o777); err != nil && !errors.Is(err, os.ErrExist) {
-		return "", err
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return "", err
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return "", errors.New("terminal fallback source is not a real directory")
-	}
-	if err := os.Chmod(path, 0o777); err != nil {
-		return "", err
-	}
-	return path, nil
-}
-
-func resetTerminalFallbackDirectory(root, volumeID string) error {
-	path, err := makeTerminalFallbackDirectory(root, volumeID)
-	if err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(path, entry.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func removeTargetDirectory(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -139,9 +91,4 @@ func removeTargetDirectory(path string) error {
 		return err
 	}
 	return nil
-}
-
-func fallbackPath(root, volumeID string) string {
-	hash := sha256.Sum256([]byte(volumeID))
-	return filepath.Join(root, hex.EncodeToString(hash[:]))
 }

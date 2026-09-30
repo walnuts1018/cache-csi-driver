@@ -18,9 +18,6 @@ func (spec CacheClassSpec) Validate() error {
 	if err := spec.validateScope(); err != nil {
 		return err
 	}
-	if err := spec.validatePressurePolicy(); err != nil {
-		return err
-	}
 	if spec.Retention.Duration < 0 {
 		return fmt.Errorf("retention must not be negative")
 	}
@@ -29,16 +26,6 @@ func (spec CacheClassSpec) Validate() error {
 	}
 	return nil
 }
-
-func (spec CacheClassSpec) validatePressurePolicy() error {
-	switch spec.PressurePolicy {
-	case "", PressurePolicyUnused, PressurePolicyEvict, PressurePolicyForce:
-		return nil
-	default:
-		return fmt.Errorf("unsupported pressurePolicy %q", spec.PressurePolicy)
-	}
-}
-
 func (spec CacheClassSpec) validateScope() error {
 	switch spec.Scope {
 	case "", ScopeServiceAccount, ScopeNamespace:

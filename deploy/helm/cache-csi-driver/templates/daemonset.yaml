@@ -1,4 +1,3 @@
-{{- include "cache-csi-driver.validatePressureSettings" . -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -39,26 +38,13 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --metrics-address=:{{ .Values.metrics.port }}
             - --cache-root={{ .Values.cacheRootDir }}
-            - --fallback-root={{ .Values.fallbackRootDir }}
-            - --fallback-max-bytes={{ .Values.fallbackMaxBytes }}
-            - --fallback-volume-max-bytes={{ .Values.fallbackVolumeMaxBytes }}
-            - --fallback-emergency-root={{ .Values.fallbackEmergencyRootDir }}
-            - --fallback-emergency-max-bytes={{ .Values.fallbackEmergencyMaxBytes }}
-            - --fallback-emergency-root-max-bytes={{ .Values.fallbackEmergencyRootMaxBytes }}
-            - --fallback-emergency-volume-max-bytes={{ .Values.fallbackEmergencyVolumeMaxBytes }}
-            - --fallback-terminal-root={{ .Values.fallbackTerminalRootDir }}
-            - --fallback-terminal-root-max-bytes={{ .Values.fallbackTerminalRootMaxBytes }}
             - --node-id=$(NODE_NAME)
             - --kubelet-root={{ .Values.kubeletRootDir }}
             - --gc-interval={{ .Values.gcInterval }}
-            - --allow-pod-eviction={{ .Values.pressure.allowPodEviction }}
-            - --allow-force-delete={{ .Values.pressure.allowForceDelete }}
             - --pressure-high-free-percent={{ .Values.pressure.highFreePercent }}
             - --pressure-low-free-percent={{ .Values.pressure.lowFreePercent }}
-            - --pressure-critical-free-percent={{ .Values.pressure.criticalFreePercent }}
             - --pressure-high-inode-free-percent={{ .Values.pressure.highInodeFreePercent }}
             - --pressure-low-inode-free-percent={{ .Values.pressure.lowInodeFreePercent }}
-            - --pressure-critical-inode-free-percent={{ .Values.pressure.criticalInodeFreePercent }}
             - --project-id-start={{ .Values.projectIDRange.start | int64 }}
             - --project-id-count={{ .Values.projectIDRange.count | int64 }}
             {{- with .Values.driver.extraArgs }}
@@ -69,6 +55,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           securityContext:
             privileged: true
             runAsUser: 0
@@ -90,8 +80,8 @@ spec:
             failureThreshold: {{ .Values.driver.livenessProbe.failureThreshold }}
           readinessProbe:
             httpGet:
-              path: /healthz
-              port: 9808
+              path: /readyz
+              port: metrics
             periodSeconds: 10
             timeoutSeconds: 5
           volumeMounts:
@@ -102,15 +92,6 @@ spec:
               mountPropagation: Bidirectional
             - name: cache-root
               mountPath: {{ .Values.cacheRootDir }}
-            - name: fallback-root
-              mountPath: {{ .Values.fallbackRootDir }}
-              mountPropagation: Bidirectional
-            - name: fallback-emergency-root
-              mountPath: {{ .Values.fallbackEmergencyRootDir }}
-              mountPropagation: Bidirectional
-            - name: fallback-terminal-root
-              mountPath: {{ .Values.fallbackTerminalRootDir }}
-              mountPropagation: Bidirectional
             - name: tmp
               mountPath: /tmp
             - name: kube-api-access
@@ -173,18 +154,6 @@ spec:
         - name: cache-root
           hostPath:
             path: {{ .Values.cacheRootDir }}
-            type: DirectoryOrCreate
-        - name: fallback-root
-          hostPath:
-            path: {{ .Values.fallbackRootDir }}
-            type: DirectoryOrCreate
-        - name: fallback-emergency-root
-          hostPath:
-            path: {{ .Values.fallbackEmergencyRootDir }}
-            type: DirectoryOrCreate
-        - name: fallback-terminal-root
-          hostPath:
-            path: {{ .Values.fallbackTerminalRootDir }}
             type: DirectoryOrCreate
         - name: tmp
           emptyDir:

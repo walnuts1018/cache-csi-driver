@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ printf "%s-cacheclass-reader" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cacheclass-reader") }}
   labels:
     {{- include "cache-csi-driver.labels" . | nindent 4 }}
 rules:
@@ -20,34 +20,133 @@ rules:
       - serviceaccounts
     verbs:
       - get
-  {{- if .Values.rbac.createPodEvictions }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cacheclass-reader") }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cacheclass-reader") }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cache-csi-driver.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "node-health-agent") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - get
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "node-health-agent") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "node-health-agent") }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cache-csi-driver.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller-leases") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - get
+      - list
+      - update
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller-leases") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller-leases") }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cache-csi-driver.healthControllerServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller") }}
+  labels:
+    {{- include "cache-csi-driver.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - ""
     resources:
       - pods/eviction
     verbs:
       - create
-  {{- end }}
-  {{- if .Values.rbac.deletePodsAtCriticalPressure }}
-  - apiGroups:
-      - ""
-    resources:
-      - pods
-    verbs:
-      - delete
-  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ printf "%s-cacheclass-reader" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller") }}
   labels:
     {{- include "cache-csi-driver.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ printf "%s-cacheclass-reader" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "health-controller") }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "cache-csi-driver.serviceAccountName" . }}
+    name: {{ include "cache-csi-driver.healthControllerServiceAccountName" . }}
     namespace: {{ .Release.Namespace }}

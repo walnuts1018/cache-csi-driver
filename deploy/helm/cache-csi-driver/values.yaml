@@ -8,50 +8,42 @@ nameOverride: ""
 fullnameOverride: ""
 
 cacheRootDir: /var/lib/cache-csi
-fallbackRootDir: /run/cache-csi/fallback
-fallbackMaxBytes: 1Gi
-fallbackVolumeMaxBytes: 128Mi
-fallbackEmergencyRootDir: /run/cache-csi/fallback-emergency
-fallbackEmergencyMaxBytes: 64Mi
-fallbackEmergencyRootMaxBytes: 16Mi
-fallbackEmergencyVolumeMaxBytes: 4Mi
-fallbackTerminalRootDir: /run/cache-csi/fallback-terminal
-fallbackTerminalRootMaxBytes: 64Mi
 metrics:
   port: 9807
 kubeletRootDir: /var/lib/kubelet
 gcInterval: 30s
 pressure:
-  allowPodEviction: false
-  allowForceDelete: false
   highFreePercent: 25
   lowFreePercent: 20
-  criticalFreePercent: 0
   highInodeFreePercent: 15
   lowInodeFreePercent: 10
-  criticalInodeFreePercent: 0
 projectIDRange:
   start: 2000000000
   count: 1000000
 
-csiDriver:
-  # CSI-aware schedulingを有効にしたCluster Autoscalerではtrueを推奨します。KarpenterなどではCSI-aware schedulingへの対応を確認してから有効化してください。
-  preventPodSchedulingIfMissing: false
-
 admissionPolicy:
-  enabled: true
   cacheClassAllowlist:
     enabled: false
     annotationKey: cache.storage.walnuts.dev/allowed-cache-classes
-
-rbac:
-  createPodEvictions: false
-  deletePodsAtCriticalPressure: false
 
 serviceAccount:
   create: true
   annotations: {}
   name: ""
+
+healthController:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - operator: Exists
 
 podAnnotations: {}
 priorityClassName: system-node-critical

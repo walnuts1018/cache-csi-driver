@@ -9,7 +9,6 @@ type CacheBackend string
 type CrashRecoveryPolicy string
 type SharingPolicy string
 type CacheScope string
-type PressurePolicy string
 
 const (
 	BackendDirectory       CacheBackend        = "directory"
@@ -20,9 +19,6 @@ const (
 	SharingPolicyExclusive SharingPolicy       = "Exclusive"
 	ScopeServiceAccount    CacheScope          = "ServiceAccount"
 	ScopeNamespace         CacheScope          = "Namespace"
-	PressurePolicyUnused   PressurePolicy      = "UnusedOnly"
-	PressurePolicyEvict    PressurePolicy      = "Evict"
-	PressurePolicyForce    PressurePolicy      = "ForceDelete"
 )
 
 // CacheClassSpec defines storage and reuse behavior for node-local cache generations.
@@ -49,10 +45,6 @@ type CacheClassSpec struct {
 	// +kubebuilder:default=ServiceAccount
 	// +kubebuilder:validation:Enum=ServiceAccount;Namespace
 	Scope CacheScope `json:"scope,omitempty"`
-	// Policy for active cache generations during filesystem pressure. ForceDelete requires the node's critical pressure watermark and explicit Pod delete RBAC.
-	// +kubebuilder:default=UnusedOnly
-	// +kubebuilder:validation:Enum=UnusedOnly;Evict;ForceDelete
-	PressurePolicy PressurePolicy `json:"pressurePolicy,omitempty"`
 	// Mounts cache generations with execution disabled.
 	NoExec bool `json:"noExec,omitempty"`
 }

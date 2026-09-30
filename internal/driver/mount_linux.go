@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 
 	mobyMountinfo "github.com/moby/sys/mountinfo"
@@ -24,14 +23,6 @@ func newMounter() mounter { return systemMounter{} }
 
 func (systemMounter) mount(source, target string, readOnly, noExec bool) error {
 	return mount(source, target, readOnly, noExec)
-}
-
-func (systemMounter) prepareFallback(path string, maxBytes int64, noExec bool) error {
-	return prepareFallbackGeneration(path, maxBytes, noExec)
-}
-
-func (systemMounter) unmountGeneration(path string) error {
-	return UnmountFallbackGeneration(path)
 }
 
 func (systemMounter) unmount(target string) error { return unmount(target) }
@@ -242,7 +233,7 @@ func sourceMounted(source string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	mounts, err := mountinfo.GetMounts(nil)
+	mounts, err := mobyMountinfo.GetMounts(nil)
 	if err != nil {
 		return false, err
 	}
@@ -310,75 +301,4 @@ func filesystemReadOnly(path string) (bool, error) {
 		return false, err
 	}
 	return stat.Flags&unix.ST_RDONLY != 0, nil
-}
-
-func UnmountFallbackGeneration(path string) error {
-	return unmountFallbackGeneration(path)
-}
-
-func prepareFallbackGeneration(path string, maxBytes int64, noExec bool) error {
-	if maxBytes <= 0 {
-		return errors.New("fallback generation size must be positive")
-	}
-	mount, mounted, err := generationMountAt(path)
-	if err != nil {
-		return err
-	}
-	if mounted {
-		if mount.FSType != "tmpfs" {
-			return errors.New("fallback generation is mounted with an unexpected filesystem or size")
-		}
-		options := strings.Split(mount.Options, ",")
-		if !slices.Contains(options, "nodev") || !slices.Contains(options, "nosuid") || slices.Contains(options, "noexec") != noExec {
-			return errors.New("fallback generation mount options do not match its cache policy")
-		}
-		return verifyFallbackGenerationCapacity(path, maxBytes)
-	}
-	flags := uintptr(unix.MS_NODEV | unix.MS_NOSUID)
-	if noExec {
-		flags |= unix.MS_NOEXEC
-	}
-	options := "size=" + strconv.FormatInt(maxBytes, 10) + ",mode=0777"
-	if err := unix.Mount("tmpfs", path, "tmpfs", flags, options); err != nil {
-		return fmt.Errorf("mount bounded fallback generation: %w", err)
-	}
-	return verifyFallbackGenerationCapacity(path, maxBytes)
-}
-
-func verifyFallbackGenerationCapacity(path string, maxBytes int64) error {
-	var usage unix.Statfs_t
-	if err := unix.Statfs(path, &usage); err != nil {
-		return fmt.Errorf("inspect bounded fallback generation: %w", err)
-	}
-	capacity := uint64(usage.Blocks) * uint64(usage.Bsize)
-	if capacity > uint64(maxBytes) {
-		return fmt.Errorf("fallback generation capacity %d exceeds configured maximum %d", capacity, maxBytes)
-	}
-	return nil
-}
-
-func unmountFallbackGeneration(path string) error {
-	mount, mounted, err := generationMountAt(path)
-	if err != nil || !mounted {
-		return err
-	}
-	if mount.FSType != "tmpfs" {
-		return fmt.Errorf("refusing to unmount unexpected fallback filesystem %q", mount.FSType)
-	}
-	if err := unix.Unmount(path, 0); err != nil {
-		return fmt.Errorf("unmount bounded fallback generation: %w", err)
-	}
-	return nil
-}
-
-func generationMountAt(path string) (*mobyMountinfo.Info, bool, error) {
-	mounts, err := mounttable.AtPath(path)
-	if err != nil {
-		return nil, false, err
-	}
-	top, err := mounttable.Top(mounts)
-	if err != nil {
-		return nil, false, err
-	}
-	return top, top != nil, nil
 }
