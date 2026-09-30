@@ -72,6 +72,17 @@ func (s *Store) Collect(now time.Time) error {
 	return nil
 }
 
+func (s *Store) ObservePressure() (bool, error) {
+	usage, err := filesystemUsage(s.metadataRepository.root)
+	if err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	active := s.updatePressure(usage)
+	s.mu.Unlock()
+	return active, nil
+}
+
 func (s *Store) ReclaimPressure(ctx context.Context) error {
 	attemptedTrash := make(map[string]struct{})
 	var incomplete error

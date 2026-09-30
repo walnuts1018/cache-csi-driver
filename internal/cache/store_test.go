@@ -1026,7 +1026,7 @@ func assertDegradedObjectRetained(t *testing.T, store *Store, identity, source, 
 	if err != nil || !found || foundIdentity != identity || foundSource != source {
 		t.Fatalf("degraded source lookup = (%q, %q, %v, %v)", foundIdentity, foundSource, found, err)
 	}
-	err = store.CleanupDegradedObject(identity, func(string) (bool, error) {
+	err = store.QuarantineDegradedObject(identity, func(string) (bool, error) {
 		if inspectErr {
 			return false, errors.New("mount inspection failed")
 		}
@@ -1041,7 +1041,7 @@ func assertDegradedObjectRetained(t *testing.T, store *Store, identity, source, 
 	if _, err := os.Stat(entry); err != nil {
 		t.Fatalf("degraded object was removed while a generation remained mounted: %v", err)
 	}
-	if err := store.CleanupDegradedObject(identity, func(string) (bool, error) { return false, nil }); err != nil {
+	if err := store.QuarantineDegradedObject(identity, func(string) (bool, error) { return false, nil }); err != nil {
 		t.Fatal(err)
 	}
 }

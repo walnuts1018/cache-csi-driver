@@ -219,7 +219,7 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 	return matchedIdentity, matchedSource, matchedIdentity != "", nil
 }
 
-func (s *Store) CleanupDegradedObject(identity string, sourceMounted func(source string) (bool, error)) error {
+func (s *Store) QuarantineDegradedObject(identity string, sourceMounted func(source string) (bool, error)) error {
 	if !validIdentity(identity) || sourceMounted == nil {
 		return errors.New("valid degraded cache identity and mount inspector are required")
 	}

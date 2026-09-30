@@ -51,6 +51,8 @@ if [ "$host_os" = Darwin ]; then
   GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 GOPATH="$tmp_dir" GOMODCACHE="$go_mod_cache" go install -trimpath github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
   csi_sanity_bin="$tmp_dir/bin/linux_$go_arch/csi-sanity"
 fi
+cp "$csi_sanity_bin" "$tmp_dir/csi-sanity"
+chmod 0755 "$tmp_dir/csi-sanity"
 
 docker run --detach --privileged --platform "linux/$go_arch" --name "$container_name" \
   -v "$tmp_dir:/tmp/csi-sanity" \
@@ -84,21 +86,12 @@ if [ ! -S "$tmp_dir/csi.sock" ]; then
   exit 1
 fi
 
-if [ "$host_os" = Darwin ]; then
-  docker exec "$container_name" "/tmp/csi-sanity/bin/linux_$go_arch/csi-sanity" \
-    --csi.endpoint=unix:///tmp/csi-sanity/csi.sock \
-    --csi.mountdir=/tmp/csi-sanity/mount \
-    --csi.stagingdir=/tmp/csi-sanity/staging \
-    --ginkgo.focus="NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo" \
-    --ginkgo.v
-else
-  "$csi_sanity_bin" \
-    --csi.endpoint="unix://$tmp_dir/csi.sock" \
-    --csi.mountdir="$tmp_dir/mount" \
-    --csi.stagingdir="$tmp_dir/staging" \
-    --ginkgo.focus="NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo" \
-    --ginkgo.v
-fi
+docker exec "$container_name" /tmp/csi-sanity/csi-sanity \
+  --csi.endpoint=unix:///tmp/csi-sanity/csi.sock \
+  --csi.mountdir=/tmp/csi-sanity/mount \
+  --csi.stagingdir=/tmp/csi-sanity/staging \
+  --ginkgo.focus="NodeGetCapabilities|NodeGetInfo|GetPluginCapabilities|GetPluginInfo" \
+  --ginkgo.v
 """
 
 [tasks."test:mount-api"]
@@ -127,6 +120,8 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 go_arch="$(go env GOARCH)"
 GOOS=linux GOARCH="$go_arch" CGO_ENABLED=0 go test -c -o "$tmp_dir/xfs-quota.test" ./internal/quota
+chmod 0755 "$tmp_dir"
+chmod 0555 "$tmp_dir/xfs-quota.test"
 docker run --rm --privileged --platform "linux/$go_arch" \
   --env CACHE_CSI_REQUIRE_XFS_QUOTA=1 \
   --env CACHE_CSI_XFS_ROOT=/mnt/cache-csi-xfs \

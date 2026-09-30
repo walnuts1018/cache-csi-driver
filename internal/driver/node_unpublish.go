@@ -137,10 +137,12 @@ func (s *Server) cleanupTerminalFallbackLeases(ctx context.Context, volumeID, ta
 			s.logger.WarnContext(ctx, "cache lease metadata is unavailable after terminal fallback unpublish", "root", store.Root(), "error", err)
 			if errors.Is(err, cache.ErrDegradedMetadata) && s.isFallbackStore(store) {
 				fallbackIdentity, identityErr := cache.FallbackIdentity(volumeID)
-				if identityErr == nil {
-					if quarantineErr := store.ScheduleQuarantine(fallbackIdentity, s.mounter.sourceMounted); quarantineErr != nil {
-						s.logger.WarnContext(ctx, "failed to schedule fallback quarantine after terminal unpublish", "root", store.Root(), "error", quarantineErr)
-					}
+				if identityErr != nil {
+					s.logger.WarnContext(ctx, "failed to derive fallback identity after terminal unpublish", "root", store.Root(), "error", identityErr)
+					continue
+				}
+				if quarantineErr := store.QuarantineDegradedObject(fallbackIdentity, s.mounter.sourceMounted); quarantineErr != nil {
+					s.logger.WarnContext(ctx, "failed to quarantine fallback cache after terminal unpublish", "root", store.Root(), "error", quarantineErr)
 				}
 			}
 			continue
@@ -155,8 +157,8 @@ func (s *Server) cleanupTerminalFallbackLeases(ctx context.Context, volumeID, ta
 		}
 		if err := store.Release(volumeID, target); err != nil {
 			s.logger.WarnContext(ctx, "failed to release cache lease after terminal teardown", "root", store.Root(), "error", err)
-			if quarantineErr := store.ScheduleQuarantine(identity, s.mounter.sourceMounted); quarantineErr != nil {
-				s.logger.WarnContext(ctx, "failed to schedule cache quarantine after terminal teardown", "root", store.Root(), "error", quarantineErr)
+			if quarantineErr := store.QuarantineDegradedObject(identity, s.mounter.sourceMounted); quarantineErr != nil {
+				s.logger.WarnContext(ctx, "failed to quarantine cache after terminal teardown", "root", store.Root(), "error", quarantineErr)
 			}
 		}
 	}
@@ -235,8 +237,8 @@ func (s *Server) finishUnpublishCleanup(ctx context.Context, volumeID string, ac
 		}
 		if err := active.store.Release(volumeID, active.lease.Target); err != nil {
 			s.logger.WarnContext(ctx, "failed to release cache lease after target teardown", "root", active.store.Root(), "error", err)
-			if quarantineErr := active.store.ScheduleQuarantine(active.identity, s.mounter.sourceMounted); quarantineErr != nil {
-				s.logger.WarnContext(ctx, "failed to schedule cache quarantine after lease release", "root", active.store.Root(), "error", quarantineErr)
+			if quarantineErr := active.store.QuarantineDegradedObject(active.identity, s.mounter.sourceMounted); quarantineErr != nil {
+				s.logger.WarnContext(ctx, "failed to quarantine cache after lease release", "root", active.store.Root(), "error", quarantineErr)
 			}
 		}
 	} else {
@@ -248,8 +250,8 @@ func (s *Server) finishUnpublishCleanup(ctx context.Context, volumeID string, ac
 		}
 	}
 	for store, identity := range degraded {
-		if err := store.ScheduleQuarantine(identity, s.mounter.sourceMounted); err != nil {
-			s.logger.WarnContext(ctx, "failed to schedule degraded cache quarantine", "root", store.Root(), "error", err)
+		if err := store.QuarantineDegradedObject(identity, s.mounter.sourceMounted); err != nil {
+			s.logger.WarnContext(ctx, "failed to quarantine degraded cache", "root", store.Root(), "error", err)
 		}
 	}
 }

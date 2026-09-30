@@ -34,6 +34,51 @@ spec:
           operator: NotIn
           values:
             - "true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ printf "%s-cache-attributes" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+        scope: Namespaced
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(volume,
+          !has(volume.csi) || volume.csi.driver != "cache.csi.walnuts.dev" ||
+          (has(volume.csi.ephemeral) && volume.csi.ephemeral &&
+          has(volume.csi.volumeAttributes) &&
+          volume.csi.volumeAttributes.all(attribute,
+            attribute in ["cacheClass", "cacheKey", "maxBytes"]) &&
+          "cacheClass" in volume.csi.volumeAttributes &&
+          volume.csi.volumeAttributes["cacheClass"] != "" &&
+          "cacheKey" in volume.csi.volumeAttributes &&
+          volume.csi.volumeAttributes["cacheKey"] != ""))
+      message: Cache CSI volumeAttributes must contain cacheClass and cacheKey and may contain maxBytes only.
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(volume,
+          !has(volume.csi) || volume.csi.driver != "cache.csi.walnuts.dev" ||
+          !has(volume.csi.volumeAttributes) ||
+          !("maxBytes" in volume.csi.volumeAttributes) ||
+          (isQuantity(volume.csi.volumeAttributes["maxBytes"]) &&
+          quantity(volume.csi.volumeAttributes["maxBytes"]).sign() > 0))
+      message: Cache CSI maxBytes must be a positive Kubernetes quantity.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ printf "%s-cache-attributes" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+spec:
+  policyName: {{ printf "%s-cache-attributes" (include "cache-csi-driver.fullname" .) | trunc 63 | trimSuffix "-" }}
+  validationActions:
+    - Deny
+  matchResources: {}
 {{- if .Values.admissionPolicy.cacheClassAllowlist.enabled }}
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -108,7 +108,7 @@ func TestCriticalForceDeleteUsesUIDPreconditionAndCooldown(t *testing.T) {
 	}
 }
 
-func TestPressureReclaimsRuntimeDegradedCacheWithoutKubernetesClient(t *testing.T) {
+func TestManagerRecoversRuntimeDegradedCacheWithoutKubernetesClient(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	store, err := cache.NewStore(root, cache.StoreOptions{})
@@ -153,18 +153,18 @@ func TestPressureReclaimsRuntimeDegradedCacheWithoutKubernetesClient(t *testing.
 		}
 		return mounted, nil
 	}})
-	manager.pressure(t.Context())
+	manager.recoverDegraded(t.Context())
 	if _, err := os.Stat(filepath.Join(root, identity)); err != nil {
 		t.Fatalf("mounted degraded object was removed: %v", err)
 	}
 	mounted = false
 	inspectionError = true
-	manager.pressure(t.Context())
+	manager.recoverDegraded(t.Context())
 	if _, err := os.Stat(filepath.Join(root, identity)); err != nil {
 		t.Fatalf("object with unknown mount state was removed: %v", err)
 	}
 	inspectionError = false
-	manager.pressure(t.Context())
+	manager.recoverDegraded(t.Context())
 	if inspected != 3 {
 		t.Fatalf("degraded mount inspections = %d, want 3", inspected)
 	}

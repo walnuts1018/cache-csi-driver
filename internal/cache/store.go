@@ -27,6 +27,8 @@ var ErrFallbackCapacity = errors.New("fallback cache capacity is exhausted")
 
 var ErrFallbackLeaseConflict = errors.New("fallback cache lease ID is already in use")
 
+var ErrFallbackObjectMounted = errors.New("fallback cache object remains mounted")
+
 var ErrStoreNotReady = errors.New("cache store indexes are not ready")
 
 const pressureStateNormal = "normal"
@@ -107,18 +109,18 @@ type pressureManager struct {
 }
 
 type trashCollector struct {
-	trashMetadata      map[string]Metadata
-	trashDeleted       uint64
-	trashCursor        string
-	removeTrashEntry   func(string) error
-	stopTrash          chan struct{}
-	trashDone          chan struct{}
-	trashRequests      chan chan error
-	quarantineRequests chan quarantineRequest
-	trashMu            sync.Mutex
-	collectorMu        sync.Mutex
-	collectorStarted   bool
-	collectorFinished  bool
+	trashMetadata     map[string]Metadata
+	trashDeleted      uint64
+	trashCursor       string
+	removeTrashEntry  func(string) error
+	stopTrash         chan struct{}
+	trashDone         chan struct{}
+	trashRequests     chan chan error
+	trashMu           sync.Mutex
+	trashCleanupMu    sync.Mutex
+	collectorMu       sync.Mutex
+	collectorStarted  bool
+	collectorFinished bool
 }
 
 type keyedMutexes struct {
@@ -345,7 +347,7 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		leaseManager:         leaseManager{},
 		projectQuotaRegistry: projectQuotaRegistry{projectIDStart: options.ProjectIDStart, projectIDCount: options.ProjectIDCount, projectReservations: make(map[uint32][]projectReservation), projectOwnersByID: make(map[uint32]projectReservationKey), projectIDByGeneration: make(map[projectReservationKey]uint32), unknownProjectReservations: make(map[string]string)},
 		pressureManager:      pressureManager{pressure: options.Pressure, pressureState: pressureStateNormal, pressureDetachFailed: make(map[string]struct{})},
-		trashCollector:       trashCollector{trashMetadata: make(map[string]Metadata), stopTrash: make(chan struct{}), trashDone: make(chan struct{}), trashRequests: make(chan chan error), quarantineRequests: make(chan quarantineRequest, 64)},
+		trashCollector:       trashCollector{trashMetadata: make(map[string]Metadata), stopTrash: make(chan struct{}), trashDone: make(chan struct{}), trashRequests: make(chan chan error)},
 		unmountGeneration:    options.UnmountGeneration,
 		initDone:             make(chan struct{}),
 	}

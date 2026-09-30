@@ -33,9 +33,11 @@ kind create cluster \
 context="kind-$cluster_name"
 kubectl --context "$context" wait --for=condition=Ready nodes --all --timeout=3m
 
-docker build --tag "$image" .
+go_arch="$(go env GOARCH)"
+docker build --platform "linux/$go_arch" --provenance=false --tag "$image" .
 docker pull "$app_image"
-kind load docker-image "$image" "$app_image" --name "$cluster_name"
+docker save --output "$tmp_dir/kind-images.tar" "$image" "$app_image"
+kind load image-archive "$tmp_dir/kind-images.tar" --name "$cluster_name"
 
 helm upgrade --install cache-csi-driver deploy/helm/cache-csi-driver \
   --kube-context "$context" \

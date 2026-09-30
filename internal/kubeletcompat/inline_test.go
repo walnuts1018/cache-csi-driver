@@ -19,11 +19,6 @@ func TestParsePodTargetAcceptsKubeletPodLayouts(t *testing.T) {
 			target: filepath.Join(kubeletRoot, "pods", "550e8400-e29b-41d4-a716-446655440000", "volumes", "kubernetes.io~csi", "model-cache", "mount"),
 			podUID: "550e8400-e29b-41d4-a716-446655440000",
 		},
-		{
-			name:   "alternate Pod-owned layout",
-			target: filepath.Join(kubeletRoot, "pods", "pod-uid", "plugins", "csi", "mount"),
-			podUID: "pod-uid",
-		},
 	}
 	for _, test := range targets {
 		t.Run(test.name, func(t *testing.T) {
@@ -41,7 +36,12 @@ func TestParsePodTargetAcceptsKubeletPodLayouts(t *testing.T) {
 	invalidTargets := []string{
 		filepath.Join(kubeletRoot, "pods"),
 		filepath.Join(kubeletRoot, "pods", "pod-uid"),
+		filepath.Join(kubeletRoot, "pods", "pod-uid", "mount"),
+		filepath.Join(kubeletRoot, "pods", "pod-uid", "plugins", "csi", "mount"),
+		filepath.Join(kubeletRoot, "pods", "pod-uid", "volumes", "other-driver", "volume", "mount"),
+		filepath.Join(kubeletRoot, "pods", "pod-uid", "volumes", "kubernetes.io~csi", "volume"),
 		filepath.Join(kubeletRoot, "pods", "pod-uid", "..", "other", "mount"),
+		filepath.Join(kubeletRoot, "pods", "other", "mount"),
 		filepath.Join(kubeletRoot, "other", "pod-uid", "mount"),
 	}
 	for _, target := range invalidTargets {

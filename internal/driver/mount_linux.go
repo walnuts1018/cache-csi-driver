@@ -11,7 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/moby/sys/mountinfo"
+	mobyMountinfo "github.com/moby/sys/mountinfo"
+	mounttable "github.com/walnuts1018/cache-csi-driver/internal/mountinfo"
 	"golang.org/x/sys/unix"
 )
 
@@ -183,20 +184,23 @@ func sameCacheSource(source, target string) (bool, error) {
 
 // sourceWithinRootはmountinfoのデバイス番号とmount rootを照合し、指定root配下からのbind mountであることを確認する。
 func sourceWithinRoot(target, root string) (bool, error) {
-	targetMounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(filepath.Clean(target)))
+	mounts, err := mobyMountinfo.GetMounts(nil)
 	if err != nil {
 		return false, err
 	}
-	targetMount := topMountAtPath(targetMounts)
+	targetMounts := mounttable.AtPathIn(mounts, target)
+	targetMount, err := mounttable.Top(targetMounts)
+	if err != nil {
+		return false, err
+	}
 	if targetMount == nil {
 		return false, nil
 	}
-	mounts, err := mountinfo.GetMounts(nil)
+	root = filepath.Clean(root)
+	rootMount, err := mounttable.Covering(mounts, root)
 	if err != nil {
 		return false, err
 	}
-	root = filepath.Clean(root)
-	rootMount := coveringMount(mounts, root)
 	if rootMount == nil {
 		return false, nil
 	}
@@ -214,7 +218,11 @@ func sourceWithinRoot(target, root string) (bool, error) {
 		if !pathWithin(root, candidatePath) || candidate.Major != targetMount.Major || candidate.Minor != targetMount.Minor {
 			continue
 		}
-		if coveringMount(mounts, candidatePath) != candidate {
+		candidateMount, err := mounttable.Covering(mounts, candidatePath)
+		if err != nil {
+			return false, err
+		}
+		if candidateMount != candidate {
 			continue
 		}
 		if filepath.Clean(candidate.Root) == filepath.Clean(targetMount.Root) {
@@ -222,30 +230,6 @@ func sourceWithinRoot(target, root string) (bool, error) {
 		}
 	}
 	return false, nil
-}
-
-func coveringMount(mounts []*mountinfo.Info, path string) *mountinfo.Info {
-	var covering *mountinfo.Info
-	for _, mount := range mounts {
-		mountpoint := filepath.Clean(mount.Mountpoint)
-		if !pathWithin(mountpoint, path) {
-			continue
-		}
-		if covering == nil || len(mountpoint) > len(covering.Mountpoint) || len(mountpoint) == len(covering.Mountpoint) && mount.ID > covering.ID {
-			covering = mount
-		}
-	}
-	return covering
-}
-
-func topMountAtPath(mounts []*mountinfo.Info) *mountinfo.Info {
-	var top *mountinfo.Info
-	for _, mount := range mounts {
-		if top == nil || mount.ID > top.ID {
-			top = mount
-		}
-	}
-	return top
 }
 
 func pathWithin(root, path string) bool {
@@ -300,14 +284,18 @@ type mountInfo struct {
 }
 
 func readMountInfo(target string) (mountInfo, bool, error) {
-	mounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(target))
+	mounts, err := mounttable.AtPath(target)
 	if err != nil {
 		return mountInfo{}, false, err
 	}
-	if len(mounts) == 0 {
+	top, err := mounttable.Top(mounts)
+	if err != nil {
+		return mountInfo{}, false, err
+	}
+	if top == nil {
 		return mountInfo{}, false, nil
 	}
-	options := strings.Split(mounts[0].Options, ",")
+	options := strings.Split(top.Options, ",")
 	return mountInfo{
 		readOnly: slices.Contains(options, "ro"),
 		noExec:   slices.Contains(options, "noexec"),
@@ -383,16 +371,14 @@ func unmountFallbackGeneration(path string) error {
 	return nil
 }
 
-func generationMountAt(path string) (*mountinfo.Info, bool, error) {
-	mounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(filepath.Clean(path)))
+func generationMountAt(path string) (*mobyMountinfo.Info, bool, error) {
+	mounts, err := mounttable.AtPath(path)
 	if err != nil {
 		return nil, false, err
 	}
-	var top *mountinfo.Info
-	for _, mount := range mounts {
-		if top == nil || mount.ID > top.ID {
-			top = mount
-		}
+	top, err := mounttable.Top(mounts)
+	if err != nil {
+		return nil, false, err
 	}
 	return top, top != nil, nil
 }

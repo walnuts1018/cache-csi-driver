@@ -30,10 +30,6 @@ func (collector *trashCollector) run(store *Store) {
 		case <-ticker.C:
 			_ = store.retryProjectRegistry()
 			_ = store.cleanupTrashBatch()
-		case request := <-collector.quarantineRequests:
-			if err := store.CleanupDegradedObject(request.identity, request.sourceMounted); err != nil {
-				store.markDegraded(request.identity, fmt.Errorf("scheduled degraded cache quarantine: %w", err))
-			}
 		case response := <-collector.trashRequests:
 			response <- errors.Join(store.retryProjectRegistry(), store.cleanupTrashBatch())
 		}
@@ -65,6 +61,8 @@ func (s *Store) cleanupTrashBatch() error {
 }
 
 func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]struct{}, error) {
+	s.trashCollector.trashCleanupMu.Lock()
+	defer s.trashCollector.trashCleanupMu.Unlock()
 	// detach処理と同じmutex下でsnapshotし、作成途中のtrash entryを削除対象に含めない。
 	s.trashCollector.trashMu.Lock()
 	entries, err := s.metadataRepository.readDir(filepath.Join(s.metadataRepository.root, trashDirectoryName))

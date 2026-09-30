@@ -175,20 +175,98 @@ func (m *Manager) Run(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	pressureRequests := make(chan struct{}, 1)
+	var workers sync.WaitGroup
+	workers.Go(func() { m.runCollection(ctx) })
+	workers.Go(func() { m.runDegradedRecovery(ctx) })
+	workers.Go(func() { m.runPressureWorker(ctx, pressureRequests) })
+	m.runPressureMonitor(ctx, pressureRequests)
+	workers.Wait()
+}
+
+func (m *Manager) runCollection(ctx context.Context) {
 	m.collect(ctx, time.Now())
-	m.pressure(ctx)
-	retentionTicker := time.NewTicker(m.interval)
-	defer retentionTicker.Stop()
-	pressureTicker := time.NewTicker(m.pressureInterval)
-	defer pressureTicker.Stop()
+	ticker := time.NewTicker(m.interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-retentionTicker.C:
+		case now := <-ticker.C:
 			m.collect(ctx, now)
-		case <-pressureTicker.C:
+		}
+	}
+}
+
+func (m *Manager) runDegradedRecovery(ctx context.Context) {
+	m.recoverDegraded(ctx)
+	ticker := time.NewTicker(m.pressureInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.recoverDegraded(ctx)
+		}
+	}
+}
+
+func (m *Manager) runPressureMonitor(ctx context.Context, requests chan<- struct{}) {
+	m.observePressure(ctx, requests)
+	ticker := time.NewTicker(m.pressureInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.observePressure(ctx, requests)
+		}
+	}
+}
+
+func (m *Manager) observePressure(ctx context.Context, requests chan<- struct{}) {
+	active := false
+	for _, store := range m.stores {
+		underPressure, err := store.ObservePressure()
+		if err != nil {
+			m.logger.ErrorContext(ctx, "observe cache filesystem pressure failed", "root", store.Root(), "error", err)
+			continue
+		}
+		active = active || underPressure
+	}
+	m.syncStoreMetrics()
+	if active {
+		select {
+		case requests <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (m *Manager) runPressureWorker(ctx context.Context, requests <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-requests:
 			m.pressure(ctx)
+		}
+	}
+}
+
+func (m *Manager) recoverDegraded(ctx context.Context) {
+	if m.inspectMount == nil || ctx.Err() != nil {
+		return
+	}
+	defer m.syncStoreMetrics()
+	for _, store := range m.stores {
+		if err := store.RecoverDegraded(ctx, m.inspectMount); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			m.logger.WarnContext(ctx, "degraded cache recovery was incomplete", "root", store.Root(), "error", err)
 		}
 	}
 }
@@ -212,20 +290,6 @@ func (m *Manager) pressure(ctx context.Context) {
 		return
 	}
 	for _, store := range m.stores {
-		if m.inspectMount != nil {
-			if err := store.RecoverDegraded(ctx, m.inspectMount); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return
-				}
-				m.logger.WarnContext(ctx, "degraded cache recovery was incomplete", "root", store.Root(), "error", err)
-			}
-		}
-		if err := store.CleanupTrash(ctx); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return
-			}
-			m.logger.WarnContext(ctx, "cache trash cleanup failed during pressure check", "root", store.Root(), "error", err)
-		}
 		if err := store.ReclaimPressure(ctx); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return

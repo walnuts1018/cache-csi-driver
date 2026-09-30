@@ -612,22 +612,29 @@ func (s *Store) Release(leaseID, target string) error {
 	if retiredIndex >= 0 && !s.hasGenerationLeases(meta, generation) {
 		meta.Retired[retiredIndex].State = GenerationStateRetired
 		if err := s.writeMetadata(filepath.Join(s.metadataRepository.root, identity), meta); err != nil {
+			s.markDegraded(identity, err)
 			return fmt.Errorf("record cache generation retirement: %w", err)
 		}
 		retired := meta.Retired[retiredIndex]
 		generationPath := filepath.Join(entry, "generations", generation)
 		if err := s.detachGenerationToTrash(generationPath, identity, retired); err != nil {
+			s.markDegraded(identity, err)
 			return fmt.Errorf("detach released cache generation: %w", err)
 		}
 		meta.Retired = slices.Delete(meta.Retired, retiredIndex, retiredIndex+1)
 	}
 	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) == 0 {
 		if err := s.detachToTrash(entry); err != nil {
+			s.markDegraded(identity, err)
 			return fmt.Errorf("discard released cache object: %w", err)
 		}
 		return nil
 	}
-	return s.writeMetadata(entry, meta)
+	if err := s.writeMetadata(entry, meta); err != nil {
+		s.markDegraded(identity, err)
+		return err
+	}
+	return nil
 }
 
 func (s *Store) hasGenerationLeases(meta Metadata, generation string) bool {

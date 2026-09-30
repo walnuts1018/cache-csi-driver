@@ -107,9 +107,16 @@ func TestNodePublishValidatesTargetPodIdentityAndShape(t *testing.T) {
 			wantReject: true,
 		},
 		{
-			name:   "target layout may differ under the matching Pod directory",
-			target: filepath.Join(server.options.KubeletRoot, "pods", testPodUID, "volumes", "other-driver", "volume-name", "mount"),
-			podUID: testPodUID,
+			name:       "target uses another volume plugin layout",
+			target:     filepath.Join(server.options.KubeletRoot, "pods", testPodUID, "volumes", "other-driver", "volume-name", "mount"),
+			podUID:     testPodUID,
+			wantReject: true,
+		},
+		{
+			name:       "target is not the kubelet CSI mount directory",
+			target:     filepath.Join(server.options.KubeletRoot, "pods", testPodUID, "mount"),
+			podUID:     testPodUID,
+			wantReject: true,
 		},
 		{
 			name:       "target has a noncanonical path",

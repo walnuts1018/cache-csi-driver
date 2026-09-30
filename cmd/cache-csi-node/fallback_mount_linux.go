@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/moby/sys/mountinfo"
+	mounttable "github.com/walnuts1018/cache-csi-driver/internal/mountinfo"
 	"golang.org/x/sys/unix"
 )
 
@@ -32,11 +32,15 @@ func mountFallbackTmpfs(path string, size int64, noExec bool) error {
 	if noExec {
 		flags |= unix.MS_NOEXEC
 	}
-	mounts, err := mountsAtPath(path)
+	mounts, err := mounttable.AtPath(path)
 	if err != nil {
 		return fmt.Errorf("inspect fallback mount: %w", err)
 	}
-	if existing := topMountAtPath(mounts); existing != nil && existing.FSType == "tmpfs" {
+	existing, err := mounttable.Top(mounts)
+	if err != nil {
+		return fmt.Errorf("select topmost fallback mount: %w", err)
+	}
+	if existing != nil && existing.FSType == "tmpfs" {
 		flags |= unix.MS_REMOUNT
 	}
 	options := "size=" + strconv.FormatInt(size, 10) + ",mode=0700"
@@ -46,11 +50,14 @@ func mountFallbackTmpfs(path string, size int64, noExec bool) error {
 	if err := os.Chmod(path, 0o700); err != nil {
 		return fmt.Errorf("restrict fallback tmpfs root: %w", err)
 	}
-	mounts, err = mountsAtPath(path)
+	mounts, err = mounttable.AtPath(path)
 	if err != nil {
 		return fmt.Errorf("verify fallback mount: %w", err)
 	}
-	mount := topMountAtPath(mounts)
+	mount, err := mounttable.Top(mounts)
+	if err != nil {
+		return fmt.Errorf("select topmost fallback mount: %w", err)
+	}
 	if mount == nil || mount.FSType != "tmpfs" {
 		return errors.New("fallback root is not mounted as tmpfs")
 	}
@@ -75,20 +82,4 @@ func mountFallbackTmpfs(path string, size int64, noExec bool) error {
 		return fmt.Errorf("fallback tmpfs capacity %d exceeds configured maximum %d", capacity, size)
 	}
 	return nil
-}
-
-func mountsAtPath(path string) ([]*mountinfo.Info, error) {
-	return mountinfo.GetMounts(func(mount *mountinfo.Info) (skip, stop bool) {
-		return filepath.Clean(mount.Mountpoint) != path, false
-	})
-}
-
-func topMountAtPath(mounts []*mountinfo.Info) *mountinfo.Info {
-	var top *mountinfo.Info
-	for _, mount := range mounts {
-		if top == nil || mount.ID > top.ID {
-			top = mount
-		}
-	}
-	return top
 }
