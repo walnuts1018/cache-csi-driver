@@ -59,9 +59,9 @@ func (s *Store) Acquire(options AcquireOptions) (string, bool, error) {
 	if err := validateAcquireOptions(options); err != nil {
 		return "", false, err
 	}
-	unlockLease := s.leaseLocks.lock(options.Lease.ID)
+	unlockLease := s.lockLease(options.Lease.ID)
 	defer unlockLease()
-	unlockIdentity := s.identityLocks.lock(options.Identity)
+	unlockIdentity := s.lockIdentity(options.Identity)
 	defer unlockIdentity()
 	return s.acquireLocked(options)
 }
@@ -133,6 +133,17 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 		s.markDegraded(options.Identity, err)
 		return "", false, err
 	}
+	requestedPolicyHash, err := generationPolicyHash(options.Policy)
+	if err != nil {
+		return "", false, fmt.Errorf("hash requested cache generation policy: %w", err)
+	}
+	storedPolicyHash := meta.PolicyHash
+	if storedPolicyHash == "" {
+		storedPolicyHash, err = generationPolicyHash(meta.Policy)
+		if err != nil {
+			return "", false, fmt.Errorf("hash stored cache generation policy: %w", err)
+		}
+	}
 	for _, lease := range meta.Leases {
 		_, existingPolicy, err := leaseGenerationAndPolicy(meta, lease)
 		if err != nil {
@@ -143,23 +154,17 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 			return "", false, ErrExclusivePolicyConflict
 		}
 	}
-	activeLeases := s.activeLeaseCount(meta)
+	objectHasLeases := len(meta.Leases) != 0
 	quotaPolicyChanged := meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes
-	if quotaPolicyChanged && (activeLeases > 0 || len(meta.Retired) > 0) {
+	if quotaPolicyChanged && objectHasLeases {
 		return "", false, ErrQuotaPolicyConflict
 	}
-	if len(meta.Retired) == 0 && activeLeases == 0 && (quotaPolicyChanged || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
+	policyChanged := requestedPolicyHash != storedPolicyHash
+	if !objectHasLeases && (policyChanged || meta.Dirty && !meta.Policy.CrashRecoveryReuse) {
 		if err := s.rejectUnderPressure(); err != nil {
 			return "", false, err
 		}
-		if err := s.detachToTrash(entry); err != nil {
-			return "", false, fmt.Errorf("discard cache before generation transition: %w", err)
-		}
-		if err := s.ensureDirectory(entry); err != nil {
-			return "", false, fmt.Errorf("create cache entry after generation transition: %w", err)
-		}
-		meta = Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
-		return s.createLease(entry, options, meta)
+		return s.discardAndCreateGeneration(entry, options, meta)
 	}
 	generationPath := filepath.Join(entry, "generations", meta.Generation)
 	generationExists := true
@@ -176,6 +181,17 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 		options.Lease.NoExec = meta.Policy.NoExec
 	}
 	return s.acquireExisting(entry, options, meta)
+}
+
+func (s *Store) discardAndCreateGeneration(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
+	if err := s.detachToTrash(entry); err != nil {
+		return "", false, fmt.Errorf("discard cache before generation transition: %w", err)
+	}
+	if err := s.ensureDirectory(entry); err != nil {
+		return "", false, fmt.Errorf("create cache entry after generation transition: %w", err)
+	}
+	meta = Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
+	return s.createLease(entry, options, meta)
 }
 
 func (s *Store) rejectUnderPressure() error {
@@ -199,9 +215,9 @@ func (s *Store) AcquireFallback(options AcquireOptions, requestedBytes, perVolum
 	if perVolumeMaxBytes <= 0 || totalMaxBytes <= 0 {
 		return FallbackAllocation{}, errors.New("fallback cache limits must be positive")
 	}
-	unlockLease := s.leaseLocks.lock(options.Lease.ID)
+	unlockLease := s.lockLease(options.Lease.ID)
 	defer unlockLease()
-	unlockIdentity := s.identityLocks.lock(options.Identity)
+	unlockIdentity := s.lockIdentity(options.Identity)
 	defer unlockIdentity()
 	s.fallbackMu.Lock()
 	defer s.fallbackMu.Unlock()
@@ -403,13 +419,13 @@ func (s *Store) setLeasePreparing(leaseID, target string, preparing bool) error 
 	if leaseID == "" || !filepath.IsAbs(target) {
 		return errors.New("valid cache lease ID and absolute target path are required")
 	}
-	unlockLease := s.leaseLocks.lock(leaseID)
+	unlockLease := s.lockLease(leaseID)
 	defer unlockLease()
 	identity, exists := s.identityForLease(leaseID)
 	if !exists {
 		return errors.New("cache lease does not exist")
 	}
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	identity, meta, found, err := s.findLease(leaseID)
 	if err != nil {
@@ -440,13 +456,13 @@ func (s *Store) setLeasePreparing(leaseID, target string, preparing bool) error 
 }
 
 func (s *Store) LeaseDetails(leaseID string) (string, Lease, string, Policy, bool, error) {
-	unlockLease := s.leaseLocks.lock(leaseID)
+	unlockLease := s.lockLease(leaseID)
 	defer unlockLease()
 	identity, exists := s.identityForLease(leaseID)
 	if !exists {
 		return "", Lease{}, "", Policy{}, false, nil
 	}
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	identity, meta, found, err := s.findLease(leaseID)
 	if err != nil || !found {
@@ -470,7 +486,7 @@ func (s *Store) QuotaState(identity string, maxBytes int64) (uint32, bool, bool,
 	if !validIdentity(identity) || maxBytes <= 0 {
 		return 0, false, false, errors.New("valid cache identity and positive quota limit are required")
 	}
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	entry := filepath.Join(s.root, identity)
 	meta, err := s.readObjectMetadata(identity)
@@ -491,6 +507,10 @@ func (s *Store) QuotaState(identity string, maxBytes int64) (uint32, bool, bool,
 		s.mu.Lock()
 		s.addProjectReservation(meta.ProjectID, projectReservation{Identity: identity, Generation: meta.Generation})
 		s.mu.Unlock()
+		if err := s.persistProjectReservationsLocked(); err != nil {
+			s.projectRegistryMu.Unlock()
+			return 0, false, false, fmt.Errorf("synchronize project ID reservation before quota reuse: %w", err)
+		}
 		s.projectRegistryMu.Unlock()
 	}
 	if err := s.writeMetadata(entry, meta); err != nil {
@@ -503,7 +523,7 @@ func (s *Store) Expose(identity string) (string, error) {
 	if !validIdentity(identity) {
 		return "", errors.New("invalid cache identity")
 	}
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	entry := filepath.Join(s.root, identity)
 	meta, err := s.readObjectMetadata(identity)
@@ -529,7 +549,7 @@ func (s *Store) Expose(identity string) (string, error) {
 }
 
 func (s *Store) MarkQuotaApplied(identity string, maxBytes int64) error {
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	entry := filepath.Join(s.root, identity)
 	meta, err := s.readObjectMetadata(identity)
@@ -541,7 +561,7 @@ func (s *Store) MarkQuotaApplied(identity string, maxBytes int64) error {
 }
 
 func (s *Store) MarkProjectAssigned(identity string) error {
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	entry := filepath.Join(s.root, identity)
 	meta, err := s.readObjectMetadata(identity)
@@ -553,13 +573,13 @@ func (s *Store) MarkProjectAssigned(identity string) error {
 }
 
 func (s *Store) Release(leaseID, target string) error {
-	unlockLease := s.leaseLocks.lock(leaseID)
+	unlockLease := s.lockLease(leaseID)
 	defer unlockLease()
 	identity, exists := s.identityForLease(leaseID)
 	if !exists {
 		return nil
 	}
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	identity, meta, found, err := s.findLease(leaseID)
 	if err != nil || !found {
@@ -584,6 +604,10 @@ func (s *Store) Release(leaseID, target string) error {
 	entry := filepath.Join(s.root, identity)
 	retiredIndex := slices.IndexFunc(meta.Retired, func(retired RetiredGeneration) bool { return retired.Generation == generation })
 	if retiredIndex >= 0 && !s.hasGenerationLeases(meta, generation) {
+		meta.Retired[retiredIndex].State = GenerationStateRetired
+		if err := s.writeMetadata(filepath.Join(s.root, identity), meta); err != nil {
+			return fmt.Errorf("record cache generation retirement: %w", err)
+		}
 		retired := meta.Retired[retiredIndex]
 		generationPath := filepath.Join(entry, "generations", generation)
 		if err := s.detachGenerationToTrash(generationPath, identity, retired); err != nil {
@@ -629,13 +653,13 @@ func (s *Store) identityForLease(leaseID string) (string, bool) {
 }
 
 func (s *Store) ReleaseTarget(leaseID string) (string, bool, error) {
-	unlockLease := s.leaseLocks.lock(leaseID)
+	unlockLease := s.lockLease(leaseID)
 	defer unlockLease()
 	identity, exists := s.identityForLease(leaseID)
 	if !exists {
 		return "", false, nil
 	}
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	_, meta, found, err := s.findLease(leaseID)
 	if err != nil || !found {

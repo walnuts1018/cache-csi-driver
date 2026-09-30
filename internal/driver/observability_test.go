@@ -39,9 +39,8 @@ func TestQuotaBackendFailureUsesFallbackAndDegradesStorageHealth(t *testing.T) {
 	t.Parallel()
 
 	spec := cachev1alpha1.CacheClassSpec{
-		Backend: cachev1alpha1.BackendXFSProject,
-		Quota: cachev1alpha1.QuotaPolicy{
-			Enabled:         true,
+		Storage: cachev1alpha1.StoragePolicy{
+			Backend:         cachev1alpha1.BackendXFSProject,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
 		},
 	}

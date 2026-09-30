@@ -1525,7 +1525,7 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	}
 }
 
-func TestAcquirePreservesIdleGenerationPolicySnapshot(t *testing.T) {
+func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
 	t.Parallel()
 	initialPolicy := Policy{
 		SharingPolicy:  SharingPolicyShared,
@@ -1569,18 +1569,18 @@ func TestAcquirePreservesIdleGenerationPolicySnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondPath != firstPath {
-		t.Fatalf("reused generation path = %q, want %q", secondPath, firstPath)
+	if secondPath == firstPath {
+		t.Fatalf("reused generation path = %q, want a new generation after the policy change", secondPath)
 	}
 	_, lease, _, storedPolicy, found, err := store.LeaseDetails("second-idle-lease")
 	if err != nil || !found {
 		t.Fatalf("second idle lease found = %t, error = %v", found, err)
 	}
-	if lease.NoExec != initialPolicy.NoExec {
-		t.Fatalf("second idle lease noexec = %t, want generation snapshot %t", lease.NoExec, initialPolicy.NoExec)
+	if lease.NoExec != updatedPolicy.NoExec {
+		t.Fatalf("second idle lease noexec = %t, want updated policy %t", lease.NoExec, updatedPolicy.NoExec)
 	}
-	if storedPolicy != initialPolicy {
-		t.Fatalf("second idle lease policy = %+v, want generation snapshot %+v", storedPolicy, initialPolicy)
+	if storedPolicy != updatedPolicy {
+		t.Fatalf("second idle lease policy = %+v, want updated policy %+v", storedPolicy, updatedPolicy)
 	}
 }
 

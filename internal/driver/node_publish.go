@@ -55,7 +55,7 @@ func (s *Server) publishWhileStoreNotReady(ctx context.Context, req *csi.NodePub
 		return status.Errorf(codes.Internal, "inspect target mount while cache store is recovering: %v", err)
 	}
 	if !mounted {
-		return s.useFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly, expectedFallbackCause("store_recovering"), nil)
+		return s.useFallback(ctx, req, expectedFallbackCause("store_recovering"), nil)
 	}
 	if s.fallbackStore != nil {
 		_, lease, source, _, found, err := s.fallbackStore.LeaseDetails(req.GetVolumeId())
@@ -258,7 +258,7 @@ func (s *Server) publish(ctx context.Context, req *csi.NodePublishVolumeRequest,
 	storedPolicy, existingLease, err := s.prepareLease(req, identity)
 	if err != nil {
 		if cause, ok := fallbackCauseForError(err, "cache_acquire_failed"); ok {
-			return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, cause, err)
+			return s.useFallback(ctx, req, cause, err)
 		}
 		if errors.Is(err, cache.ErrDegradedMetadata) {
 			return status.Errorf(codes.Internal, "read cache lease: %v", err)
@@ -329,9 +329,9 @@ func (s *Server) publishAfterResolutionFailure(ctx context.Context, req *csi.Nod
 	identity, lease, source, policy, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		if errors.Is(err, cache.ErrDegradedMetadata) {
-			return s.useFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly, expectedFallbackCause("metadata_degraded"), err)
+			return s.useFallback(ctx, req, expectedFallbackCause("metadata_degraded"), err)
 		}
-		return s.useFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly, unexpectedFallbackCause("cache_acquire_failed"), err)
+		return s.useFallback(ctx, req, unexpectedFallbackCause("cache_acquire_failed"), err)
 	}
 	if !found {
 		if s.fallbackStore != nil {
@@ -348,7 +348,7 @@ func (s *Server) publishAfterResolutionFailure(ctx context.Context, req *csi.Nod
 				}
 			}
 		}
-		return s.useFallback(ctx, req, requestedFallbackBytes(req), true, cache.PressurePolicyUnusedOnly, fallbackCauseForResolution(resolveErr), resolveErr)
+		return s.useFallback(ctx, req, fallbackCauseForResolution(resolveErr), resolveErr)
 	}
 	if lease.Target != req.GetTargetPath() {
 		return status.Error(codes.AlreadyExists, "volume ID is already published at a different target")
@@ -409,15 +409,15 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 		SchemaVersion:      spec.SchemaVersion,
 		CrashRecoveryReuse: spec.CrashRecovery == "reuse",
 		PressurePolicy:     string(pressurePolicy),
-		QuotaEnabled:       spec.Quota.Enabled,
+		QuotaEnabled:       spec.Storage.Backend == cachev1alpha1.BackendXFSProject,
 		Retention:          spec.Retention.Duration,
 	}
 	if policy.SchemaVersion == "" {
 		policy.SchemaVersion = "v1"
 	}
-	classMaxBytes := spec.MaxBytes.Value()
+	classMaxBytes := spec.Storage.MaxBytes.Value()
 	if requestedMaxBytes != "" {
-		if !spec.Quota.Enabled {
+		if !policy.QuotaEnabled {
 			return cache.Policy{}, errors.New("maxBytes requires an XFS project quota CacheClass")
 		}
 		requested, err := resource.ParseQuantity(requestedMaxBytes)
@@ -428,13 +428,13 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 			return cache.Policy{}, errors.New("maxBytes exceeds the CacheClass per-cache quota ceiling")
 		}
 		policy.MaxBytes = requested.Value()
-	} else if spec.Quota.DefaultMaxBytes.Sign() > 0 {
-		policy.MaxBytes = spec.Quota.DefaultMaxBytes.Value()
+	} else if spec.Storage.DefaultMaxBytes.Sign() > 0 {
+		policy.MaxBytes = spec.Storage.DefaultMaxBytes.Value()
 	} else {
 		policy.MaxBytes = classMaxBytes
 	}
-	if spec.Quota.Enabled && policy.MaxBytes <= 0 {
-		return cache.Policy{}, errors.New("CacheClass quota is enabled without an effective maxBytes limit")
+	if policy.QuotaEnabled && policy.MaxBytes <= 0 {
+		return cache.Policy{}, errors.New("xfs-project CacheClass has no effective maxBytes limit")
 	}
 	return policy, nil
 }
@@ -443,7 +443,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 	_, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 	if err != nil {
 		if cause, ok := fallbackCauseForError(err, "cache_acquire_failed"); ok {
-			return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, cause, err)
+			return s.useFallback(ctx, req, cause, err)
 		}
 		code := codes.Internal
 		if errors.Is(err, cache.ErrQuotaPolicyConflict) || errors.Is(err, cache.ErrExclusivePolicyConflict) || errors.Is(err, cache.ErrLeaseGenerationRetired) {
@@ -459,7 +459,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 		if releaseErr := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
 			err = errors.Join(err, fmt.Errorf("release cache lease after reading its generation policy: %w", releaseErr))
 		}
-		return s.useFallback(ctx, req, policy.MaxBytes, true, cache.PressurePolicyUnusedOnly, unexpectedFallbackCause("cache_acquire_failed"), err)
+		return s.useFallback(ctx, req, unexpectedFallbackCause("cache_acquire_failed"), err)
 	}
 	source := storedSource
 	policy = storedPolicy
@@ -469,7 +469,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 			s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("quota_setup_failed"), err)
 			return status.Errorf(codes.Internal, "apply cache quota failed; release normal cache lease failed: %v", err)
 		}
-		return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, unexpectedFallbackCause("quota_setup_failed"), err)
+		return s.useFallback(ctx, req, unexpectedFallbackCause("quota_setup_failed"), err)
 	}
 	source, err = s.store.Expose(identity)
 	if err != nil {
@@ -480,7 +480,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 				}
 				return status.Errorf(codes.Internal, "expose cache generation failed; release cache lease failed: %v", releaseErr)
 			}
-			return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, cause, err)
+			return s.useFallback(ctx, req, cause, err)
 		}
 		return s.rollbackPublish(req, status.Errorf(codes.FailedPrecondition, "expose cache generation: %v", err))
 	}
@@ -514,7 +514,7 @@ func (s *Server) publishCache(ctx context.Context, req *csi.NodePublishVolumeReq
 			s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("quota_setup_failed"), err)
 			return status.Errorf(codes.Internal, "apply cache quota failed; release cache lease failed: %v", releaseErr)
 		}
-		return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, unexpectedFallbackCause("quota_setup_failed"), err)
+		return s.useFallback(ctx, req, unexpectedFallbackCause("quota_setup_failed"), err)
 	}
 	source, err := s.store.Expose(identity)
 	if err != nil {
@@ -522,7 +522,7 @@ func (s *Server) publishCache(ctx context.Context, req *csi.NodePublishVolumeReq
 			s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("generation_expose_failed"), err)
 			return status.Errorf(codes.Internal, "expose cache generation failed; release cache lease failed: %v", releaseErr)
 		}
-		return s.useFallback(ctx, req, policy.MaxBytes, policy.NoExec, policy.PressurePolicy, unexpectedFallbackCause("generation_expose_failed"), err)
+		return s.useFallback(ctx, req, unexpectedFallbackCause("generation_expose_failed"), err)
 	}
 	if err := s.mount(req, source, policy.NoExec); err != nil {
 		return err
@@ -560,7 +560,7 @@ func requestedFallbackBytes(req *csi.NodePublishVolumeRequest) int64 {
 	return quantity.Value()
 }
 
-func (s *Server) publishFallback(ctx context.Context, req *csi.NodePublishVolumeRequest, requestedBytes int64, noExec bool, pressurePolicy string) error {
+func (s *Server) publishFallback(ctx context.Context, req *csi.NodePublishVolumeRequest) error {
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
 	}
@@ -573,6 +573,9 @@ func (s *Server) publishFallback(ctx context.Context, req *csi.NodePublishVolume
 	}
 	unlock := s.identityLocks.Lock(identity)
 	defer unlock()
+	requestedBytes := requestedFallbackBytes(req)
+	noExec := true
+	pressurePolicy := cache.PressurePolicyUnusedOnly
 	volumeContext := req.GetVolumeContext()
 	policy := cache.Policy{ClassName: "fallback", SharingPolicy: cache.SharingPolicyExclusive, DiscardOnLastRelease: true, NoExec: noExec, PressurePolicy: pressurePolicy}
 	lease := cache.Lease{

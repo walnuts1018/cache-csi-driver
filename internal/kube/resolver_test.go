@@ -82,7 +82,7 @@ func TestResolverGetsNamespaceAndServiceAccountOnDemand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolvedNamespaceUID != string(namespace.UID) || resolvedServiceAccountUID != string(serviceAccount.UID) || resolvedClass.UID != testCacheClassUID || resolvedClass.Object.Spec.Backend != cachev1alpha1.BackendDirectory {
+	if resolvedNamespaceUID != string(namespace.UID) || resolvedServiceAccountUID != string(serviceAccount.UID) || resolvedClass.UID != testCacheClassUID || resolvedClass.Object.Spec.Storage.Backend != cachev1alpha1.BackendDirectory {
 		t.Fatalf("resolved cache identity inputs = namespace UID %q, service account UID %q, class %+v", resolvedNamespaceUID, resolvedServiceAccountUID, resolvedClass)
 	}
 
@@ -371,6 +371,6 @@ func testCacheClass(scope string) *unstructured.Unstructured {
 			"name": "compiler",
 			"uid":  testCacheClassUID,
 		},
-		"spec": map[string]any{"backend": "directory", "scope": scope},
+		"spec": map[string]any{"storage": map[string]any{"backend": "directory"}, "scope": scope},
 	}}
 }

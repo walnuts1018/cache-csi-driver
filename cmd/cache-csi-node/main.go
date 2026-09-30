@@ -47,6 +47,7 @@ func run(logger *slog.Logger) error {
 	endpoint := flag.String("endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint")
 	metricsAddress := flag.String("metrics-address", ":9807", "Prometheus metrics HTTP listen address")
 	cacheRoot := flag.String("cache-root", "/var/lib/cache-csi", "cache storage directory")
+	requireCacheRootMountpoint := flag.Bool("require-cache-root-mountpoint", false, "require cache-root to be a filesystem mountpoint before measuring filesystem-wide pressure")
 	fallbackRoot := flag.String("fallback-root", "/run/cache-csi/fallback", "temporary cache directory used when Kubernetes API resolution fails")
 	fallbackMaxBytes := flag.String("fallback-max-bytes", "1Gi", "maximum total size of the fallback tmpfs filesystem")
 	fallbackVolumeMaxBytes := flag.String("fallback-volume-max-bytes", "128Mi", "maximum size reserved for one fallback cache volume")
@@ -55,10 +56,11 @@ func run(logger *slog.Logger) error {
 	gcInterval := flag.Duration("gc-interval", 30*time.Second, "cache garbage collection interval")
 	highFreePercent := flag.Int("pressure-high-free-percent", 25, "free-byte percentage at which cache pressure collection stops")
 	lowFreePercent := flag.Int("pressure-low-free-percent", 20, "free-byte percentage at which cache pressure collection starts")
-	criticalFreePercent := flag.Int("pressure-critical-free-percent", 0, "critical free-byte percentage at which opted-in cache Pods may be force deleted; zero disables force deletion")
+	criticalFreePercent := flag.Int("pressure-critical-free-percent", 0, "free-byte percentage below which ForceDelete policies become eligible; --allow-force-delete is required for Pod deletion; zero disables critical escalation")
 	highInodeFreePercent := flag.Int("pressure-high-inode-free-percent", 15, "free-inode percentage at which cache pressure collection stops")
 	lowInodeFreePercent := flag.Int("pressure-low-inode-free-percent", 10, "free-inode percentage at which cache pressure collection starts")
-	criticalInodeFreePercent := flag.Int("pressure-critical-inode-free-percent", 0, "critical free-inode percentage at which opted-in cache Pods may be force deleted; zero disables force deletion")
+	criticalInodeFreePercent := flag.Int("pressure-critical-inode-free-percent", 0, "free-inode percentage below which ForceDelete policies become eligible; --allow-force-delete is required for Pod deletion; zero disables critical escalation")
+	allowForceDelete := flag.Bool("allow-force-delete", false, "allow ForceDelete pressure policies to bypass PodDisruptionBudgets using UID-preconditioned Pod deletion")
 	projectIDStart := flag.Uint("project-id-start", 2_000_000_000, "first project ID reserved for cache identities")
 	projectIDCount := flag.Uint("project-id-count", 1_000_000, "number of project IDs reserved for cache identities")
 	flag.Parse()
@@ -92,9 +94,10 @@ func run(logger *slog.Logger) error {
 		CriticalInodeFreePercent: *criticalInodeFreePercent,
 	}
 	store, err := cache.NewStoreAsync(*cacheRoot, cache.StoreOptions{
-		Pressure:       pressure,
-		ProjectIDStart: uint32(*projectIDStart),
-		ProjectIDCount: uint32(*projectIDCount),
+		Pressure:              pressure,
+		ProjectIDStart:        uint32(*projectIDStart),
+		ProjectIDCount:        uint32(*projectIDCount),
+		RequireRootMountpoint: *requireCacheRootMountpoint,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize cache store: %w", err)
@@ -113,12 +116,13 @@ func run(logger *slog.Logger) error {
 		resolver.Start(ctx)
 	}
 	cacheManager := manager.New(store, manager.Options{
-		Interval:      *gcInterval,
-		Client:        client,
-		InspectMount:  driver.VerifyCacheMount,
-		FallbackStore: fallbackStore,
-		Logger:        logger,
-		Metrics:       metricSet,
+		Interval:         *gcInterval,
+		Client:           client,
+		InspectMount:     driver.VerifyCacheMount,
+		FallbackStore:    fallbackStore,
+		Logger:           logger,
+		Metrics:          metricSet,
+		AllowForceDelete: *allowForceDelete,
 	})
 	if client == nil {
 		logger.Warn("Pod pressure eviction is unavailable because the in-cluster Kubernetes client could not be created")

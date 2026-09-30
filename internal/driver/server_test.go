@@ -261,9 +261,8 @@ func TestNodePublishRetryUsesPersistedQuotaPolicy(t *testing.T) {
 	t.Parallel()
 
 	spec := cachev1alpha1.CacheClassSpec{
-		Backend: cachev1alpha1.BackendXFSProject,
-		Quota: cachev1alpha1.QuotaPolicy{
-			Enabled:         true,
+		Storage: cachev1alpha1.StoragePolicy{
+			Backend:         cachev1alpha1.BackendXFSProject,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
 		},
 	}
@@ -276,7 +275,7 @@ func TestNodePublishRetryUsesPersistedQuotaPolicy(t *testing.T) {
 	}
 
 	resolver := server.resolver.(*testResolver)
-	resolver.spec.Quota.DefaultMaxBytes = resource.MustParse("2Mi")
+	resolver.spec.Storage.DefaultMaxBytes = resource.MustParse("2Mi")
 	delete(mounts.mounts, request.GetTargetPath())
 	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
 		t.Fatalf("retry after CacheClass quota change: %v", err)
@@ -293,10 +292,9 @@ func TestNodePublishRollsBackLeaseWhenQuotaConfigurationFails(t *testing.T) {
 
 	quotaFailure := errors.New("quota configuration failed")
 	spec := cachev1alpha1.CacheClassSpec{
-		Backend: cachev1alpha1.BackendXFSProject,
-		NoExec:  true,
-		Quota: cachev1alpha1.QuotaPolicy{
-			Enabled:         true,
+		NoExec: true,
+		Storage: cachev1alpha1.StoragePolicy{
+			Backend:         cachev1alpha1.BackendXFSProject,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
 		},
 	}
@@ -431,10 +429,9 @@ func TestNodePublishKeepsQuotaIdentityConflictHard(t *testing.T) {
 	t.Parallel()
 
 	spec := cachev1alpha1.CacheClassSpec{
-		Backend:       cachev1alpha1.BackendXFSProject,
 		SharingPolicy: cachev1alpha1.SharingPolicyExclusive,
-		Quota: cachev1alpha1.QuotaPolicy{
-			Enabled:         true,
+		Storage: cachev1alpha1.StoragePolicy{
+			Backend:         cachev1alpha1.BackendXFSProject,
 			DefaultMaxBytes: resource.MustParse("1Mi"),
 		},
 	}
@@ -450,8 +447,8 @@ func TestNodePublishKeepsQuotaIdentityConflictHard(t *testing.T) {
 	}
 	if _, _, _, policy, found, err := server.fallbackStore.LeaseDetails(second.GetVolumeId()); err != nil || !found {
 		t.Fatalf("fallback lease found = %t, error = %v; want fallback for exclusive quota conflict", found, err)
-	} else if policy.MaxBytes != 1<<20 {
-		t.Fatalf("fallback maxBytes = %d, want 1Mi", policy.MaxBytes)
+	} else if policy.MaxBytes != 128<<20 {
+		t.Fatalf("fallback maxBytes = %d, want the node fallback volume limit of 128Mi", policy.MaxBytes)
 	}
 }
 

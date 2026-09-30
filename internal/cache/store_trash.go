@@ -18,19 +18,26 @@ const trashDirectoryName = ".trash"
 
 const trashBatchSize = 16
 
-func (s *Store) runTrashCollector() {
+func (collector *trashCollector) runTrashCollector() {
+	s := collector.store
 	defer s.finishTrashCollector()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	_ = s.retryProjectRegistry()
 	_ = s.cleanupTrashBatch()
 	for {
 		select {
 		case <-s.stopTrash:
 			return
 		case <-ticker.C:
+			_ = s.retryProjectRegistry()
 			_ = s.cleanupTrashBatch()
+		case request := <-s.quarantineRequests:
+			if err := s.CleanupDegradedObject(request.identity, request.sourceMounted); err != nil {
+				s.markDegraded(request.identity, fmt.Errorf("scheduled degraded cache quarantine: %w", err))
+			}
 		case response := <-s.trashRequests:
-			response <- s.cleanupTrashBatch()
+			response <- errors.Join(s.retryProjectRegistry(), s.cleanupTrashBatch())
 		}
 	}
 }
@@ -54,12 +61,14 @@ func (s *Store) CleanupTrash(ctx context.Context) error {
 	}
 }
 
-func (s *Store) cleanupTrashBatch() error {
+func (collector *trashCollector) cleanupTrashBatch() error {
+	s := collector.store
 	_, err := s.cleanupTrashBatchSkipping(nil)
 	return err
 }
 
-func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]struct{}, error) {
+func (collector *trashCollector) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]struct{}, error) {
+	s := collector.store
 	// detach処理と同じmutex下でsnapshotし、作成途中のtrash entryを削除対象に含めない。
 	s.trashMu.Lock()
 	entries, err := s.readDir(filepath.Join(s.root, trashDirectoryName))
@@ -97,11 +106,6 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 		s.projectRegistryMu.Lock()
 		s.mu.Lock()
 		s.trashDeleted++
-		reservationsBeforeCleanup := make(map[uint32][]projectReservation, len(s.projectReservations))
-		for projectID, reservations := range s.projectReservations {
-			reservationsBeforeCleanup[projectID] = slices.Clone(reservations)
-		}
-		unknownReservationsBeforeCleanup := maps.Clone(s.unknownProjectReservations)
 		for projectID, reservations := range s.projectReservations {
 			kept := make([]projectReservation, 0, len(reservations))
 			for _, reservation := range reservations {
@@ -137,27 +141,23 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 		}
 		s.mu.Unlock()
 		if err := s.persistProjectReservationsLocked(); err != nil {
-			s.mu.Lock()
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("persist project ID registry after trash cleanup: %w", err))
-			s.projectReservations = reservationsBeforeCleanup
-			s.unknownProjectReservations = unknownReservationsBeforeCleanup
-			s.rebuildProjectReservationIndexes()
-			s.projectRegistryDirty = true
-			s.mu.Unlock()
 		}
 		s.projectRegistryMu.Unlock()
 	}
 	return attempted, cleanupErr
 }
 
-func (s *Store) removeTrash(path string) error {
-	if s.removeTrashEntry != nil {
-		return s.removeTrashEntry(path)
+func (collector *trashCollector) removeTrash(path string) error {
+	s := collector.store
+	if collector.removeTrashEntry != nil {
+		return collector.removeTrashEntry(path)
 	}
 	return s.removeAll(path)
 }
 
-func (s *Store) cleanupTrashUntilAttempted(ctx context.Context, attempted map[string]struct{}) error {
+func (collector *trashCollector) cleanupTrashUntilAttempted(ctx context.Context, attempted map[string]struct{}) error {
+	s := collector.store
 	if attempted == nil {
 		attempted = make(map[string]struct{})
 	}
@@ -310,12 +310,12 @@ func (s *Store) indexObjectInTrash(identity, trashID string, meta Metadata) {
 	delete(s.degraded, identity)
 }
 
-func (s *Store) syncDirectory(path string) error {
-	relative, err := s.relative(path)
+func (repository *metadataRepository) syncDirectory(path string) error {
+	relative, err := repository.relative(path)
 	if err != nil {
 		return err
 	}
-	handle, err := s.rootFS.Open(relative)
+	handle, err := repository.rootFS.Open(relative)
 	if err != nil {
 		return err
 	}

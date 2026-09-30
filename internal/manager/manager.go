@@ -80,6 +80,7 @@ type Options struct {
 	Client           kubernetes.Interface
 	InspectMount     MountInspector
 	FallbackStore    *cache.Store
+	AllowForceDelete bool
 	Logger           *slog.Logger
 	Metrics          *metrics.Metrics
 }
@@ -90,6 +91,7 @@ type Manager struct {
 	pressureInterval time.Duration
 	client           kubernetes.Interface
 	inspectMount     MountInspector
+	allowForceDelete bool
 	logger           *slog.Logger
 	metrics          *metrics.Metrics
 	storeNames       []string
@@ -120,6 +122,7 @@ func New(store *cache.Store, options Options) *Manager {
 		pressureInterval: options.PressureInterval,
 		client:           options.Client,
 		inspectMount:     options.InspectMount,
+		allowForceDelete: options.AllowForceDelete,
 		logger:           options.Logger,
 		metrics:          options.Metrics,
 		evictions:        make(map[evictionKey]evictionState),
@@ -269,17 +272,21 @@ func (m *Manager) evictWithBackoff(ctx context.Context, victim cache.PressureVic
 	lease := victim.Lease
 	key := evictionKey{namespace: lease.Namespace, podUID: lease.PodUID}
 	now := time.Now()
+	forceDelete := victim.ForceDelete && m.allowForceDelete
 	state, found := m.evictionState(key)
-	if found && state.shouldSkip(now) && (!victim.ForceDelete || state.forceDeleteAttempted || state.gone) {
+	if found && state.shouldSkip(now) && (!forceDelete || state.forceDeleteAttempted || state.gone) {
 		return
 	}
 
 	var err error
 	action := "eviction"
-	if victim.ForceDelete {
+	if forceDelete {
 		action = "force_delete"
 		err = m.forceDelete(ctx, lease)
 	} else {
+		if victim.ForceDelete {
+			m.logger.WarnContext(ctx, "critical cache pressure force deletion is disabled; falling back to Pod eviction that respects PodDisruptionBudgets", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID)
+		}
 		err = m.evict(ctx, lease)
 	}
 	result := "accepted"
@@ -300,23 +307,23 @@ func (m *Manager) evictWithBackoff(ctx context.Context, victim cache.PressureVic
 		return
 	}
 	state = nextEvictionState(now, state, err)
-	if victim.ForceDelete {
+	if forceDelete {
 		state.forceDeleteAttempted = true
 	}
 	m.setEvictionState(key, state)
 	if err != nil {
-		if apierrors.IsTooManyRequests(err) && !victim.ForceDelete {
+		if apierrors.IsTooManyRequests(err) && !forceDelete {
 			m.logger.WarnContext(ctx, "Pod eviction was blocked, possibly by a PodDisruptionBudget", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
 			return
 		}
-		if victim.ForceDelete {
+		if forceDelete {
 			m.logger.WarnContext(ctx, "Pod force deletion at critical cache pressure failed", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
 		} else {
 			m.logger.WarnContext(ctx, "Pod eviction for cache pressure failed", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", state.nextAttempt.Sub(now), "error", err)
 		}
 		return
 	}
-	if victim.ForceDelete {
+	if forceDelete {
 		m.logger.WarnContext(ctx, "requested UID-preconditioned Pod force deletion at critical cache pressure", "namespace", lease.Namespace, "pod", lease.PodName, "podUID", lease.PodUID, "retryAfter", acceptedEvictionDelay)
 		return
 	}

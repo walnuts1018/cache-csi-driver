@@ -26,22 +26,9 @@ const (
 )
 
 // CacheClassSpec defines storage and reuse behavior for node-local cache generations.
-// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || (has(self.backend) && self.backend == 'xfs-project')",message="quota requires the xfs-project backend"
-// +kubebuilder:validation:XValidation:rule="!has(self.backend) || self.backend != 'xfs-project' || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled)",message="xfs-project backend requires quota to be enabled"
-// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !quantity(string(self.maxBytes)).isLessThan(quantity('0'))",message="maxBytes must not be negative"
-// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isLessThan(quantity('0'))",message="quota.defaultMaxBytes must not be negative"
-// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !quantity(string(self.maxBytes)).isGreaterThan(quantity('0')) || (has(self.quota) && has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')",message="maxBytes requires quota to be enabled with the xfs-project backend"
-// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity('0')) || (has(self.quota.enabled) && self.quota.enabled && has(self.backend) && self.backend == 'xfs-project')",message="quota.defaultMaxBytes requires quota to be enabled with the xfs-project backend"
-// +kubebuilder:validation:XValidation:rule="!has(self.quota) || !has(self.quota.enabled) || !self.quota.enabled || ((has(self.maxBytes) && quantity(string(self.maxBytes)).isGreaterThan(quantity('0'))) || (has(self.quota.defaultMaxBytes) && quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity('0'))))",message="quota requires maxBytes or quota.defaultMaxBytes"
-// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !quantity(string(self.maxBytes)).isGreaterThan(quantity('0')) || !has(self.quota) || !has(self.quota.defaultMaxBytes) || !quantity(string(self.quota.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))",message="quota.defaultMaxBytes must not exceed maxBytes"
 type CacheClassSpec struct {
-	// Storage backend used for cache generations.
-	// +kubebuilder:default=directory
-	// +kubebuilder:validation:Enum=directory;xfs-project
-	Backend CacheBackend `json:"backend,omitempty"`
-	// Maximum per-cache quota ceiling for volume-level maxBytes requests in this class. Requires quota.enabled and the xfs-project backend; requests above this limit are rejected.
-	// +kubebuilder:validation:Type=string
-	MaxBytes resource.Quantity `json:"maxBytes,omitzero"`
+	// Storage backend and quota limits used for cache generations.
+	Storage StoragePolicy `json:"storage"`
 	// Maximum age of an unused cache before it becomes eligible for garbage collection.
 	// +kubebuilder:default="72h"
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retention must not be negative"
@@ -62,8 +49,6 @@ type CacheClassSpec struct {
 	// +kubebuilder:default=ServiceAccount
 	// +kubebuilder:validation:Enum=ServiceAccount;Namespace
 	Scope CacheScope `json:"scope,omitempty"`
-	// Quota configuration for cache generations.
-	Quota QuotaPolicy `json:"quota,omitzero"`
 	// Policy for active cache generations during filesystem pressure. ForceDelete requires the node's critical pressure watermark and explicit Pod delete RBAC.
 	// +kubebuilder:default=UnusedOnly
 	// +kubebuilder:validation:Enum=UnusedOnly;Evict;ForceDelete
@@ -72,9 +57,22 @@ type CacheClassSpec struct {
 	NoExec bool `json:"noExec,omitempty"`
 }
 
-type QuotaPolicy struct {
-	// Enables XFS project quota enforcement for each cache identity. Requires the xfs-project backend and a per-cache limit in maxBytes or defaultMaxBytes.
-	Enabled bool `json:"enabled,omitempty"`
+// StoragePolicy defines the filesystem backend and quota limits for cache generations.
+// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !quantity(string(self.maxBytes)).isLessThan(quantity('0'))",message="maxBytes must not be negative"
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultMaxBytes) || !quantity(string(self.defaultMaxBytes)).isLessThan(quantity('0'))",message="defaultMaxBytes must not be negative"
+// +kubebuilder:validation:XValidation:rule="self.backend != 'directory' || (!has(self.maxBytes) && !has(self.defaultMaxBytes))",message="directory backend does not support quota limits"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || quantity(string(self.maxBytes)).isGreaterThan(quantity('0'))",message="maxBytes must be greater than zero"
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultMaxBytes) || quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity('0'))",message="defaultMaxBytes must be greater than zero"
+// +kubebuilder:validation:XValidation:rule="self.backend != 'xfs-project' || ((has(self.maxBytes) && quantity(string(self.maxBytes)).isGreaterThan(quantity('0'))) || (has(self.defaultMaxBytes) && quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity('0'))))",message="xfs-project backend requires maxBytes or defaultMaxBytes"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxBytes) || !has(self.defaultMaxBytes) || !quantity(string(self.defaultMaxBytes)).isGreaterThan(quantity(string(self.maxBytes)))",message="defaultMaxBytes must not exceed maxBytes"
+type StoragePolicy struct {
+	// Storage backend used for cache generations.
+	// +kubebuilder:default=directory
+	// +kubebuilder:validation:Enum=directory;xfs-project
+	Backend CacheBackend `json:"backend"`
+	// Maximum per-cache quota ceiling for volume-level maxBytes requests in this class. Requests above this limit are rejected.
+	// +kubebuilder:validation:Type=string
+	MaxBytes resource.Quantity `json:"maxBytes,omitzero"`
 	// Per-cache hard limit used when the CSI volume context omits maxBytes. If maxBytes is set, this default must not exceed the class ceiling.
 	// +kubebuilder:validation:Type=string
 	DefaultMaxBytes resource.Quantity `json:"defaultMaxBytes,omitzero"`
@@ -82,8 +80,8 @@ type QuotaPolicy struct {
 
 // CacheClass is the schema for cacheclasses.
 // +kubebuilder:resource:scope=Cluster,shortName=cc
-// +kubebuilder:printcolumn:name="Backend",type=string,JSONPath=".spec.backend"
-// +kubebuilder:printcolumn:name="MaxBytes",type=string,JSONPath=".spec.maxBytes"
+// +kubebuilder:printcolumn:name="Backend",type=string,JSONPath=".spec.storage.backend"
+// +kubebuilder:printcolumn:name="MaxBytes",type=string,JSONPath=".spec.storage.maxBytes"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:object:root=true
 type CacheClass struct {

@@ -57,7 +57,7 @@ func (s *Store) Collect(now time.Time) error {
 	s.mu.Unlock()
 	slices.SortFunc(candidates, func(left, right candidate) int { return left.meta.LastUsed.Compare(right.meta.LastUsed) })
 	for _, item := range candidates[:min(len(candidates), trashBatchSize)] {
-		unlockIdentity := s.identityLocks.lock(item.identity)
+		unlockIdentity := s.lockIdentity(item.identity)
 		meta, err := s.readObjectMetadata(item.identity)
 		if err != nil || len(meta.Leases) != 0 || meta.Policy.Retention <= 0 || now.Sub(meta.LastUsed) < meta.Policy.Retention {
 			unlockIdentity()
@@ -129,7 +129,7 @@ func (s *Store) ReclaimPressure(ctx context.Context) error {
 		item := candidates[nextCandidate]
 		nextCandidate++
 		s.mu.Unlock()
-		unlockIdentity := s.identityLocks.lock(item.identity)
+		unlockIdentity := s.lockIdentity(item.identity)
 		meta, err := s.readObjectMetadata(item.identity)
 		if err != nil || len(meta.Leases) != 0 || !meta.LastUsed.Equal(item.lastUsed) {
 			unlockIdentity()
@@ -189,38 +189,38 @@ func pressureCleanupResult(err error) error {
 	return errors.Join(ErrPressureReclaimIncomplete, err)
 }
 
-func (s *Store) underLowWatermark(fs unix.Statfs_t) bool {
-	return below(fs.Bavail, fs.Blocks, s.pressure.LowFreePercent) || below(fs.Ffree, fs.Files, s.pressure.LowInodeFreePercent)
+func (manager *pressureManager) underLowWatermark(fs unix.Statfs_t) bool {
+	return below(fs.Bavail, fs.Blocks, manager.pressure.LowFreePercent) || below(fs.Ffree, fs.Files, manager.pressure.LowInodeFreePercent)
 }
 
-func (s *Store) updatePressure(fs unix.Statfs_t) bool {
-	if !s.pressureActive {
-		s.pressureActive = s.underLowWatermark(fs)
-		s.updatePressureState(fs)
-		return s.pressureActive
+func (manager *pressureManager) updatePressure(fs unix.Statfs_t) bool {
+	if !manager.pressureActive {
+		manager.pressureActive = manager.underLowWatermark(fs)
+		manager.updatePressureState(fs)
+		return manager.pressureActive
 	}
-	bytesRecovered := s.pressure.HighFreePercent == 0 || above(fs.Bavail, fs.Blocks, s.pressure.HighFreePercent)
-	inodesRecovered := s.pressure.HighInodeFreePercent == 0 || above(fs.Ffree, fs.Files, s.pressure.HighInodeFreePercent)
+	bytesRecovered := manager.pressure.HighFreePercent == 0 || above(fs.Bavail, fs.Blocks, manager.pressure.HighFreePercent)
+	inodesRecovered := manager.pressure.HighInodeFreePercent == 0 || above(fs.Ffree, fs.Files, manager.pressure.HighInodeFreePercent)
 	if bytesRecovered && inodesRecovered {
-		s.pressureActive = false
+		manager.pressureActive = false
 	}
-	s.updatePressureState(fs)
-	return s.pressureActive
+	manager.updatePressureState(fs)
+	return manager.pressureActive
 }
 
-func (s *Store) updatePressureState(fs unix.Statfs_t) {
-	s.pressureState = pressureStateNormal
-	if !s.pressureActive {
+func (manager *pressureManager) updatePressureState(fs unix.Statfs_t) {
+	manager.pressureState = pressureStateNormal
+	if !manager.pressureActive {
 		return
 	}
-	s.pressureState = "reclaiming"
-	if s.underCriticalWatermark(fs) {
-		s.pressureState = "critical"
+	manager.pressureState = "reclaiming"
+	if manager.underCriticalWatermark(fs) {
+		manager.pressureState = "critical"
 	}
 }
 
-func (s *Store) underCriticalWatermark(fs unix.Statfs_t) bool {
-	return below(fs.Bavail, fs.Blocks, s.pressure.CriticalFreePercent) || below(fs.Ffree, fs.Files, s.pressure.CriticalInodeFreePercent)
+func (manager *pressureManager) underCriticalWatermark(fs unix.Statfs_t) bool {
+	return below(fs.Bavail, fs.Blocks, manager.pressure.CriticalFreePercent) || below(fs.Ffree, fs.Files, manager.pressure.CriticalInodeFreePercent)
 }
 
 func (s *Store) MetadataError() error {
@@ -289,7 +289,7 @@ func (s *Store) pressureVictimSnapshot(fs unix.Statfs_t) (bool, bool, []string, 
 }
 
 func (s *Store) retirePressureCandidate(candidate pressureVictimCandidate) ([]PressureVictim, bool, error) {
-	unlockIdentity := s.identityLocks.lock(candidate.identity)
+	unlockIdentity := s.lockIdentity(candidate.identity)
 	defer unlockIdentity()
 	meta, err := s.readObjectMetadata(candidate.identity)
 	if err != nil || s.activeLeaseCount(meta) == 0 || !policyAllowsPressureTermination(meta.Policy.PressurePolicy) || s.hasPreparingGenerationLease(meta, meta.Generation) {
@@ -317,6 +317,7 @@ func (s *Store) retirePressureCandidate(candidate pressureVictimCandidate) ([]Pr
 		return nil, false, nil
 	}
 	meta.Retired = append(meta.Retired, RetiredGeneration{
+		State:           GenerationStateRetiring,
 		Generation:      meta.Generation,
 		ProjectID:       meta.ProjectID,
 		ProjectAssigned: meta.ProjectAssigned,
@@ -324,6 +325,7 @@ func (s *Store) retirePressureCandidate(candidate pressureVictimCandidate) ([]Pr
 		Policy:          meta.Policy,
 	})
 	meta.Generation = uuid.NewV7().String()
+	meta.GenerationState = GenerationStateActive
 	meta.CreatedAt = time.Now().UTC()
 	replacementPath := filepath.Join(candidate.path, "generations", meta.Generation)
 	if err := s.ensureDirectory(replacementPath); err != nil {
@@ -342,14 +344,14 @@ func (s *Store) retirePressureCandidate(candidate pressureVictimCandidate) ([]Pr
 
 func (s *Store) retiredPressureVictims(identities []string, criticalPressure bool) ([]PressureVictim, error) {
 	for _, identity := range identities {
-		unlockIdentity := s.identityLocks.lock(identity)
+		unlockIdentity := s.lockIdentity(identity)
 		meta, err := s.readObjectMetadata(identity)
 		if err != nil {
 			unlockIdentity()
 			continue
 		}
 		for _, retired := range meta.Retired {
-			if !policyAllowsPressureTermination(retired.Policy.PressurePolicy) || s.hasPreparingGenerationLease(meta, retired.Generation) {
+			if retired.State == GenerationStateRetired || !s.hasGenerationLeases(meta, retired.Generation) || !policyAllowsPressureTermination(retired.Policy.PressurePolicy) || s.hasPreparingGenerationLease(meta, retired.Generation) {
 				continue
 			}
 			victims := make([]PressureVictim, 0)

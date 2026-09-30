@@ -32,6 +32,9 @@ csiDriver:
 
 admissionPolicy:
   enabled: true
+  cacheClassAllowlist:
+    enabled: false
+    annotationKey: cache.storage.walnuts.dev/allowed-cache-classes
 
 rbac:
   createPodEvictions: false

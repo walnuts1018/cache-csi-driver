@@ -3,11 +3,10 @@ kind: CacheClass
 metadata:
   name: xfs-project
 spec:
-  backend: xfs-project
-  maxBytes: 64Gi
+  storage:
+    backend: xfs-project
+    maxBytes: 64Gi
+    defaultMaxBytes: 16Gi
   retention: 72h
   schemaVersion: v1
   crashRecovery: discard
-  quota:
-    enabled: true
-    defaultMaxBytes: 16Gi

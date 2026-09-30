@@ -41,59 +41,87 @@ type PressureConfig struct {
 }
 
 type StoreOptions struct {
-	Pressure          PressureConfig
-	ProjectIDStart    uint32
-	ProjectIDCount    uint32
-	UnmountGeneration func(string) error
+	Pressure              PressureConfig
+	ProjectIDStart        uint32
+	ProjectIDCount        uint32
+	UnmountGeneration     func(string) error
+	RequireRootMountpoint bool
 }
 
 type Store struct {
-	root                       string
-	rootFS                     *os.Root
-	unmountGeneration          func(string) error
-	pressure                   PressureConfig
+	metadataRepository
+	generationManager
+	leaseManager
+	projectQuotaRegistry
+	pressureManager
+	trashCollector
+	unmountGeneration func(string) error
+	mu                sync.Mutex
+	closeOnce         sync.Once
+	closeErr          error
+	initDone          chan struct{}
+	initErr           error
+	indexReady        atomic.Bool
+	ready             atomic.Bool
+	// lease lockを取得してからidentity lockを取得し、project registry lockの後にmuを取得します。muはfilesystem I/O中に保持しません。
+	recoveryMu sync.Mutex
+}
+
+type metadataRepository struct {
+	root   string
+	rootFS *os.Root
+}
+
+type generationManager struct {
+	store                  *Store
+	metadataByIdentity     map[string]Metadata
+	leaseIndex             map[string]string
+	degraded               map[string]error
+	fallbackReservedBytes  int64
+	retiredGenerationCount int
+}
+
+type leaseManager struct {
+	identityLocks keyedMutexes
+	leaseLocks    keyedMutexes
+	fallbackMu    sync.Mutex
+}
+
+// projectQuotaRegistryはcache metadataをcanonical sourceとしてproject ID予約indexを管理します。永続registryはmetadataから再構築でき、保存失敗はdirty状態のまま再試行します。
+type projectQuotaRegistry struct {
+	store                      *Store
 	projectIDStart             uint32
 	projectIDCount             uint32
 	projectRegistryDamaged     bool
 	projectRegistryDirty       bool
-	pressureActive             bool
-	pressureState              string
-	pressureDetachFailed       map[string]struct{}
-	metadataByIdentity         map[string]Metadata
-	leaseIndex                 map[string]string
-	degraded                   map[string]error
 	projectReservations        map[uint32][]projectReservation
 	projectOwnersByID          map[uint32]projectReservationKey
 	projectIDByGeneration      map[projectReservationKey]uint32
 	unknownProjectReservations map[string]string
-	trashMetadata              map[string]Metadata
-	trashDeleted               uint64
-	fallbackReservedBytes      int64
-	retiredGenerationCount     int
-	trashCursor                string
-	removeTrashEntry           func(string) error
-	mu                         sync.Mutex
-	stopTrash                  chan struct{}
-	trashDone                  chan struct{}
-	trashRequests              chan chan error
-	closeOnce                  sync.Once
-	closeErr                   error
-	initDone                   chan struct{}
-	initErr                    error
-	indexReady                 atomic.Bool
-	ready                      atomic.Bool
-	// lease lockを取得してからidentity lockを取得し、project registry lockの後にmuを取得します。muはfilesystem I/O中に保持しません。
-	identityLocks keyedMutexes
-	leaseLocks    keyedMutexes
-	// project IDはcache root全体で一意なため、registry fileの更新を直列化します。
-	projectRegistryMu sync.Mutex
-	fallbackMu        sync.Mutex
-	// trashのdetach中にcollectorが作成途中のentryをsnapshotしないようにします。
-	trashMu           sync.Mutex
-	recoveryMu        sync.Mutex
-	collectorMu       sync.Mutex
-	collectorStarted  bool
-	collectorFinished bool
+	projectRegistryMu          sync.Mutex
+}
+
+type pressureManager struct {
+	pressure             PressureConfig
+	pressureActive       bool
+	pressureState        string
+	pressureDetachFailed map[string]struct{}
+}
+
+type trashCollector struct {
+	store              *Store
+	trashMetadata      map[string]Metadata
+	trashDeleted       uint64
+	trashCursor        string
+	removeTrashEntry   func(string) error
+	stopTrash          chan struct{}
+	trashDone          chan struct{}
+	trashRequests      chan chan error
+	quarantineRequests chan quarantineRequest
+	trashMu            sync.Mutex
+	collectorMu        sync.Mutex
+	collectorStarted   bool
+	collectorFinished  bool
 }
 
 type keyedMutexes struct {
@@ -104,6 +132,14 @@ type keyedMutexes struct {
 type keyedMutex struct {
 	mu   sync.Mutex
 	refs int
+}
+
+func (manager *leaseManager) lockIdentity(identity string) func() {
+	return manager.identityLocks.lock(identity)
+}
+
+func (manager *leaseManager) lockLease(leaseID string) func() {
+	return manager.leaseLocks.lock(leaseID)
 }
 
 func (m *keyedMutexes) lock(key string) func() {
@@ -197,40 +233,40 @@ func (s *Store) WaitForIndexes(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) relative(path string) (string, error) {
-	relative, err := filepath.Rel(s.root, filepath.Clean(path))
+func (repository *metadataRepository) relative(path string) (string, error) {
+	relative, err := filepath.Rel(repository.root, filepath.Clean(path))
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return "", fmt.Errorf("path %q is outside cache root", path)
 	}
 	return relative, nil
 }
 
-func (s *Store) readDir(path string) ([]os.DirEntry, error) {
-	relative, err := s.relative(path)
+func (repository *metadataRepository) readDir(path string) ([]os.DirEntry, error) {
+	relative, err := repository.relative(path)
 	if err != nil {
 		return nil, err
 	}
-	return fs.ReadDir(s.rootFS.FS(), relative)
+	return fs.ReadDir(repository.rootFS.FS(), relative)
 }
 
-func (s *Store) stat(path string) error {
-	relative, err := s.relative(path)
+func (repository *metadataRepository) stat(path string) error {
+	relative, err := repository.relative(path)
 	if err != nil {
 		return err
 	}
-	_, err = s.rootFS.Stat(relative)
+	_, err = repository.rootFS.Stat(relative)
 	return err
 }
 
-func (s *Store) ensureDirectory(path string) error {
-	relative, err := s.relative(path)
+func (repository *metadataRepository) ensureDirectory(path string) error {
+	relative, err := repository.relative(path)
 	if err != nil {
 		return err
 	}
-	if err := s.rootFS.MkdirAll(relative, 0o700); err != nil {
+	if err := repository.rootFS.MkdirAll(relative, 0o700); err != nil {
 		return err
 	}
-	info, err := s.rootFS.Lstat(relative)
+	info, err := repository.rootFS.Lstat(relative)
 	if err != nil {
 		return err
 	}
@@ -240,24 +276,24 @@ func (s *Store) ensureDirectory(path string) error {
 	return nil
 }
 
-func (s *Store) rename(oldPath, newPath string) error {
-	oldRelative, err := s.relative(oldPath)
+func (repository *metadataRepository) rename(oldPath, newPath string) error {
+	oldRelative, err := repository.relative(oldPath)
 	if err != nil {
 		return err
 	}
-	newRelative, err := s.relative(newPath)
+	newRelative, err := repository.relative(newPath)
 	if err != nil {
 		return err
 	}
-	return s.rootFS.Rename(oldRelative, newRelative)
+	return repository.rootFS.Rename(oldRelative, newRelative)
 }
 
-func (s *Store) removeAll(path string) error {
-	relative, err := s.relative(path)
+func (repository *metadataRepository) removeAll(path string) error {
+	relative, err := repository.relative(path)
 	if err != nil {
 		return err
 	}
-	return s.rootFS.RemoveAll(relative)
+	return repository.rootFS.RemoveAll(relative)
 }
 
 func NewStore(root string, options StoreOptions) (*Store, error) {
@@ -288,6 +324,12 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		_ = rootFS.Close()
 		return nil, err
 	}
+	if options.RequireRootMountpoint {
+		if err := validateRootMountpoint(root); err != nil {
+			_ = rootFS.Close()
+			return nil, fmt.Errorf("validate cache root mountpoint: %w", err)
+		}
+	}
 	if options.ProjectIDStart == 0 && options.ProjectIDCount == 0 {
 		options.ProjectIDStart = 2_000_000_000
 		options.ProjectIDCount = 1_000_000
@@ -301,27 +343,30 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		return nil, fmt.Errorf("create cache trash directory: %w", err)
 	}
 	store := &Store{
-		root:                       root,
-		rootFS:                     rootFS,
-		unmountGeneration:          options.UnmountGeneration,
-		pressure:                   options.Pressure,
-		pressureState:              pressureStateNormal,
-		projectIDStart:             options.ProjectIDStart,
-		projectIDCount:             options.ProjectIDCount,
-		pressureDetachFailed:       make(map[string]struct{}),
+		metadataRepository:         metadataRepository{root: root, rootFS: rootFS},
 		metadataByIdentity:         make(map[string]Metadata),
 		leaseIndex:                 make(map[string]string),
 		degraded:                   make(map[string]error),
+		projectIDStart:             options.ProjectIDStart,
+		projectIDCount:             options.ProjectIDCount,
 		projectReservations:        make(map[uint32][]projectReservation),
 		projectOwnersByID:          make(map[uint32]projectReservationKey),
 		projectIDByGeneration:      make(map[projectReservationKey]uint32),
 		unknownProjectReservations: make(map[string]string),
+		pressure:                   options.Pressure,
+		pressureState:              pressureStateNormal,
+		pressureDetachFailed:       make(map[string]struct{}),
 		trashMetadata:              make(map[string]Metadata),
 		stopTrash:                  make(chan struct{}),
 		trashDone:                  make(chan struct{}),
 		trashRequests:              make(chan chan error),
+		quarantineRequests:         make(chan quarantineRequest, 64),
+		unmountGeneration:          options.UnmountGeneration,
 		initDone:                   make(chan struct{}),
 	}
+	store.generationManager.store = store
+	store.projectQuotaRegistry.store = store
+	store.trashCollector.store = store
 	if initializeIndexes {
 		if err := store.rebuildIndexes(); err != nil {
 			_ = rootFS.Close()
@@ -394,7 +439,8 @@ func (s *Store) resetIndexState() {
 	s.trashCursor = ""
 }
 
-func (s *Store) startTrashCollector() {
+func (collector *trashCollector) startTrashCollector() {
+	s := collector.store
 	s.collectorMu.Lock()
 	defer s.collectorMu.Unlock()
 	if s.collectorStarted || s.collectorFinished {
@@ -410,7 +456,8 @@ func (s *Store) startTrashCollector() {
 	}
 }
 
-func (s *Store) finishTrashCollector() {
+func (collector *trashCollector) finishTrashCollector() {
+	s := collector.store
 	s.collectorMu.Lock()
 	defer s.collectorMu.Unlock()
 	if s.collectorFinished {
@@ -420,9 +467,9 @@ func (s *Store) finishTrashCollector() {
 	close(s.trashDone)
 }
 
-func (s *Store) stopRequested() bool {
+func (collector *trashCollector) stopRequested() bool {
 	select {
-	case <-s.stopTrash:
+	case <-collector.stopTrash:
 		return true
 	default:
 		return false

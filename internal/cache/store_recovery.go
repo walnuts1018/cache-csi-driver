@@ -157,7 +157,7 @@ func (s *Store) FindDegradedGenerationForTarget(target string, sameSource func(s
 	s.mu.Unlock()
 	var matchedIdentity, matchedSource string
 	for _, identity := range identities {
-		unlockIdentity := s.identityLocks.lock(identity)
+		unlockIdentity := s.lockIdentity(identity)
 		s.mu.Lock()
 		_, degraded := s.degraded[identity]
 		s.mu.Unlock()
@@ -223,7 +223,7 @@ func (s *Store) CleanupDegradedObject(identity string, sourceMounted func(source
 	if !validIdentity(identity) || sourceMounted == nil {
 		return errors.New("valid degraded cache identity and mount inspector are required")
 	}
-	unlockIdentity := s.identityLocks.lock(identity)
+	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	s.mu.Lock()
 	if _, degraded := s.degraded[identity]; !degraded {
@@ -283,7 +283,7 @@ func (s *Store) RecoverDegraded(ctx context.Context, verifyMount func(source str
 		if err := ctx.Err(); err != nil {
 			return errors.Join(recoveryErr, err)
 		}
-		unlockIdentity := s.identityLocks.lock(identity)
+		unlockIdentity := s.lockIdentity(identity)
 		s.mu.Lock()
 		_, degraded := s.degraded[identity]
 		s.mu.Unlock()
@@ -320,7 +320,7 @@ func (s *Store) RecoverLeasesContext(ctx context.Context, verifyMount func(sourc
 			return err
 		}
 		if entry.IsDir() && entry.Name() != trashDirectoryName {
-			unlockIdentity := s.identityLocks.lock(entry.Name())
+			unlockIdentity := s.lockIdentity(entry.Name())
 			if err := s.recoverObjectLeases(ctx, filepath.Join(s.root, entry.Name()), entry.Name(), verifyMount); err != nil {
 				unlockIdentity()
 				return err
@@ -405,7 +405,7 @@ func (s *Store) recoverValidObjectLeases(ctx context.Context, path, identity str
 	allLeasesActive := len(active) == len(meta.Leases)
 	if allLeasesActive && (len(active) > 0 || !wasDirty || meta.Policy.CrashRecoveryReuse) {
 		meta.Leases = active
-		if hadPreparingLease {
+		if hadPreparingLease || metadataNeedsNormalization(meta) {
 			if err := s.writeMetadata(path, meta); err != nil {
 				s.markDegraded(identity, err)
 			}
@@ -476,11 +476,12 @@ func (s *Store) recoverDirtyObject(path, identity string, meta Metadata) error {
 		return fmt.Errorf("create cache object after recovery: %w", err)
 	}
 	meta = Metadata{
-		Identity:   identity,
-		Generation: uuid.NewV7().String(),
-		CreatedAt:  time.Now().UTC(),
-		LastUsed:   time.Now().UTC(),
-		Policy:     meta.Policy,
+		Identity:        identity,
+		Generation:      uuid.NewV7().String(),
+		GenerationState: GenerationStateActive,
+		CreatedAt:       time.Now().UTC(),
+		LastUsed:        time.Now().UTC(),
+		Policy:          meta.Policy,
 	}
 	if err := s.writeMetadata(path, meta); err != nil {
 		s.markDegraded(identity, err)
@@ -495,8 +496,16 @@ func (s *Store) recoverRetiredGenerations(ctx context.Context, path, identity st
 		}
 		retired := meta.Retired[index]
 		if slices.ContainsFunc(active, func(lease Lease) bool { return lease.Generation == retired.Generation }) {
+			meta.Retired[index].State = GenerationStateRetiring
 			index++
 			continue
+		}
+		if meta.Retired[index].State != GenerationStateRetired {
+			meta.Retired[index].State = GenerationStateRetired
+			if err := s.writeMetadata(path, *meta); err != nil {
+				s.markDegraded(identity, err)
+				return true, nil
+			}
 		}
 		if err := s.detachGenerationToTrash(filepath.Join(path, "generations", retired.Generation), identity, retired); err != nil {
 			s.markDegraded(identity, err)

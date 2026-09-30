@@ -42,7 +42,8 @@ type unknownProjectReservation struct {
 	TrashID  string `json:"trashID,omitempty"`
 }
 
-func (s *Store) loadProjectRegistry() bool {
+func (registry *projectQuotaRegistry) loadProjectRegistry() bool {
+	s := registry.store
 	s.projectRegistryMu.Lock()
 	defer s.projectRegistryMu.Unlock()
 	data, err := s.rootFS.ReadFile(projectRegistryName)
@@ -88,7 +89,8 @@ func (s *Store) loadProjectRegistry() bool {
 	return false
 }
 
-func (s *Store) reconcileProjectReservations(entries, trashEntries []os.DirEntry) error {
+func (registry *projectQuotaRegistry) reconcileProjectReservations(entries, trashEntries []os.DirEntry) error {
+	s := registry.store
 	objects := make(map[string]os.DirEntry, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() && entry.Name() != trashDirectoryName {
@@ -153,7 +155,8 @@ func (s *Store) reconcileProjectReservations(entries, trashEntries []os.DirEntry
 	return nil
 }
 
-func (s *Store) reconcileProjectReservation(projectID uint32, reservation projectReservation, objects, trash map[string]os.DirEntry) (projectReservation, bool) {
+func (registry *projectQuotaRegistry) reconcileProjectReservation(projectID uint32, reservation projectReservation, objects, trash map[string]os.DirEntry) (projectReservation, bool) {
+	s := registry.store
 	if reservation.TrashID != "" {
 		if _, exists := trash[reservation.TrashID]; exists {
 			return reservation, true
@@ -189,7 +192,8 @@ func (s *Store) reconcileProjectReservation(projectID uint32, reservation projec
 	return reservation, false
 }
 
-func (s *Store) reconcileUnknownProjectReservation(identity, trashID string, objects, trash map[string]os.DirEntry) (string, bool) {
+func (registry *projectQuotaRegistry) reconcileUnknownProjectReservation(identity, trashID string, objects, trash map[string]os.DirEntry) (string, bool) {
+	s := registry.store
 	if trashID != "" {
 		if _, exists := trash[trashID]; exists {
 			return trashID, true
@@ -217,7 +221,8 @@ func metadataHasProjectReservation(meta Metadata, projectID uint32, generation s
 	})
 }
 
-func (s *Store) addMetadataReservations(meta Metadata, trashID string) {
+func (registry *projectQuotaRegistry) addMetadataReservations(meta Metadata, trashID string) {
+	s := registry.store
 	if meta.ProjectID != 0 {
 		s.addProjectReservation(meta.ProjectID, projectReservation{Identity: meta.Identity, Generation: meta.Generation, TrashID: trashID})
 	}
@@ -228,7 +233,8 @@ func (s *Store) addMetadataReservations(meta Metadata, trashID string) {
 	}
 }
 
-func (s *Store) addProjectReservation(projectID uint32, reservation projectReservation) {
+func (registry *projectQuotaRegistry) addProjectReservation(projectID uint32, reservation projectReservation) {
+	s := registry.store
 	key := projectReservationKey{identity: reservation.Identity, generation: reservation.Generation}
 	if existing, found := s.projectOwnersByID[projectID]; found && existing != key {
 		s.projectRegistryDamaged = true
@@ -255,7 +261,8 @@ func (s *Store) addProjectReservation(projectID uint32, reservation projectReser
 	s.projectRegistryDirty = true
 }
 
-func (s *Store) rebuildProjectReservationIndexes() {
+func (registry *projectQuotaRegistry) rebuildProjectReservationIndexes() {
+	s := registry.store
 	clear(s.projectOwnersByID)
 	clear(s.projectIDByGeneration)
 	for projectID, reservations := range s.projectReservations {
@@ -275,7 +282,8 @@ func (s *Store) rebuildProjectReservationIndexes() {
 	}
 }
 
-func (s *Store) syncProjectReservationIndexes(projectID uint32) {
+func (registry *projectQuotaRegistry) syncProjectReservationIndexes(projectID uint32) {
+	s := registry.store
 	reservations := s.projectReservations[projectID]
 	if len(reservations) == 0 {
 		delete(s.projectOwnersByID, projectID)
@@ -298,7 +306,8 @@ func (s *Store) syncProjectReservationIndexes(projectID uint32) {
 	}
 }
 
-func (s *Store) addUnknownProjectReservation(identity, trashID string) {
+func (registry *projectQuotaRegistry) addUnknownProjectReservation(identity, trashID string) {
+	s := registry.store
 	if existing, exists := s.unknownProjectReservations[identity]; exists && existing == trashID {
 		return
 	}
@@ -306,7 +315,8 @@ func (s *Store) addUnknownProjectReservation(identity, trashID string) {
 	s.projectRegistryDirty = true
 }
 
-func (s *Store) persistProjectReservationsLocked() error {
+func (registry *projectQuotaRegistry) persistProjectReservationsLocked() (resultErr error) {
+	s := registry.store
 	s.mu.Lock()
 	if s.projectRegistryDamaged || !s.projectRegistryDirty {
 		s.mu.Unlock()
@@ -323,6 +333,15 @@ func (s *Store) persistProjectReservationsLocked() error {
 		unknownReservations = append(unknownReservations, unknownProjectReservation{Identity: identity, TrashID: trashID})
 	}
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if resultErr == nil {
+			s.projectRegistryDirty = false
+		} else {
+			s.projectRegistryDirty = true
+		}
+		s.mu.Unlock()
+	}()
 	sort.Slice(unknownReservations, func(i, j int) bool { return unknownReservations[i].Identity < unknownReservations[j].Identity })
 	sort.Slice(reservations, func(i, j int) bool {
 		if reservations[i].ProjectID == reservations[j].ProjectID {
@@ -376,13 +395,17 @@ func (s *Store) persistProjectReservationsLocked() error {
 	if closeErr != nil {
 		return closeErr
 	}
-	s.mu.Lock()
-	s.projectRegistryDirty = false
-	s.mu.Unlock()
 	return nil
 }
 
-func (s *Store) projectReservationLocked(projectID uint32, identity, generation string) (projectReservation, bool) {
+func (registry *projectQuotaRegistry) retryProjectRegistry() error {
+	registry.projectRegistryMu.Lock()
+	defer registry.projectRegistryMu.Unlock()
+	return registry.persistProjectReservationsLocked()
+}
+
+func (registry *projectQuotaRegistry) projectReservationLocked(projectID uint32, identity, generation string) (projectReservation, bool) {
+	s := registry.store
 	for _, reservation := range s.projectReservations[projectID] {
 		if reservation.Identity == identity && reservation.Generation == generation {
 			return reservation, true
@@ -391,7 +414,8 @@ func (s *Store) projectReservationLocked(projectID uint32, identity, generation 
 	return projectReservation{}, false
 }
 
-func (s *Store) restoreProjectReservation(projectID uint32, identity, generation string, previous projectReservation, hadPrevious bool) error {
+func (registry *projectQuotaRegistry) restoreProjectReservation(projectID uint32, identity, generation string, previous projectReservation, hadPrevious bool) error {
+	s := registry.store
 	if projectID == 0 {
 		return nil
 	}
@@ -400,7 +424,8 @@ func (s *Store) restoreProjectReservation(projectID uint32, identity, generation
 	return s.restoreProjectReservationLocked(projectID, identity, generation, previous, hadPrevious)
 }
 
-func (s *Store) restoreProjectReservationLocked(projectID uint32, identity, generation string, previous projectReservation, hadPrevious bool) error {
+func (registry *projectQuotaRegistry) restoreProjectReservationLocked(projectID uint32, identity, generation string, previous projectReservation, hadPrevious bool) error {
+	s := registry.store
 	s.mu.Lock()
 	reservations := s.projectReservations[projectID]
 	index := slices.IndexFunc(reservations, func(reservation projectReservation) bool {
@@ -434,7 +459,8 @@ func (s *Store) restoreProjectReservationLocked(projectID uint32, identity, gene
 	return nil
 }
 
-func (s *Store) projectID(identity, generation string) (uint32, error) {
+func (registry *projectQuotaRegistry) projectID(identity, generation string) (uint32, error) {
+	s := registry.store
 	s.projectRegistryMu.Lock()
 	defer s.projectRegistryMu.Unlock()
 

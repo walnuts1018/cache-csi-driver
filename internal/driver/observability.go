@@ -58,11 +58,11 @@ func fallbackCauseForResolution(err error) fallbackCause {
 	return expectedFallbackCause("api_unavailable")
 }
 
-func (s *Server) useFallback(ctx context.Context, req *csi.NodePublishVolumeRequest, requestedBytes int64, noExec bool, pressurePolicy string, cause fallbackCause, trigger error) error {
+func (s *Server) useFallback(ctx context.Context, req *csi.NodePublishVolumeRequest, cause fallbackCause, trigger error) error {
 	if cause.class == fallbackClassUnexpected {
 		s.markUnexpectedBackendFailure(ctx, cause, trigger)
 	}
-	err := s.publishFallback(ctx, req, requestedBytes, noExec, pressurePolicy)
+	err := s.publishFallback(ctx, req)
 	if err == nil && s.metrics != nil {
 		s.metrics.RecordPublish(publishOutcomeFallback)
 		s.metrics.RecordFallback(cause.class, cause.reason)

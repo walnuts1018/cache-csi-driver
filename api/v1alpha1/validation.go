@@ -6,10 +6,10 @@ import (
 )
 
 func (spec CacheClassSpec) Validate() error {
-	if err := spec.validateBackend(); err != nil {
+	if err := spec.Storage.validate(); err != nil {
 		return err
 	}
-	if err := spec.validateQuota(); err != nil {
+	if err := spec.validateCrashRecovery(); err != nil {
 		return err
 	}
 	if err := spec.validateSharingPolicy(); err != nil {
@@ -48,12 +48,32 @@ func (spec CacheClassSpec) validateScope() error {
 	}
 }
 
-func (spec CacheClassSpec) validateBackend() error {
-	switch spec.Backend {
+func (policy StoragePolicy) validate() error {
+	if policy.MaxBytes.Sign() < 0 || policy.DefaultMaxBytes.Sign() < 0 {
+		return fmt.Errorf("cache size limits must not be negative")
+	}
+	switch policy.Backend {
 	case "", BackendDirectory, BackendXFSProject:
 	default:
-		return fmt.Errorf("unsupported backend %q", spec.Backend)
+		return fmt.Errorf("unsupported backend %q", policy.Backend)
 	}
+	switch policy.Backend {
+	case "", BackendDirectory:
+		if !policy.MaxBytes.IsZero() || !policy.DefaultMaxBytes.IsZero() {
+			return fmt.Errorf("directory backend does not support quota limits")
+		}
+	case BackendXFSProject:
+		if policy.MaxBytes.IsZero() && policy.DefaultMaxBytes.IsZero() {
+			return fmt.Errorf("xfs-project backend requires maxBytes or defaultMaxBytes")
+		}
+		if !policy.MaxBytes.IsZero() && !policy.DefaultMaxBytes.IsZero() && policy.DefaultMaxBytes.Cmp(policy.MaxBytes) > 0 {
+			return fmt.Errorf("defaultMaxBytes must not exceed maxBytes")
+		}
+	}
+	return nil
+}
+
+func (spec CacheClassSpec) validateCrashRecovery() error {
 	switch spec.CrashRecovery {
 	case "", CrashRecoveryDiscard, CrashRecoveryReuse:
 		return nil
@@ -69,26 +89,4 @@ func (spec CacheClassSpec) validateSharingPolicy() error {
 	default:
 		return fmt.Errorf("unsupported sharingPolicy %q", spec.SharingPolicy)
 	}
-}
-
-func (spec CacheClassSpec) validateQuota() error {
-	if spec.MaxBytes.Sign() < 0 || spec.Quota.DefaultMaxBytes.Sign() < 0 {
-		return fmt.Errorf("cache size limits must not be negative")
-	}
-	if spec.Quota.Enabled && spec.Backend != BackendXFSProject {
-		return fmt.Errorf("quota requires the xfs-project backend")
-	}
-	if spec.Backend == BackendXFSProject && !spec.Quota.Enabled {
-		return fmt.Errorf("xfs-project backend requires quota to be enabled")
-	}
-	if !spec.Quota.Enabled && (!spec.MaxBytes.IsZero() || !spec.Quota.DefaultMaxBytes.IsZero()) {
-		return fmt.Errorf("maxBytes and quota.defaultMaxBytes require quota to be enabled")
-	}
-	if spec.Quota.Enabled && spec.MaxBytes.IsZero() && spec.Quota.DefaultMaxBytes.IsZero() {
-		return fmt.Errorf("quota requires maxBytes or quota.defaultMaxBytes")
-	}
-	if spec.Quota.Enabled && !spec.MaxBytes.IsZero() && spec.Quota.DefaultMaxBytes.Cmp(spec.MaxBytes) > 0 {
-		return fmt.Errorf("quota.defaultMaxBytes must not exceed the maxBytes ceiling")
-	}
-	return nil
 }

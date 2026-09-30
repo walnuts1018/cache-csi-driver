@@ -27,6 +27,14 @@ const PressurePolicyEvict = "Evict"
 
 const PressurePolicyForceDelete = "ForceDelete"
 
+type GenerationState string
+
+const (
+	GenerationStateActive   GenerationState = "Active"
+	GenerationStateRetiring GenerationState = "Retiring"
+	GenerationStateRetired  GenerationState = "Retired"
+)
+
 type PressureVictim struct {
 	Lease       Lease
 	ForceDelete bool
@@ -45,11 +53,12 @@ type Lease struct {
 }
 
 type RetiredGeneration struct {
-	Generation      string `json:"generation"`
-	ProjectID       uint32 `json:"projectID,omitempty"`
-	ProjectAssigned bool   `json:"projectAssigned,omitempty"`
-	QuotaBytes      int64  `json:"quotaBytes,omitempty"`
-	Policy          Policy `json:"policy"`
+	State           GenerationState `json:"state,omitempty"`
+	Generation      string          `json:"generation"`
+	ProjectID       uint32          `json:"projectID,omitempty"`
+	ProjectAssigned bool            `json:"projectAssigned,omitempty"`
+	QuotaBytes      int64           `json:"quotaBytes,omitempty"`
+	Policy          Policy          `json:"policy"`
 }
 
 type Policy struct {
@@ -91,6 +100,8 @@ type Metadata struct {
 	FormatVersion   int                 `json:"formatVersion"`
 	Identity        string              `json:"identity"`
 	Generation      string              `json:"generation"`
+	GenerationState GenerationState     `json:"generationState,omitempty"`
+	PolicyHash      string              `json:"policyHash,omitempty"`
 	CreatedAt       time.Time           `json:"createdAt"`
 	LastUsed        time.Time           `json:"lastUsed"`
 	Leases          []Lease             `json:"leases,omitempty"`
@@ -102,7 +113,8 @@ type Metadata struct {
 	Retired         []RetiredGeneration `json:"retired,omitempty"`
 }
 
-func (s *Store) indexObjectMetadata(meta Metadata) {
+func (manager *generationManager) indexObjectMetadata(meta Metadata) {
+	s := manager.store
 	_, recoveringDegraded := s.degraded[meta.Identity]
 	if previous, exists := s.metadataByIdentity[meta.Identity]; exists {
 		s.removeFallbackReservation(previous)
@@ -153,7 +165,8 @@ func (s *Store) indexObjectMetadata(meta Metadata) {
 	}
 }
 
-func (s *Store) indexMetadata(meta Metadata) {
+func (manager *generationManager) indexMetadata(meta Metadata) {
+	s := manager.store
 	s.projectRegistryMu.Lock()
 	defer s.projectRegistryMu.Unlock()
 	s.mu.Lock()
@@ -161,13 +174,15 @@ func (s *Store) indexMetadata(meta Metadata) {
 	s.indexObjectMetadata(meta)
 }
 
-func (s *Store) markDegraded(identity string, cause error) {
+func (manager *generationManager) markDegraded(identity string, cause error) {
+	s := manager.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.markDegradedLocked(identity, cause)
 }
 
-func (s *Store) markDegradedLocked(identity string, cause error) {
+func (manager *generationManager) markDegradedLocked(identity string, cause error) {
+	s := manager.store
 	if previous, exists := s.metadataByIdentity[identity]; exists {
 		s.removeFallbackReservation(previous)
 		s.retiredGenerationCount -= len(previous.Retired)
@@ -176,19 +191,22 @@ func (s *Store) markDegradedLocked(identity string, cause error) {
 	s.degraded[identity] = fmt.Errorf("%w: %v", ErrDegradedMetadata, cause)
 }
 
-func (s *Store) addFallbackReservation(meta Metadata) {
+func (manager *generationManager) addFallbackReservation(meta Metadata) {
+	s := manager.store
 	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) > 0 && meta.Policy.MaxBytes > 0 {
 		s.fallbackReservedBytes += meta.Policy.MaxBytes
 	}
 }
 
-func (s *Store) removeFallbackReservation(meta Metadata) {
+func (manager *generationManager) removeFallbackReservation(meta Metadata) {
+	s := manager.store
 	if meta.Policy.DiscardOnLastRelease && len(meta.Leases) > 0 && meta.Policy.MaxBytes > 0 {
 		s.fallbackReservedBytes -= meta.Policy.MaxBytes
 	}
 }
 
-func (s *Store) indexDegradedLeaseIDs(identity string, meta Metadata) {
+func (manager *generationManager) indexDegradedLeaseIDs(identity string, meta Metadata) {
+	s := manager.store
 	if meta.Identity != identity {
 		return
 	}
@@ -209,6 +227,18 @@ func validateMetadata(identity string, meta Metadata) error {
 	if meta.Identity != identity || meta.Generation == "" {
 		return errors.New("cache metadata identity or generation is inconsistent")
 	}
+	if meta.GenerationState != "" && meta.GenerationState != GenerationStateActive {
+		return errors.New("cache metadata has an unsupported active generation state")
+	}
+	if meta.PolicyHash != "" {
+		policyHash, err := generationPolicyHash(meta.Policy)
+		if err != nil {
+			return fmt.Errorf("hash cache metadata policy: %w", err)
+		}
+		if meta.PolicyHash != policyHash {
+			return errors.New("cache metadata policy hash does not match its policy snapshot")
+		}
+	}
 	if meta.Policy.Retention < 0 {
 		return errors.New("cache metadata has a negative retention")
 	}
@@ -219,11 +249,37 @@ func validateMetadata(identity string, meta Metadata) error {
 		return errors.New("cache metadata has an unsupported pressure policy")
 	}
 	for _, retired := range meta.Retired {
-		if retired.Generation == "" || retired.Policy.Retention < 0 || !validSharingPolicy(retired.Policy.SharingPolicy) || !validPressurePolicy(retired.Policy.PressurePolicy) {
+		if retired.Generation == "" || retired.State != "" && retired.State != GenerationStateRetiring && retired.State != GenerationStateRetired || retired.Policy.Retention < 0 || !validSharingPolicy(retired.Policy.SharingPolicy) || !validPressurePolicy(retired.Policy.PressurePolicy) {
 			return errors.New("cache metadata has an invalid retired generation policy")
+		}
+		hasLeases := slices.ContainsFunc(meta.Leases, func(lease Lease) bool {
+			generation := lease.Generation
+			if generation == "" {
+				generation = meta.Generation
+			}
+			return generation == retired.Generation
+		})
+		if retired.State == GenerationStateRetiring && !hasLeases || retired.State == GenerationStateRetired && hasLeases {
+			return errors.New("cache metadata retired generation state does not match its leases")
 		}
 	}
 	return nil
+}
+
+func metadataNeedsNormalization(meta Metadata) bool {
+	if meta.FormatVersion != storeFormatVersion || meta.GenerationState == "" || meta.PolicyHash == "" {
+		return true
+	}
+	return slices.ContainsFunc(meta.Retired, func(retired RetiredGeneration) bool { return retired.State == "" })
+}
+
+func generationPolicyHash(policy Policy) (string, error) {
+	data, err := json.Marshal(policy)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func validPressurePolicy(policy string) bool {
@@ -234,7 +290,8 @@ func validSharingPolicy(policy string) bool {
 	return policy == "" || policy == SharingPolicyShared || policy == SharingPolicyExclusive
 }
 
-func (s *Store) readObjectMetadata(identity string) (Metadata, error) {
+func (manager *generationManager) readObjectMetadata(identity string) (Metadata, error) {
+	s := manager.store
 	s.mu.Lock()
 	if err := s.degraded[identity]; err != nil {
 		s.mu.Unlock()
@@ -260,12 +317,12 @@ func (s *Store) readObjectMetadata(identity string) (Metadata, error) {
 	return meta, nil
 }
 
-func (s *Store) readMetadata(entry string) (Metadata, error) {
-	relative, err := s.relative(entry)
+func (repository *metadataRepository) readMetadata(entry string) (Metadata, error) {
+	relative, err := repository.relative(entry)
 	if err != nil {
 		return Metadata{}, err
 	}
-	data, err := s.rootFS.ReadFile(filepath.Join(relative, metadataName))
+	data, err := repository.rootFS.ReadFile(filepath.Join(relative, metadataName))
 	if err != nil {
 		return Metadata{}, err
 	}
@@ -276,8 +333,57 @@ func (s *Store) readMetadata(entry string) (Metadata, error) {
 	return meta, nil
 }
 
+func (repository *metadataRepository) writeAtomicMetadata(relative string, data []byte) error {
+	temp := filepath.Join(relative, ".metadata-"+uuid.NewV7().String())
+	file, err := repository.rootFS.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		_ = repository.rootFS.Remove(temp)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = repository.rootFS.Remove(temp)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = repository.rootFS.Remove(temp)
+		return err
+	}
+	if err := repository.rootFS.Rename(temp, filepath.Join(relative, metadataName)); err != nil {
+		_ = repository.rootFS.Remove(temp)
+		return err
+	}
+	directory, err := repository.rootFS.Open(relative)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
 func (s *Store) writeMetadata(entry string, meta Metadata) error {
 	meta.FormatVersion = storeFormatVersion
+	meta.GenerationState = GenerationStateActive
+	for index := range meta.Retired {
+		if meta.Retired[index].State != "" {
+			continue
+		}
+		if s.hasGenerationLeases(meta, meta.Retired[index].Generation) {
+			meta.Retired[index].State = GenerationStateRetiring
+		} else {
+			meta.Retired[index].State = GenerationStateRetired
+		}
+	}
+	policyHash, err := generationPolicyHash(meta.Policy)
+	if err != nil {
+		return fmt.Errorf("hash cache generation policy: %w", err)
+	}
+	meta.PolicyHash = policyHash
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return err
@@ -286,50 +392,17 @@ func (s *Store) writeMetadata(entry string, meta Metadata) error {
 	if err != nil {
 		return err
 	}
-	temp := filepath.Join(relative, ".metadata-"+uuid.NewV7().String())
-	file, err := s.rootFS.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
+	if filepath.Dir(relative) == "." && (filepath.Base(relative) != meta.Identity || meta.Generation == "") {
+		return errors.New("cache metadata identity or generation is inconsistent")
+	}
+	if err := s.writeAtomicMetadata(relative, data); err != nil {
 		return err
-	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		_ = s.rootFS.Remove(temp)
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		_ = s.rootFS.Remove(temp)
-		return err
-	}
-	if err := file.Close(); err != nil {
-		_ = s.rootFS.Remove(temp)
-		return err
-	}
-	if err := s.rootFS.Rename(temp, filepath.Join(relative, metadataName)); err != nil {
-		_ = s.rootFS.Remove(temp)
-		return err
-	}
-	dir, err := s.rootFS.Open(relative)
-	if err != nil {
-		return err
-	}
-	syncErr := dir.Sync()
-	closeErr := dir.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	if closeErr != nil {
-		return closeErr
 	}
 	s.projectRegistryMu.Lock()
 	defer s.projectRegistryMu.Unlock()
 	s.mu.Lock()
 	switch {
 	case filepath.Dir(relative) == "." && filepath.Base(relative) != trashDirectoryName:
-		if filepath.Base(relative) != meta.Identity || meta.Generation == "" {
-			s.mu.Unlock()
-			return errors.New("cache metadata identity or generation is inconsistent")
-		}
 		s.indexObjectMetadata(meta)
 	case filepath.Dir(relative) == trashDirectoryName:
 		trashID := filepath.Base(relative)
@@ -339,9 +412,7 @@ func (s *Store) writeMetadata(entry string, meta Metadata) error {
 	registryDirty := s.projectRegistryDirty
 	s.mu.Unlock()
 	if registryDirty {
-		if err := s.persistProjectReservationsLocked(); err != nil {
-			return fmt.Errorf("persist project ID registry after metadata update: %w", err)
-		}
+		_ = s.persistProjectReservationsLocked()
 	}
 	return nil
 }

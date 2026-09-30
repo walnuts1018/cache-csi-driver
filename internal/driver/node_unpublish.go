@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (s *Server) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	if req.GetVolumeId() == "" || !filepath.IsAbs(req.GetTargetPath()) {
 		return nil, status.Error(codes.InvalidArgument, "volume ID and absolute target path are required")
 	}
@@ -42,7 +42,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 	if mounted {
-		handled, err := s.unpublishDegradedMount(req.GetTargetPath())
+		handled, err := s.unpublishDegradedMount(ctx, req.GetTargetPath())
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "unpublish degraded cache: %v", err)
 		}
@@ -50,7 +50,7 @@ func (s *Server) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
 	}
-	if err := s.unpublishFallback(req, mounted); err != nil {
+	if err := s.unpublishFallback(ctx, req, mounted); err != nil {
 		return nil, err
 	}
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -81,7 +81,7 @@ func (s *Server) unpublishCacheLease(req *csi.NodeUnpublishVolumeRequest, lease 
 	return nil
 }
 
-func (s *Server) unpublishDegradedMount(target string) (bool, error) {
+func (s *Server) unpublishDegradedMount(ctx context.Context, target string) (bool, error) {
 	if _, _, ok := kubeletcompat.ParseInlineCSITarget(s.options.KubeletRoot, target); !ok {
 		return false, nil
 	}
@@ -102,14 +102,15 @@ func (s *Server) unpublishDegradedMount(target string) (bool, error) {
 		if err := removeTargetDirectory(target); err != nil {
 			return false, fmt.Errorf("remove degraded cache mount target: %w", err)
 		}
-		// CSIのunpublishはunmountで完了しているため、cacheの隔離失敗でkubeletへ不要な再試行を要求しない。
-		_ = store.CleanupDegradedObject(identity, s.mounter.sourceMounted)
+		if err := store.ScheduleQuarantine(identity, s.mounter.sourceMounted); err != nil {
+			s.logger.WarnContext(ctx, "failed to schedule degraded cache quarantine", "error", err)
+		}
 		return true, nil
 	}
 	return false, nil
 }
 
-func (s *Server) unpublishFallback(req *csi.NodeUnpublishVolumeRequest, mounted bool) error {
+func (s *Server) unpublishFallback(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, mounted bool) error {
 	if s.fallbackStore == nil {
 		return status.Error(codes.FailedPrecondition, "fallback cache root is not configured")
 	}
@@ -120,7 +121,9 @@ func (s *Server) unpublishFallback(req *csi.NodeUnpublishVolumeRequest, mounted 
 		}
 		identity, identityErr := cache.FallbackIdentity(req.GetVolumeId())
 		if identityErr == nil {
-			_ = s.fallbackStore.CleanupDegradedObject(identity, s.mounter.sourceMounted)
+			if err := s.fallbackStore.ScheduleQuarantine(identity, s.mounter.sourceMounted); err != nil {
+				s.logger.WarnContext(ctx, "failed to schedule degraded fallback quarantine", "error", err)
+			}
 		}
 		if mounted {
 			return status.Error(codes.FailedPrecondition, "target mount has unreadable fallback metadata")
