@@ -46,17 +46,21 @@ type unpublishLease struct {
 
 func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, mounted bool) error {
 	stores := append([]*cache.Store{s.store}, s.fallbackStores()...)
+	terminalSource := fallbackPath(s.options.FallbackTerminalRoot, req.GetVolumeId())
+	if mounted {
+		terminalMount, err := s.mounter.sameCacheSource(terminalSource, req.GetTargetPath())
+		if err != nil {
+			return status.Errorf(codes.Internal, "verify terminal fallback source: %v", err)
+		}
+		if terminalMount {
+			return s.unpublishTerminalFallback(ctx, req, terminalSource, stores)
+		}
+	}
 	active, degraded, err := s.inspectUnpublishLeases(ctx, req.GetTargetPath(), req.GetVolumeId(), mounted, stores)
 	if err != nil {
 		return err
 	}
-	terminalSource := fallbackPath(s.options.FallbackTerminalRoot, req.GetVolumeId())
-	terminalMount := false
 	if mounted {
-		terminalMount, err = s.mounter.sameCacheSource(terminalSource, req.GetTargetPath())
-		if err != nil {
-			return status.Errorf(codes.Internal, "verify terminal fallback source: %v", err)
-		}
 		owned, err := s.ownsUnpublishMount(active, stores, req.GetTargetPath())
 		if err != nil {
 			return err
@@ -71,18 +75,66 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 	if err := removeTargetDirectory(req.GetTargetPath()); err != nil {
 		return status.Errorf(codes.Internal, "remove cache mount target: %v", err)
 	}
-	if terminalMount {
-		mounted, err := s.mounter.sourceMounted(terminalSource)
+	s.finishUnpublishCleanup(ctx, req.GetVolumeId(), active, degraded)
+	return nil
+}
+
+func (s *Server) unpublishTerminalFallback(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, source string, stores []*cache.Store) error {
+	if err := s.mounter.unmount(req.GetTargetPath()); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
+		return status.Errorf(codes.Internal, "unmount terminal cache: %v", err)
+	}
+	if err := removeTargetDirectory(req.GetTargetPath()); err != nil {
+		return status.Errorf(codes.Internal, "remove terminal cache mount target: %v", err)
+	}
+	s.removeTerminalFallbackSource(ctx, source)
+	s.cleanupTerminalFallbackLeases(ctx, req.GetVolumeId(), req.GetTargetPath(), stores)
+	return nil
+}
+
+func (s *Server) removeTerminalFallbackSource(ctx context.Context, source string) {
+	mounted, err := s.mounter.sourceMounted(source)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to inspect terminal fallback source after unpublish", "source", source, "error", err)
+		return
+	}
+	if mounted {
+		return
+	}
+	if err := os.Remove(source); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.logger.WarnContext(ctx, "failed to remove terminal fallback source after unpublish", "source", source, "error", err)
+	}
+}
+
+func (s *Server) cleanupTerminalFallbackLeases(ctx context.Context, volumeID, target string, stores []*cache.Store) {
+	for _, store := range stores {
+		identity, lease, source, _, found, err := store.LeaseDetails(volumeID)
 		if err != nil {
-			s.logger.WarnContext(ctx, "failed to inspect terminal fallback source after unpublish", "source", terminalSource, "error", err)
-		} else if !mounted {
-			if err := os.Remove(terminalSource); err != nil && !errors.Is(err, os.ErrNotExist) {
-				s.logger.WarnContext(ctx, "failed to remove terminal fallback source after unpublish", "source", terminalSource, "error", err)
+			s.logger.WarnContext(ctx, "cache lease metadata is unavailable after terminal fallback unpublish", "root", store.Root(), "error", err)
+			if errors.Is(err, cache.ErrDegradedMetadata) && s.isFallbackStore(store) {
+				fallbackIdentity, identityErr := cache.FallbackIdentity(volumeID)
+				if identityErr == nil {
+					if quarantineErr := store.ScheduleQuarantine(fallbackIdentity, s.mounter.sourceMounted); quarantineErr != nil {
+						s.logger.WarnContext(ctx, "failed to schedule fallback quarantine after terminal unpublish", "root", store.Root(), "error", quarantineErr)
+					}
+				}
+			}
+			continue
+		}
+		if !found || lease.Target != target {
+			continue
+		}
+		if s.isFallbackStore(store) {
+			if err := s.mounter.unmountGeneration(source); err != nil {
+				s.logger.WarnContext(ctx, "failed to unmount fallback generation after terminal teardown", "source", source, "error", err)
+			}
+		}
+		if err := store.Release(volumeID, target); err != nil {
+			s.logger.WarnContext(ctx, "failed to release cache lease after terminal teardown", "root", store.Root(), "error", err)
+			if quarantineErr := store.ScheduleQuarantine(identity, s.mounter.sourceMounted); quarantineErr != nil {
+				s.logger.WarnContext(ctx, "failed to schedule cache quarantine after terminal teardown", "root", store.Root(), "error", quarantineErr)
 			}
 		}
 	}
-	s.finishUnpublishCleanup(ctx, req.GetVolumeId(), active, degraded)
-	return nil
 }
 
 func (s *Server) inspectUnpublishLeases(ctx context.Context, target, volumeID string, mounted bool, stores []*cache.Store) (*unpublishLease, map[*cache.Store]string, error) {
