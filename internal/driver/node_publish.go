@@ -264,15 +264,24 @@ func (s *Server) verifyExistingDegradedMount(req *csi.NodePublishVolumeRequest) 
 }
 
 func (s *Server) verifyTerminalFallbackMount(req *csi.NodePublishVolumeRequest) (bool, error) {
-	return s.terminalFallbackMount(req.GetVolumeId(), req.GetTargetPath())
+	source := fallbackPath(s.options.FallbackTerminalRoot, req.GetVolumeId())
+	for _, noExec := range []bool{false, true} {
+		same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), noExec)
+		if err != nil || same {
+			return same, err
+		}
+	}
+	return false, nil
 }
 
 func (s *Server) terminalFallbackMount(volumeID, target string) (bool, error) {
 	source := fallbackPath(s.options.FallbackTerminalRoot, volumeID)
-	for _, noExec := range []bool{false, true} {
-		same, err := s.mounter.sameCacheMount(source, target, true, noExec)
-		if err != nil || same {
-			return same, err
+	for _, readOnly := range []bool{false, true} {
+		for _, noExec := range []bool{false, true} {
+			same, err := s.mounter.sameCacheMount(source, target, readOnly, noExec)
+			if err != nil || same {
+				return same, err
+			}
 		}
 	}
 	return false, nil
@@ -662,7 +671,9 @@ func (s *Server) publishFallback(ctx context.Context, req *csi.NodePublishVolume
 		if err != nil {
 			if shouldRetryEmergencyFallback(err) {
 				if releaseErr := store.Release(req.GetVolumeId(), req.GetTargetPath()); releaseErr != nil {
-					return status.Errorf(codes.Internal, "fallback acquisition failed: %v; release fallback lease before retry failed: %v", err, releaseErr)
+					s.markUnexpectedBackendFailure(ctx, unexpectedFallbackCause("fallback_lease_release_failed"), releaseErr)
+					s.logger.WarnContext(ctx, "fallback lease could not be released before changing tiers", "volumeID", req.GetVolumeId(), "root", store.Root(), "error", releaseErr)
+					return s.publishTerminalFallback(ctx, req, fallbackSemantics{mode: fallbackModeResolved, noExec: storedPolicy.NoExec})
 				}
 				if store != s.emergencyStore && s.emergencyStore != nil {
 					allocation, emergencyErr := s.emergencyStore.AcquireFallback(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy}, requestedBytes, s.options.FallbackEmergencyVolumeMaxBytes, s.options.FallbackEmergencyMaxBytes)
@@ -714,17 +725,17 @@ func (s *Server) publishTerminalFallback(ctx context.Context, req *csi.NodePubli
 	if !filepath.IsAbs(s.options.FallbackTerminalRoot) {
 		return status.Error(codes.FailedPrecondition, "terminal fallback root is not configured")
 	}
-	source, err := makeTerminalFallbackDirectory(s.options.FallbackTerminalRoot, req.GetVolumeId())
-	if err != nil {
-		return status.Errorf(codes.Internal, "prepare terminal fallback source: %v", err)
-	}
 	noExec := semantics.mode != fallbackModeResolved || semantics.noExec
 	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
 	if err != nil {
 		return status.Errorf(codes.Internal, "inspect terminal fallback target: %v", err)
 	}
+	source, err := makeTerminalFallbackDirectory(s.options.FallbackTerminalRoot, req.GetVolumeId())
+	if err != nil {
+		return status.Errorf(codes.Internal, "prepare terminal fallback source: %v", err)
+	}
 	if mounted {
-		same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), true, noExec)
+		same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), noExec)
 		if err != nil {
 			return status.Errorf(codes.Internal, "verify terminal fallback target: %v", err)
 		}
@@ -733,11 +744,22 @@ func (s *Server) publishTerminalFallback(ctx context.Context, req *csi.NodePubli
 		}
 		return status.Error(codes.AlreadyExists, "target is mounted from a different source")
 	}
+	sourceMounted, err := s.mounter.sourceMounted(source)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return status.Errorf(codes.Internal, "inspect terminal fallback source: %v", err)
+	}
+	if sourceMounted {
+		return status.Error(codes.AlreadyExists, "terminal fallback volume is mounted at another target")
+	}
+	if err := resetTerminalFallbackDirectory(s.options.FallbackTerminalRoot, req.GetVolumeId()); err != nil {
+		return status.Errorf(codes.Internal, "reset terminal fallback source: %v", err)
+	}
 	if err := makeTargetDirectory(req.GetTargetPath()); err != nil {
+		s.removeTerminalFallbackSource(ctx, source)
 		return status.Errorf(codes.Internal, "prepare terminal fallback target: %v", err)
 	}
-	// 終端fallbackはデータ保持よりPodの起動を優先し、volumeをread-onlyで公開する。
-	if err := s.mounter.mount(source, req.GetTargetPath(), true, noExec); err != nil {
+	if err := s.mounter.mount(source, req.GetTargetPath(), req.GetReadonly(), noExec); err != nil {
+		s.removeTerminalFallbackSource(ctx, source)
 		return status.Errorf(codes.Internal, "mount terminal fallback: %v", err)
 	}
 	return nil
@@ -803,6 +825,7 @@ func (s *Server) publishFallbackOnStoreOrTerminal(ctx context.Context, req *csi.
 				s.logger.WarnContext(ctx, "failed to unmount fallback generation before changing tiers", "source", allocation.Source, "error", err)
 			}
 		}
+		return s.publishTerminalFallback(ctx, req, fallbackSemantics{mode: fallbackModeResolved, noExec: allocation.NoExec})
 	}
 	if store != s.emergencyStore && s.emergencyStore != nil {
 		allocation, acquireErr := s.emergencyStore.AcquireFallback(acquireOptions, requestedBytes, s.options.FallbackEmergencyVolumeMaxBytes, s.options.FallbackEmergencyMaxBytes)

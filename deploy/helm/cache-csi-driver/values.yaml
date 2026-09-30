@@ -16,7 +16,7 @@ fallbackEmergencyMaxBytes: 64Mi
 fallbackEmergencyRootMaxBytes: 16Mi
 fallbackEmergencyVolumeMaxBytes: 4Mi
 fallbackTerminalRootDir: /run/cache-csi/fallback-terminal
-fallbackTerminalRootMaxBytes: 4Mi
+fallbackTerminalRootMaxBytes: 64Mi
 metrics:
   port: 9807
 kubeletRootDir: /var/lib/kubelet

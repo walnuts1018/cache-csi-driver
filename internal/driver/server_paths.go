@@ -91,7 +91,7 @@ func makeTerminalFallbackDirectory(root, volumeID string) (string, error) {
 	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("terminal fallback root is not a real directory")
 	}
-	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Mkdir(path, 0o777); err != nil && !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
 	info, err := os.Lstat(path)
@@ -101,10 +101,27 @@ func makeTerminalFallbackDirectory(root, volumeID string) (string, error) {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("terminal fallback source is not a real directory")
 	}
-	if err := os.Chmod(path, 0o755); err != nil {
+	if err := os.Chmod(path, 0o777); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+func resetTerminalFallbackDirectory(root, volumeID string) error {
+	path, err := makeTerminalFallbackDirectory(root, volumeID)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(path, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func removeTargetDirectory(path string) error {

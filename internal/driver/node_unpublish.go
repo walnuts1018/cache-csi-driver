@@ -49,7 +49,7 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 	terminalSource := fallbackPath(s.options.FallbackTerminalRoot, req.GetVolumeId())
 	if mounted {
 		terminalMount, err := s.mounter.sameCacheSource(terminalSource, req.GetTargetPath())
-		if err != nil {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return status.Errorf(codes.Internal, "verify terminal fallback source: %v", err)
 		}
 		if terminalMount {
@@ -94,6 +94,9 @@ func (s *Server) unpublishTerminalFallback(ctx context.Context, req *csi.NodeUnp
 
 func (s *Server) removeTerminalFallbackSource(ctx context.Context, source string) {
 	mounted, err := s.mounter.sourceMounted(source)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
 	if err != nil {
 		s.logger.WarnContext(ctx, "failed to inspect terminal fallback source after unpublish", "source", source, "error", err)
 		return
@@ -101,7 +104,28 @@ func (s *Server) removeTerminalFallbackSource(ctx context.Context, source string
 	if mounted {
 		return
 	}
-	if err := os.Remove(source); err != nil && !errors.Is(err, os.ErrNotExist) {
+	root := filepath.Clean(s.options.FallbackTerminalRoot)
+	if filepath.Dir(filepath.Clean(source)) != root {
+		s.logger.WarnContext(ctx, "refusing to remove terminal fallback source outside its root", "source", source, "root", root)
+		return
+	}
+	rootInfo, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		s.logger.WarnContext(ctx, "refusing to remove terminal fallback source through an invalid root", "source", source, "root", root, "error", err)
+		return
+	}
+	sourceInfo, err := os.Lstat(source)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil || !sourceInfo.IsDir() || sourceInfo.Mode()&os.ModeSymlink != 0 {
+		s.logger.WarnContext(ctx, "refusing to remove an invalid terminal fallback source", "source", source, "error", err)
+		return
+	}
+	if err := os.RemoveAll(source); err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.logger.WarnContext(ctx, "failed to remove terminal fallback source after unpublish", "source", source, "error", err)
 	}
 }
@@ -195,13 +219,6 @@ func (s *Server) ownsUnpublishMount(active *unpublishLease, stores []*cache.Stor
 		if matches {
 			return true, nil
 		}
-	}
-	terminalMatches, err := s.mounter.sourceWithinRoot(target, s.options.FallbackTerminalRoot)
-	if err == nil && terminalMatches {
-		return true, nil
-	}
-	if err != nil {
-		inspectErr = errors.Join(inspectErr, err)
 	}
 	if inspectErr != nil {
 		return false, status.Errorf(codes.Internal, "verify cache mount source: %v", inspectErr)

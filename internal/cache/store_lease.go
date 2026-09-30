@@ -237,8 +237,11 @@ func (s *Store) AcquireFallback(options AcquireOptions, requestedBytes, perVolum
 		if err != nil {
 			return FallbackAllocation{}, err
 		}
-		if storedPolicy.MaxBytes <= 0 || storedPolicy.MaxBytes > totalMaxBytes {
-			return FallbackAllocation{}, fmt.Errorf("stored fallback cache limit %d is outside configured bounds", storedPolicy.MaxBytes)
+		if storedPolicy.MaxBytes <= 0 {
+			return FallbackAllocation{}, fmt.Errorf("%w: stored fallback cache limit %d is invalid", ErrDegradedMetadata, storedPolicy.MaxBytes)
+		}
+		if storedPolicy.MaxBytes > totalMaxBytes {
+			return FallbackAllocation{}, fmt.Errorf("%w: stored fallback cache limit %d exceeds aggregate limit %d", ErrFallbackCapacity, storedPolicy.MaxBytes, totalMaxBytes)
 		}
 		options.Policy = storedPolicy
 		options.Lease.NoExec = storedLease.NoExec
@@ -252,8 +255,11 @@ func (s *Store) AcquireFallback(options AcquireOptions, requestedBytes, perVolum
 	if degradedCount != 0 {
 		return FallbackAllocation{}, ErrDegradedMetadata
 	}
-	if reserved < 0 || reserved > totalMaxBytes {
-		return FallbackAllocation{}, errors.New("fallback cache reservations exceed the configured aggregate limit")
+	if reserved < 0 {
+		return FallbackAllocation{}, fmt.Errorf("%w: fallback cache reservations are negative", ErrDegradedMetadata)
+	}
+	if reserved > totalMaxBytes {
+		return FallbackAllocation{}, fmt.Errorf("%w: fallback cache reservations %d exceed aggregate limit %d", ErrFallbackCapacity, reserved, totalMaxBytes)
 	}
 	available := totalMaxBytes - reserved
 	limit := perVolumeMaxBytes
