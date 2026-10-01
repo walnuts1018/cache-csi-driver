@@ -371,7 +371,7 @@ func TestProjectIDAllocationStaysInsideConfiguredRange(t *testing.T) {
 func TestMetadataDamageIsIsolatedAndProjectReservationSurvivesRestart(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	store, err := NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 3})
+	store, err := NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 3, ProjectQuotaEnabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +425,7 @@ func TestMetadataDamageIsIsolatedAndProjectReservationSurvivesRestart(t *testing
 		t.Fatal(err)
 	}
 
-	store, err = NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 3})
+	store, err = NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 3, ProjectQuotaEnabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,22 +453,29 @@ func TestMetadataDamageIsIsolatedAndProjectReservationSurvivesRestart(t *testing
 	}
 }
 
-func TestRecoverLeasesQuarantinesDamagedObjectOnlyWhenUnmounted(t *testing.T) {
+func TestRecoverLeasesQuarantinesDamagedObjectAndPreservesMountedData(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		name           string
-		mounted        bool
-		verifyErr      bool
-		wantQuarantine bool
+		name          string
+		mounted       bool
+		verifyErr     bool
+		wantPreserved bool
 	}{
-		{name: "unmounted", wantQuarantine: true},
-		{name: "mounted", mounted: true},
-		{name: "unknown mount state", verifyErr: true},
+		{name: "unmounted"},
+		{name: "mounted", mounted: true, wantPreserved: true},
+		{name: "unknown mount state", verifyErr: true, wantPreserved: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			root := t.TempDir()
-			store, err := NewStore(root, StoreOptions{ProjectIDStart: 32000, ProjectIDCount: 1})
+			trashMounted := test.mounted || test.verifyErr
+			unmountCalls := 0
+			store, err := NewStore(root, StoreOptions{
+				ProjectIDStart:      32000,
+				ProjectIDCount:      1,
+				UnmountGeneration:   func(string) error { unmountCalls++; return nil },
+				IsGenerationMounted: func(string) (bool, error) { return trashMounted, nil },
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -511,31 +518,41 @@ func TestRecoverLeasesQuarantinesDamagedObjectOnlyWhenUnmounted(t *testing.T) {
 			if calls != 1 {
 				t.Fatalf("mount verifier calls = %d, want 1", calls)
 			}
-			if test.wantQuarantine {
-				if _, err := os.Stat(entry); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("unmounted damaged object was not detached: %v", err)
-				}
-				assertProjectIDReservedUntilTrashRemoval(t, store, "quota-during-quarantine", projectID, trashGate)
-			} else {
-				if _, err := os.Stat(entry); err != nil {
-					t.Fatalf("uncertain or active damaged object was removed: %v", err)
-				}
-				if err := store.MetadataError(); !errors.Is(err, ErrDegradedMetadata) {
-					t.Fatalf("metadata health error = %v, want degraded metadata", err)
-				}
-				otherIdentity := stableIdentity("quota-while-degraded")
-				if _, _, err := store.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
-					t.Fatal(err)
-				}
-				if _, _, _, err := store.QuotaState(otherIdentity, 1024); err == nil {
-					t.Fatal("project ID was reused while damaged object may still be mounted")
-				}
+			meta, err := store.metadataRepository.readMetadata(entry)
+			if err != nil || validateMetadata(identity, meta) != nil || len(meta.Leases) != 0 {
+				t.Fatalf("canonical cache after quarantine = (%+v, %v), want fresh metadata without old leases", meta, err)
 			}
+			if meta.Generation == filepath.Base(generationPath) {
+				t.Fatal("canonical identity reused the damaged generation")
+			}
+			if _, err := os.Stat(filepath.Join(entry, generationsDirectoryName, meta.Generation)); err != nil {
+				t.Fatalf("fresh cache generation is missing: %v", err)
+			}
+			trashEntries, err := store.metadataRepository.readDir(filepath.Join(root, trashDirectoryName))
+			if err != nil || len(trashEntries) != 1 {
+				t.Fatalf("quarantined object count = (%d, %v), want one object", len(trashEntries), err)
+			}
+			trashPath := filepath.Join(root, trashDirectoryName, trashEntries[0].Name())
+			if _, err := os.Stat(filepath.Join(trashPath, generationsDirectoryName, filepath.Base(generationPath))); err != nil {
+				t.Fatalf("damaged generation was not preserved in trash: %v", err)
+			}
+			markerErr := store.metadataRepository.stat(filepath.Join(trashPath, preserveMountedTrashMarker))
+			if gotPreserved := markerErr == nil; gotPreserved != test.wantPreserved {
+				t.Fatalf("mount-preserving quarantine = %t, want %t (error %v)", gotPreserved, test.wantPreserved, markerErr)
+			}
+			if test.wantPreserved && unmountCalls != 0 {
+				t.Fatalf("unmount callback calls = %d, want 0 for mounted or uncertain data", unmountCalls)
+			}
+			if err := store.MetadataError(); err != nil {
+				t.Fatalf("fresh canonical cache remains degraded: %v", err)
+			}
+			trashMounted = false
+			assertProjectIDReservedUntilTrashRemoval(t, store, "quota-during-quarantine", projectID, trashGate)
 		})
 	}
 }
 
-func TestRecoverMissingMetadataQuarantinesOnlyWhenUnmounted(t *testing.T) {
+func TestRecoverMissingMetadataQuarantinesAndPreservesMountedData(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name       string
@@ -567,6 +584,8 @@ func testMissingMetadataRecovery(t *testing.T, name string, mounted, inspectErr 
 		}
 	})
 	trashGate := gateTrashRemoval(t, store)
+	trashMounted := mounted || inspectErr
+	store.isGenerationMounted = func(string) (bool, error) { return trashMounted, nil }
 	identity := stableIdentity("missing-metadata-" + name)
 	target := filepath.Join(t.TempDir(), "target")
 	policy := Policy{QuotaEnabled: true, MaxBytes: 1024}
@@ -588,10 +607,31 @@ func testMissingMetadataRecovery(t *testing.T, name string, mounted, inspectErr 
 	if *calls != 1 {
 		t.Fatalf("mount verifier calls = %d, want 1", *calls)
 	}
-	if mounted || inspectErr {
-		assertDegradedObjectRetained(t, store, identity, source, target, mounted, inspectErr)
+	entry := filepath.Join(root, identity)
+	meta, err := store.metadataRepository.readMetadata(entry)
+	if err != nil || validateMetadata(identity, meta) != nil || len(meta.Leases) != 0 {
+		t.Fatalf("canonical cache after missing metadata recovery = (%+v, %v), want fresh metadata without leases", meta, err)
 	}
-	assertMissingMetadataQuarantined(t, store, root, identity, name, projectID, trashGate)
+	if _, err := os.Stat(filepath.Join(entry, generationsDirectoryName, meta.Generation)); err != nil {
+		t.Fatalf("fresh generation after missing metadata recovery: %v", err)
+	}
+	trashEntries, err := store.metadataRepository.readDir(filepath.Join(root, trashDirectoryName))
+	if err != nil || len(trashEntries) != 1 {
+		t.Fatalf("quarantined objects = (%d, %v), want one", len(trashEntries), err)
+	}
+	trashPath := filepath.Join(root, trashDirectoryName, trashEntries[0].Name())
+	if _, err := os.Stat(filepath.Join(trashPath, generationsDirectoryName, filepath.Base(source))); err != nil {
+		t.Fatalf("old generation was not preserved in trash: %v", err)
+	}
+	markerErr := store.metadataRepository.stat(filepath.Join(trashPath, preserveMountedTrashMarker))
+	if gotPreserved := markerErr == nil; gotPreserved != (mounted || inspectErr) {
+		t.Fatalf("mount-preserving quarantine = %t, want %t (error %v)", gotPreserved, mounted || inspectErr, markerErr)
+	}
+	if err := store.MetadataError(); err != nil {
+		t.Fatalf("fresh cache remains degraded after missing metadata recovery: %v", err)
+	}
+	trashMounted = false
+	assertProjectIDReservedUntilTrashRemoval(t, store, "missing-metadata-reservation-"+name, projectID, trashGate)
 }
 
 func missingMetadataVerifier(t *testing.T, source string, mounted, inspectErr bool) (func(string, Lease, Policy) (bool, error), *int) {
@@ -608,49 +648,6 @@ func missingMetadataVerifier(t *testing.T, source string, mounted, inspectErr bo
 		return mounted, nil
 	}
 	return verifier, calls
-}
-
-func assertDegradedObjectRetained(t *testing.T, store *Store, identity, source, target string, mounted, inspectErr bool) {
-	t.Helper()
-	entry := filepath.Join(store.Root(), identity)
-	if _, err := os.Stat(entry); err != nil {
-		t.Fatalf("active or uncertain object was removed: %v", err)
-	}
-	if !errors.Is(store.MetadataError(), ErrDegradedMetadata) {
-		t.Fatalf("metadata health error = %v, want degraded metadata", store.MetadataError())
-	}
-	foundIdentity, foundSource, found, err := store.FindDegradedGenerationForTarget(target, func(candidateSource, candidateTarget string) (bool, error) {
-		return candidateSource == source && candidateTarget == target, nil
-	})
-	if err != nil || !found || foundIdentity != identity || foundSource != source {
-		t.Fatalf("degraded source lookup = (%q, %q, %v, %v)", foundIdentity, foundSource, found, err)
-	}
-	err = store.QuarantineDegradedObject(identity, func(string) (bool, error) {
-		if inspectErr {
-			return false, errors.New("mount inspection failed")
-		}
-		return mounted, nil
-	})
-	if inspectErr && err == nil {
-		t.Fatal("degraded cleanup succeeded when mount state was unknown")
-	}
-	if !inspectErr && err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(entry); err != nil {
-		t.Fatalf("degraded object was removed while a generation remained mounted: %v", err)
-	}
-	if err := store.QuarantineDegradedObject(identity, func(string) (bool, error) { return false, nil }); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func assertMissingMetadataQuarantined(t *testing.T, store *Store, root, identity, name string, projectID uint32, trashGate *trashRemovalGate) {
-	t.Helper()
-	if _, err := os.Stat(filepath.Join(root, identity)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("fully unmounted object was not quarantined: %v", err)
-	}
-	assertProjectIDReservedUntilTrashRemoval(t, store, "missing-metadata-reservation-"+name, projectID, trashGate)
 }
 
 type trashRemovalGate struct {
@@ -721,7 +718,7 @@ func TestRecoverKeepsEmptyObjectWithoutMetadata(t *testing.T) {
 	})
 	identity := stableIdentity("empty-object")
 	entry := filepath.Join(root, identity)
-	if err := store.metadataRepository.ensureDirectory(filepath.Join(entry, "generations")); err != nil {
+	if err := store.metadataRepository.ensureDirectory(filepath.Join(entry, generationsDirectoryName)); err != nil {
 		t.Fatal(err)
 	}
 	calls := 0
@@ -742,7 +739,7 @@ func TestRecoverKeepsEmptyObjectWithoutMetadata(t *testing.T) {
 	}
 }
 
-func TestDamagedProjectRegistryDisablesOnlyQuotaAllocation(t *testing.T) {
+func TestDamagedProjectRegistryIsRebuiltFromCanonicalMetadata(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
@@ -760,12 +757,12 @@ func TestDamagedProjectRegistryDisablesOnlyQuotaAllocation(t *testing.T) {
 			if err := os.WriteFile(registryPath, test.data, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			store, err := NewStore(root, StoreOptions{})
+			store, err := NewStore(root, StoreOptions{ProjectQuotaEnabled: true})
 			if err != nil {
 				t.Fatalf("open store with damaged project registry: %v", err)
 			}
-			if !errors.Is(store.MetadataError(), ErrDegradedMetadata) {
-				t.Fatalf("storage health error = %v, want degraded metadata", store.MetadataError())
+			if err := store.ProjectRegistryError(); err != nil {
+				t.Fatalf("project registry could not be reconstructed from canonical metadata: %v", err)
 			}
 			t.Cleanup(func() {
 				if err := store.Close(); err != nil {
@@ -776,13 +773,13 @@ func TestDamagedProjectRegistryDisablesOnlyQuotaAllocation(t *testing.T) {
 			if _, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: Lease{ID: firstLeaseID, Target: filepath.Join(t.TempDir(), firstLeaseID)}}); err != nil {
 				t.Fatalf("non-quota cache operation failed: %v", err)
 			}
-			if _, _, _, err := store.QuotaState(identity, 1024); err == nil {
-				t.Fatal("quota allocation succeeded with a damaged project registry")
+			if _, _, _, err := store.QuotaState(identity, 1024); err != nil {
+				t.Fatalf("quota allocation failed after project registry reconstruction: %v", err)
 			}
 			if err := store.Close(); err != nil {
 				t.Fatal(err)
 			}
-			reopened, err := NewStore(root, StoreOptions{})
+			reopened, err := NewStore(root, StoreOptions{ProjectQuotaEnabled: true})
 			if err != nil {
 				t.Fatalf("reopen store with damaged project registry: %v", err)
 			}
@@ -795,15 +792,15 @@ func TestDamagedProjectRegistryDisablesOnlyQuotaAllocation(t *testing.T) {
 			if _, _, err := reopened.Acquire(AcquireOptions{Identity: otherIdentity, Lease: Lease{ID: otherLeaseID, Target: filepath.Join(t.TempDir(), otherLeaseID)}}); err != nil {
 				t.Fatalf("non-quota cache operation failed after restart: %v", err)
 			}
-			if _, _, _, err := reopened.QuotaState(otherIdentity, 1024); err == nil {
-				t.Fatal("quota allocation resumed after reopening damaged registry")
+			if _, _, _, err := reopened.QuotaState(otherIdentity, 1024); err != nil {
+				t.Fatalf("quota allocation failed after reopening reconstructed registry: %v", err)
 			}
 			data, err := os.ReadFile(registryPath)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(data) != string(test.data) {
-				t.Fatalf("damaged project registry was overwritten: %q", data)
+			if string(data) == string(test.data) {
+				t.Fatal("damaged project registry was not replaced by the canonical reconstruction")
 			}
 		})
 	}
@@ -853,12 +850,14 @@ func TestUnknownMetadataFormatVersionIsIsolatedAndQuarantined(t *testing.T) {
 	if _, _, _, _, found, err := recovered.LeaseDetails(leaseIDs[0]); err != nil || !found {
 		t.Fatalf("healthy object after unknown-version quarantine = found %t, error %v", found, err)
 	}
-	if _, err := os.Stat(filepath.Join(root, identities[1])); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unknown-version object was not quarantined: %v", err)
+	unknownEntry := filepath.Join(root, identities[1])
+	unknownMeta, err := recovered.metadataRepository.readMetadata(unknownEntry)
+	if err != nil || validateMetadata(identities[1], unknownMeta) != nil || len(unknownMeta.Leases) != 0 {
+		t.Fatalf("unknown-version object after quarantine = (%+v, %v), want fresh metadata without old leases", unknownMeta, err)
 	}
 }
 
-func TestLegacyStoreDocumentVersionsAreAcceptedAndUpgradedOnWrite(t *testing.T) {
+func TestOldStoreMetadataFormatsAreQuarantinedAndProjectRegistryIsRebuilt(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name            string
@@ -911,11 +910,18 @@ func legacyStoreDocuments(t *testing.T, metadataVersion, registryVersion *int) {
 			t.Error(err)
 		}
 	})
-	if _, _, _, _, found, err := reopened.LeaseDetails("legacy-format"); err != nil || !found {
-		t.Fatalf("legacy metadata lease = found %t, error %v", found, err)
+	if _, _, _, _, found, err := reopened.LeaseDetails("legacy-format"); !errors.Is(err, ErrDegradedMetadata) || found {
+		t.Fatalf("old format lease lookup = found %t, error %v, want quarantined metadata", found, err)
 	}
-	if err := reopened.CommitPublish("legacy-format", target); err != nil {
-		t.Fatalf("upgrade legacy metadata on write: %v", err)
+	if err := reopened.RecoverLeases(func(string, Lease, Policy) (bool, error) { return false, nil }); err != nil {
+		t.Fatalf("quarantine old format cache metadata: %v", err)
+	}
+	meta, err := reopened.metadataRepository.readMetadata(filepath.Join(root, identity))
+	if err != nil || validateMetadata(identity, meta) != nil || len(meta.Leases) != 0 {
+		t.Fatalf("cache after old format quarantine = (%+v, %v), want fresh current-format metadata", meta, err)
+	}
+	if err := reopened.CleanupTrash(t.Context()); err != nil {
+		t.Fatalf("remove quarantined old format cache: %v", err)
 	}
 	otherIdentity := stableIdentity("legacy-format-other")
 	if _, _, err := reopened.Acquire(AcquireOptions{
@@ -928,7 +934,6 @@ func legacyStoreDocuments(t *testing.T, metadataVersion, registryVersion *int) {
 	if _, _, _, err := reopened.QuotaState(otherIdentity, policy.MaxBytes); err != nil {
 		t.Fatalf("upgrade legacy project registry on write: %v", err)
 	}
-	assertDocumentFormatVersion(t, filepath.Join(root, identity, metadataName), storeFormatVersion)
 	assertDocumentFormatVersion(t, filepath.Join(root, projectRegistryName), storeFormatVersion)
 }
 
@@ -1025,7 +1030,7 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	firstTarget := filepath.Join(t.TempDir(), "first-shared")
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: firstLeaseID, Target: firstTarget},
+		Lease:    Lease{ID: firstLeaseID, Target: firstTarget, NoExec: initialPolicy.NoExec},
 		Policy:   initialPolicy,
 	}); err != nil {
 		t.Fatal(err)
@@ -1039,7 +1044,7 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	secondTarget := filepath.Join(t.TempDir(), "second-shared")
 	if _, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: "second-shared-lease", Target: secondTarget},
+		Lease:    Lease{ID: "second-shared-lease", Target: secondTarget, NoExec: updatedPolicy.NoExec},
 		Policy:   updatedPolicy,
 	}); err != nil {
 		t.Fatal(err)
@@ -1058,8 +1063,8 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("second shared lease found = %t, error = %v", found, err)
 	}
-	if secondLease.NoExec != initialPolicy.NoExec {
-		t.Fatalf("second shared lease noexec = %t, want generation snapshot %t", secondLease.NoExec, initialPolicy.NoExec)
+	if secondLease.NoExec != updatedPolicy.NoExec {
+		t.Fatalf("second shared lease noexec = %t, want requested policy %t", secondLease.NoExec, updatedPolicy.NoExec)
 	}
 	if secondPolicy != initialPolicy {
 		t.Fatalf("second shared lease policy = %+v, want generation snapshot %+v", secondPolicy, initialPolicy)
@@ -1072,10 +1077,13 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	}
 }
 
-func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
+func TestAcquireUpdatesIdleGenerationPolicyWithoutDiscardingData(t *testing.T) {
 	t.Parallel()
 	initialPolicy := Policy{
 		SharingPolicy: SharingPolicyShared,
+		SchemaVersion: "v1",
+		QuotaEnabled:  true,
+		MaxBytes:      1 << 20,
 		Retention:     time.Hour,
 		NoExec:        true,
 	}
@@ -1092,10 +1100,14 @@ func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
 	firstTarget := filepath.Join(t.TempDir(), "first-idle")
 	firstPath, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: "first-idle-lease", Target: firstTarget},
+		Lease:    Lease{ID: "first-idle-lease", Target: firstTarget, NoExec: initialPolicy.NoExec},
 		Policy:   initialPolicy,
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(firstPath, "warm-cache-entry")
+	if err := os.WriteFile(marker, []byte("cache"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Release("first-idle-lease", firstTarget); err != nil {
@@ -1103,19 +1115,24 @@ func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
 	}
 
 	updatedPolicy := initialPolicy
+	updatedPolicy.MaxBytes = 2 << 20
 	updatedPolicy.Retention = 2 * time.Hour
 	updatedPolicy.NoExec = false
+	updatedPolicy.SharingPolicy = SharingPolicyExclusive
 	secondTarget := filepath.Join(t.TempDir(), "second-idle")
 	secondPath, _, err := store.Acquire(AcquireOptions{
 		Identity: identity,
-		Lease:    Lease{ID: "second-idle-lease", Target: secondTarget},
+		Lease:    Lease{ID: "second-idle-lease", Target: secondTarget, NoExec: updatedPolicy.NoExec},
 		Policy:   updatedPolicy,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondPath == firstPath {
-		t.Fatalf("reused generation path = %q, want a new generation after the policy change", secondPath)
+	if secondPath != firstPath {
+		t.Fatalf("updated generation path = %q, want existing generation %q", secondPath, firstPath)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "cache" {
+		t.Fatalf("warm cache entry = (%q, %v), want preserved data", data, err)
 	}
 	_, lease, _, storedPolicy, found, err := store.LeaseDetails("second-idle-lease")
 	if err != nil || !found {
@@ -1127,6 +1144,216 @@ func TestAcquireTransitionsIdleGenerationToUpdatedPolicy(t *testing.T) {
 	if storedPolicy != updatedPolicy {
 		t.Fatalf("second idle lease policy = %+v, want updated policy %+v", storedPolicy, updatedPolicy)
 	}
+}
+
+func TestGenerationPolicyHashTracksOnlySchemaVersion(t *testing.T) {
+	t.Parallel()
+	base := Policy{
+		ClassName:     "default",
+		ClassUID:      "class-uid",
+		SharingPolicy: SharingPolicyShared,
+		NoExec:        true,
+		SchemaVersion: "v1",
+		QuotaEnabled:  true,
+		MaxBytes:      1 << 20,
+		Retention:     time.Hour,
+	}
+	baseHash, err := generationPolicyHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		update func(*Policy)
+		want   bool
+	}{
+		{name: "retention", update: func(policy *Policy) { policy.Retention *= 2 }},
+		{name: "noexec", update: func(policy *Policy) { policy.NoExec = false }},
+		{name: "sharing", update: func(policy *Policy) { policy.SharingPolicy = SharingPolicyExclusive }},
+		{name: "quota", update: func(policy *Policy) { policy.MaxBytes *= 2 }},
+		{name: "schema", update: func(policy *Policy) { policy.SchemaVersion = "v2" }, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			policy := base
+			test.update(&policy)
+			got, err := generationPolicyHash(policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed := got != baseHash; changed != test.want {
+				t.Fatalf("generation policy hash changed = %t, want %t", changed, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateMetadataRejectsNonmatchingPolicyHash(t *testing.T) {
+	t.Parallel()
+	policy := Policy{SchemaVersion: "v1", Retention: time.Hour}
+	meta := Metadata{
+		FormatVersion:   storeFormatVersion,
+		Identity:        stableIdentity("legacy-policy-hash"),
+		Generation:      "generation",
+		GenerationState: GenerationStateActive,
+		PolicyHash:      "previous-policy-hash",
+		Policy:          policy,
+	}
+	if err := validateMetadata(meta.Identity, meta); err == nil {
+		t.Fatal("metadata with a policy hash from the previous policy definition was accepted")
+	}
+}
+
+func TestAcquireMarksMissingGenerationWithActiveLeaseAsDegraded(t *testing.T) {
+	t.Parallel()
+	store, err := newStore(t.TempDir(), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	identity := stableIdentity("active-lease-missing-generation")
+	target := filepath.Join(t.TempDir(), "mount")
+	generationPath, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "active-missing-generation", Target: target},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(store.Root(), identity)
+	meta, err := store.metadataRepository.readMetadata(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(generationPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "another-lease", Target: filepath.Join(t.TempDir(), "other")},
+	})
+	if !errors.Is(err, ErrDegradedMetadata) {
+		t.Fatalf("acquire with active lease and missing generation error = %v, want degraded metadata", err)
+	}
+	stored, err := store.metadataRepository.readMetadata(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Generation != meta.Generation || len(stored.Leases) != 1 || stored.Leases[0].ID != "active-missing-generation" {
+		t.Fatalf("metadata after missing generation = %+v, want original generation and lease preserved", stored)
+	}
+}
+
+func TestRecoveryQuarantinesMissingCurrentGenerationWithoutDroppingLease(t *testing.T) {
+	t.Parallel()
+	const leaseID = "missing-current-generation"
+	root := t.TempDir()
+	store, err := newStore(root, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	identity := stableIdentity("recovery-active-lease-missing-generation")
+	target := filepath.Join(t.TempDir(), "mount")
+	source, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: leaseID, Target: target},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(root, identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(source); err != nil {
+		t.Fatal(err)
+	}
+	verifierCalls := 0
+	if err := store.RecoverLeases(func(candidate string, lease Lease, _ Policy) (bool, error) {
+		verifierCalls++
+		if candidate == filepath.Join(root, identity) {
+			return false, nil
+		}
+		if candidate != source || lease.ID != leaseID || lease.Target != target {
+			t.Fatalf("missing generation verifier input = (%q, %+v)", candidate, lease)
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if verifierCalls != 2 {
+		t.Fatalf("mount verifier calls = %d, want object and lease checks", verifierCalls)
+	}
+	newMeta, err := store.metadataRepository.readMetadata(filepath.Join(root, identity))
+	if err != nil || validateMetadata(identity, newMeta) != nil || len(newMeta.Leases) != 0 {
+		t.Fatalf("canonical metadata after recovery = (%+v, %v), want fresh generation without old lease", newMeta, err)
+	}
+	if newMeta.Generation == meta.Generation {
+		t.Fatal("canonical identity reused the missing generation")
+	}
+	trashEntries, err := store.metadataRepository.readDir(filepath.Join(root, trashDirectoryName))
+	if err != nil || len(trashEntries) != 1 {
+		t.Fatalf("quarantined object entries = (%d, %v), want one", len(trashEntries), err)
+	}
+	oldMeta, err := store.metadataRepository.readMetadata(filepath.Join(root, trashDirectoryName, trashEntries[0].Name()))
+	if err != nil || len(oldMeta.Leases) != 1 || oldMeta.Leases[0].ID != leaseID {
+		t.Fatalf("quarantined lease metadata = (%+v, %v), want original lease retained", oldMeta.Leases, err)
+	}
+}
+
+func TestDamagedProjectRegistryIsRebuiltFromMetadata(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	options := StoreOptions{ProjectQuotaEnabled: true, ProjectIDStart: 32000, ProjectIDCount: 4}
+	store, err := NewStore(root, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := stableIdentity("registry-rebuild")
+	policy := Policy{QuotaEnabled: true, MaxBytes: 1024}
+	if _, _, err := store.Acquire(AcquireOptions{Identity: identity, Lease: Lease{ID: "registry-rebuild", Target: filepath.Join(t.TempDir(), "mount")}, Policy: policy}); err != nil {
+		t.Fatal(err)
+	}
+	projectID, _, _, err := store.QuotaState(identity, policy.MaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, projectRegistryName), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rebuilt, err := NewStore(root, options)
+	if err != nil {
+		t.Fatalf("rebuild registry from canonical metadata: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := rebuilt.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := rebuilt.ProjectRegistryError(); err != nil {
+		t.Fatalf("rebuilt project registry health: %v", err)
+	}
+	gotProjectID, _, _, err := rebuilt.QuotaState(identity, policy.MaxBytes)
+	if err != nil || gotProjectID != projectID {
+		t.Fatalf("restored project ID = (%d, %v), want %d", gotProjectID, err, projectID)
+	}
+	assertDocumentFormatVersion(t, filepath.Join(root, projectRegistryName), storeFormatVersion)
 }
 
 func TestAcquireWaitsForCollectionOfSameIdentity(t *testing.T) {
@@ -1276,7 +1503,7 @@ func waitForKeyedLockReferences(t *testing.T, locks *keyedMutexes, key string, w
 	t.Fatalf("keyed lock references for %q did not reach %d", key, want)
 }
 
-func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
+func TestTrashCleanupPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir(), StoreOptions{})
 	if err != nil {
@@ -1315,14 +1542,14 @@ func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(trash) != len(identities) {
-		t.Fatalf("trash entries before pressure reclaim = %d, want %d", len(trash), len(identities))
+		t.Fatalf("trash entries before cleanup = %d, want %d", len(trash), len(identities))
 	}
-	if err := store.ReclaimPressure(t.Context()); err != nil {
+	if err := store.cleanupTrashUntilAttempted(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, identity := range identities {
 		if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("unused object %q remains after pressure reclaim: %v", identity, err)
+			t.Fatalf("unused object %q remains after trash cleanup: %v", identity, err)
 		}
 	}
 	trash, err = store.metadataRepository.readDir(filepath.Join(store.Root(), trashDirectoryName))
@@ -1330,7 +1557,7 @@ func TestPressureReclaimPhysicallyDeletesMoreThanOneBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(trash) != 0 {
-		t.Fatalf("trash entries = %d, want 0 after pressure reclaim", len(trash))
+		t.Fatalf("trash entries = %d, want 0 after cleanup", len(trash))
 	}
 }
 

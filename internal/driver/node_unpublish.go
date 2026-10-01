@@ -9,6 +9,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 	"github.com/walnuts1018/cache-csi-driver/internal/kubeletcompat"
+	"github.com/walnuts1018/cache-csi-driver/internal/nodehealth"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -20,7 +21,7 @@ func (s *Server) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	if _, ok := kubeletcompat.ParsePodTarget(s.options.KubeletRoot, req.GetTargetPath()); !ok {
 		return nil, status.Error(codes.InvalidArgument, "target path must be inside a kubelet Pod directory")
 	}
-	if err := ensureNoSymlinkTraversal(req.GetTargetPath()); err != nil {
+	if err := ensureNoSymlinkTraversal(s.options.KubeletRoot, req.GetTargetPath()); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "validate target path: %v", err)
 	}
 	unlock := s.locks.Lock(req.GetTargetPath())
@@ -40,7 +41,7 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 	if leaseErr != nil {
 		s.logger.WarnContext(ctx, "cache lease metadata is unavailable before target teardown", "volumeID", req.GetVolumeId(), "error", leaseErr)
 		if !errors.Is(leaseErr, cache.ErrDegradedMetadata) {
-			_ = s.markNodeUnavailable(ctx, "CacheLeaseReadFailed", leaseErr, true)
+			_ = s.fail(ctx, storeFailure(nodehealth.ReasonMetadataRead), leaseErr)
 		}
 	}
 	if leaseErr == nil && found && lease.Target != target {
@@ -48,14 +49,18 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 	}
 	mounted, err := s.mounter.mountedAt(target)
 	if err != nil {
-		return s.markNodeUnavailable(ctx, "MountInspectionFailed", err, true)
+		return s.fail(ctx, nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
+			Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+			Retryability: nodehealth.PermanentUntilProbe,
+		}, err)
 	}
 
 	var degradedIdentity string
 	if mounted {
 		withinCacheRoot, err := s.mounter.sourceWithinRoot(target, s.store.Root())
 		if err != nil {
-			return s.markNodeUnavailable(ctx, "CacheMountOwnershipUnknown", err, true)
+			return s.fail(ctx, objectFailure(nodehealth.ReasonMountStateUnknown), err)
 		}
 		if !withinCacheRoot {
 			return status.Error(codes.FailedPrecondition, "target mount is outside the cache root")
@@ -63,12 +68,16 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 		candidateIdentity, _, degradedFound, identifyErr := s.store.FindDegradedGenerationForTarget(target, s.mounter.sameCacheSource)
 		if identifyErr != nil {
 			s.logger.WarnContext(ctx, "failed to identify degraded cache before unpublish", "error", identifyErr)
-			_ = s.markNodeUnavailable(ctx, "DegradedCacheInspectionFailed", identifyErr, true)
+			_ = s.fail(ctx, objectFailure(nodehealth.ReasonMetadataRead), identifyErr)
 		} else if degradedFound {
 			degradedIdentity = candidateIdentity
 		}
 		if err := s.mounter.unmount(target); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
-			return s.markNodeUnavailable(ctx, "CacheUnmountFailed", err, true)
+			return s.fail(ctx, nodehealth.Failure{
+				Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
+				Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+				Retryability: nodehealth.PermanentUntilProbe,
+			}, err)
 		}
 	}
 	if err := removeTargetDirectory(target); err != nil {
@@ -78,17 +87,17 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 	if leaseErr == nil && found {
 		if err := s.store.Release(req.GetVolumeId(), target); err != nil {
 			s.logger.WarnContext(ctx, "failed to release cache lease after target teardown", "volumeID", req.GetVolumeId(), "root", s.store.Root(), "error", err)
-			_ = s.markNodeUnavailable(ctx, "CacheLeaseReleaseFailed", err, true)
+			_ = s.fail(ctx, storeFailure(nodehealth.ReasonLeaseRelease), err)
 			if quarantineErr := s.store.QuarantineDegradedObject(identity, s.mounter.sourceMounted); quarantineErr != nil {
 				s.logger.WarnContext(ctx, "failed to quarantine cache after lease release", "root", s.store.Root(), "error", quarantineErr)
-				_ = s.markNodeUnavailable(ctx, "CacheQuarantineFailed", quarantineErr, true)
+				_ = s.fail(ctx, objectFailure(nodehealth.ReasonQuarantine), quarantineErr)
 			}
 		}
 	}
 	if degradedIdentity != "" {
 		if err := s.store.QuarantineDegradedObject(degradedIdentity, s.mounter.sourceMounted); err != nil {
 			s.logger.WarnContext(ctx, "failed to quarantine degraded cache after target teardown", "identity", degradedIdentity, "error", err)
-			_ = s.markNodeUnavailable(ctx, "CacheQuarantineFailed", err, true)
+			_ = s.fail(ctx, objectFailure(nodehealth.ReasonQuarantine), err)
 		}
 	}
 	return nil

@@ -185,23 +185,21 @@ func (manager *generationManager) indexDegradedLeaseIDs(store *Store, identity s
 }
 
 func validateMetadata(identity string, meta Metadata) error {
-	if meta.FormatVersion != 0 && meta.FormatVersion != storeFormatVersion {
+	if meta.FormatVersion != storeFormatVersion {
 		return fmt.Errorf("unsupported cache metadata format version %d", meta.FormatVersion)
 	}
 	if meta.Identity != identity || meta.Generation == "" {
 		return errors.New("cache metadata identity or generation is inconsistent")
 	}
-	if meta.GenerationState != "" && meta.GenerationState != GenerationStateActive {
+	if meta.GenerationState != GenerationStateActive {
 		return errors.New("cache metadata has an unsupported active generation state")
 	}
-	if meta.PolicyHash != "" {
-		policyHash, err := generationPolicyHash(meta.Policy)
-		if err != nil {
-			return fmt.Errorf("hash cache metadata policy: %w", err)
-		}
-		if meta.PolicyHash != policyHash {
-			return errors.New("cache metadata policy hash does not match its policy snapshot")
-		}
+	policyHash, err := generationPolicyHash(meta.Policy)
+	if err != nil {
+		return fmt.Errorf("hash cache metadata policy: %w", err)
+	}
+	if meta.PolicyHash == "" || meta.PolicyHash != policyHash {
+		return errors.New("cache metadata policy hash does not match its content compatibility policy")
 	}
 	if meta.Policy.Retention < 0 {
 		return errors.New("cache metadata has a negative retention")
@@ -210,7 +208,7 @@ func validateMetadata(identity string, meta Metadata) error {
 		return errors.New("cache metadata has an unsupported sharing policy")
 	}
 	for _, retired := range meta.Retired {
-		if retired.Generation == "" || retired.State != "" && retired.State != GenerationStateRetiring && retired.State != GenerationStateRetired || retired.Policy.Retention < 0 || !validSharingPolicy(retired.Policy.SharingPolicy) {
+		if retired.Generation == "" || retired.State != GenerationStateRetiring && retired.State != GenerationStateRetired || retired.Policy.Retention < 0 || !validSharingPolicy(retired.Policy.SharingPolicy) {
 			return errors.New("cache metadata has an invalid retired generation policy")
 		}
 		hasLeases := slices.ContainsFunc(meta.Leases, func(lease Lease) bool {
@@ -228,14 +226,13 @@ func validateMetadata(identity string, meta Metadata) error {
 }
 
 func metadataNeedsNormalization(meta Metadata) bool {
-	if meta.FormatVersion != storeFormatVersion || meta.GenerationState == "" || meta.PolicyHash == "" {
-		return true
-	}
-	return slices.ContainsFunc(meta.Retired, func(retired RetiredGeneration) bool { return retired.State == "" })
+	return meta.FormatVersion != storeFormatVersion || meta.GenerationState != GenerationStateActive || meta.PolicyHash == "" || slices.ContainsFunc(meta.Retired, func(retired RetiredGeneration) bool { return retired.State == "" })
 }
 
 func generationPolicyHash(policy Policy) (string, error) {
-	data, err := json.Marshal(policy)
+	data, err := json.Marshal(struct {
+		SchemaVersion string `json:"schemaVersion"`
+	}{SchemaVersion: policy.SchemaVersion})
 	if err != nil {
 		return "", err
 	}

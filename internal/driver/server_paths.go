@@ -2,6 +2,7 @@ package driver
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,17 +25,24 @@ func (s *Server) validatePublishTarget(target, podUID string) error {
 	if targetPodUID != podUID {
 		return errors.New("target path pod UID does not match pod information")
 	}
-	return ensureNoSymlinkTraversal(target)
+	return ensureNoSymlinkTraversal(s.options.KubeletRoot, target)
 }
 
-func ensureNoSymlinkTraversal(path string) error {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+func ensureNoSymlinkTraversal(root, path string) error {
+	if !filepath.IsAbs(root) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return errors.New("target path must be clean and absolute")
 	}
-	current := string(filepath.Separator)
-	relative := strings.TrimPrefix(path, current)
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("resolve kubelet root: %w", err)
+	}
+	relative, err := filepath.Rel(filepath.Clean(root), path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return errors.New("target path is outside the kubelet root")
+	}
+	current := realRoot
 	for component := range strings.SplitSeq(relative, string(filepath.Separator)) {
-		if component == "" {
+		if component == "" || component == "." {
 			continue
 		}
 		current = filepath.Join(current, component)

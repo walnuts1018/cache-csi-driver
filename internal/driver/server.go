@@ -41,6 +41,7 @@ type Options struct {
 	KubeletRoot         string
 	VendorVersion       string
 	ProjectQuotaEnabled bool
+	MountProbe          func(context.Context) error
 	Metrics             *metrics.Metrics
 	Logger              *slog.Logger
 	Health              *nodehealth.Tracker

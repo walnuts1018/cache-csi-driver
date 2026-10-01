@@ -65,20 +65,8 @@ spec:
           !has(volume.csi.volumeAttributes) ||
           !("maxBytes" in volume.csi.volumeAttributes) ||
           (isQuantity(volume.csi.volumeAttributes["maxBytes"]) &&
-          quantity(volume.csi.volumeAttributes["maxBytes"]).sign() > 0))
+          quantity(volume.csi.volumeAttributes["maxBytes"]).isGreaterThan(quantity("0"))))
       message: Cache CSI maxBytes must be a positive Kubernetes quantity.
-    - expression: >-
-        !has(object.spec.volumes) || object.spec.volumes.all(volume,
-          !has(volume.csi) || volume.csi.driver != "cache.csi.walnuts.dev" ||
-          ((!has(object.spec.nodeName) || object.spec.nodeName == "" ||
-            (request.operation == "UPDATE" && has(oldObject) &&
-            has(oldObject.spec.nodeName) && object.spec.nodeName == oldObject.spec.nodeName)) &&
-          has(object.spec.schedulerName) &&
-          object.spec.schedulerName == "cache-csi-scheduler" &&
-          (!has(object.spec.nodeSelector) ||
-            !("cache.csi.walnuts.dev/ready" in object.spec.nodeSelector) ||
-            object.spec.nodeSelector["cache.csi.walnuts.dev/ready"] == "true")))
-      message: Cache CSI Pods must use cache-csi-scheduler, must not set spec.nodeName, and must not conflict with the cache readiness node selector.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -91,9 +79,71 @@ spec:
   matchResources: {}
 ---
 apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-node-name-create") }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(volume,
+          !has(volume.csi) || volume.csi.driver != "cache.csi.walnuts.dev" ||
+          !has(object.spec.nodeName) || object.spec.nodeName == "")
+      message: Cache CSI Pods must not set spec.nodeName when they are created.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-node-name-create") }}
+spec:
+  policyName: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-node-name-create") }}
+  validationActions:
+    - Deny
+  matchResources: {}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-readiness-selector") }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+        scope: Namespaced
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(volume,
+          !has(volume.csi) || volume.csi.driver != "cache.csi.walnuts.dev" ||
+          !has(object.spec.nodeSelector) ||
+          !("cache.csi.walnuts.dev/ready" in object.spec.nodeSelector) ||
+          object.spec.nodeSelector["cache.csi.walnuts.dev/ready"] == "true")
+      message: Cache CSI Pods must not select Nodes that are not cache-ready.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-readiness-selector") }}
+spec:
+  policyName: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-readiness-selector") }}
+  validationActions:
+    - Deny
+  matchResources: {}
+---
+apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
 metadata:
-  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-scheduling") }}
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-readiness") }}
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -126,21 +176,13 @@ spec:
               value: "true"
             }]
           : []
-    - patchType: JSONPatch
-      jsonPatch:
-        expression: >-
-          [JSONPatch{
-              op: "add",
-              path: "/spec/schedulerName",
-              value: "cache-csi-scheduler"
-            }]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicyBinding
 metadata:
-  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-scheduling") }}
+  name: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-readiness") }}
 spec:
-  policyName: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-scheduling") }}
+  policyName: {{ include "cache-csi-driver.resourceName" (dict "root" . "suffix" "cache-readiness") }}
   matchResources:
     namespaceSelector:
       matchLabels:

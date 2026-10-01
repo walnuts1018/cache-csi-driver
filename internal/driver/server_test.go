@@ -583,11 +583,18 @@ func TestNodeUnpublishCleansMountedDegradedGeneration(t *testing.T) {
 	if _, mounted := mounts.mounts[request.GetTargetPath()]; mounted {
 		t.Fatal("degraded mount remains after unpublish")
 	}
-	if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("degraded cache object remains after its last mount was removed: %v", err)
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); err != nil {
+		t.Fatalf("fresh canonical cache object is missing after quarantine: %v", err)
 	}
 	if _, err := os.Stat(source); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("degraded generation remains after cleanup: %v", err)
+		t.Fatalf("quarantined source remains at its old path: %v", err)
+	}
+	if err := store.CleanupTrash(t.Context()); err != nil {
+		t.Fatalf("clean quarantined generation after unpublish: %v", err)
+	}
+	trash, err := os.ReadDir(filepath.Join(store.Root(), ".trash"))
+	if err != nil || len(trash) != 0 {
+		t.Fatalf("trash after unpublish cleanup = %d entries, error = %v; want empty", len(trash), err)
 	}
 }
 
@@ -628,8 +635,15 @@ func TestNodeUnpublishCleansDegradedMountWithoutKubeletVolumeIDDerivation(t *tes
 	if mounts.unmountCalls != 1 {
 		t.Fatalf("unmount calls = %d, want one verified cache unmount", mounts.unmountCalls)
 	}
-	if _, err := os.Stat(filepath.Join(store.Root(), identity)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("degraded cache object remains after unpublish: %v", err)
+	if _, err := os.Stat(filepath.Join(store.Root(), identity)); err != nil {
+		t.Fatalf("fresh canonical cache object is missing after quarantine: %v", err)
+	}
+	if err := store.CleanupTrash(t.Context()); err != nil {
+		t.Fatalf("clean quarantined generation after unpublish: %v", err)
+	}
+	trash, err := os.ReadDir(filepath.Join(store.Root(), ".trash"))
+	if err != nil || len(trash) != 0 {
+		t.Fatalf("trash after unpublish cleanup = %d entries, error = %v; want empty", len(trash), err)
 	}
 }
 
@@ -731,10 +745,35 @@ func TestNodeGetStorageHealthReportsProjectRegistryFailure(t *testing.T) {
 	if err := os.MkdirAll(cacheRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	storeOptions := cache.StoreOptions{ProjectQuotaEnabled: true, ProjectIDStart: 32000, ProjectIDCount: 10}
+	identity, err := cache.Identity("namespace-uid", testDefault, "class-uid", "cache-key", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := cache.NewStore(cacheRoot, storeOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Acquire(cache.AcquireOptions{
+		Identity: identity,
+		Lease:    cache.Lease{ID: "registry-health", Target: filepath.Join(root, "target")},
+		Policy:   cache.Policy{QuotaEnabled: true, MaxBytes: 1024},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.QuotaState(identity, 1024); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheRoot, identity, ".cache-csi.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(cacheRoot, ".project-ids.json"), []byte("{broken"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := cache.NewStore(cacheRoot, cache.StoreOptions{})
+	store, err = cache.NewStore(cacheRoot, storeOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -743,8 +782,9 @@ func TestNodeGetStorageHealthReportsProjectRegistryFailure(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	server := New(store, nil, nil, Options{})
+	server := New(store, nil, nil, Options{ProjectQuotaEnabled: true})
 	server.mounter = &testMounter{}
+	server.options.Health.Set(nodehealth.PhaseReady, "TestReady", false)
 
 	response, err := server.NodeGetStorageHealth(t.Context(), &csi.NodeGetStorageHealthRequest{})
 	if err != nil {
@@ -777,8 +817,8 @@ func TestNodeGetStorageHealthReportsRecoveryBeforeInspectingStore(t *testing.T) 
 		t.Fatal(err)
 	}
 	backendHealth := response.GetBackendHealth()
-	if len(backendHealth) != 1 || backendHealth[0].GetStatus() != csi.StorageHealthErrorType_STORAGE_DEGRADED || backendHealth[0].GetReason() != "CacheRecoveryInProgress" {
-		t.Fatalf("storage health = %+v, want cache-recovery-in-progress status", backendHealth)
+	if len(backendHealth) != 1 || backendHealth[0].GetStatus() != csi.StorageHealthErrorType_STORAGE_DEGRADED || backendHealth[0].GetReason() != "Starting" {
+		t.Fatalf("storage health = %+v, want Starting status before recovery", backendHealth)
 	}
 }
 
@@ -796,7 +836,7 @@ func TestNodeGetStorageHealthReportsCacheRootFailures(t *testing.T) {
 			setup: func(mounts *testMounter) {
 				mounts.filesystemReadOnlyResult = true
 			},
-			status: csi.StorageHealthErrorType_STORAGE_DEGRADED,
+			status: csi.StorageHealthErrorType_STORAGE_UNREACHABLE,
 			reason: "CacheRootReadOnly",
 		},
 		{
@@ -970,9 +1010,10 @@ func (quota *recordingQuota) Configure(_ context.Context, _, _ string, _ uint32,
 }
 
 type testMount struct {
-	source   string
-	readOnly bool
-	noExec   bool
+	source     string
+	sourceInfo os.FileInfo
+	readOnly   bool
+	noExec     bool
 }
 
 type mountVerification struct {
@@ -1001,8 +1042,12 @@ type testMounter struct {
 func newTestServer(t *testing.T, spec cachev1alpha1.CacheClassSpec, quotaError error) (*Server, *testMounter, *cache.Store) {
 	t.Helper()
 	root := t.TempDir()
+	mounts := &testMounter{mounts: make(map[string]testMount)}
 	projectQuotaEnabled := spec.Storage.MaxBytes.Sign() > 0 || spec.Storage.DefaultMaxBytes.Sign() > 0
-	store, err := cache.NewStore(filepath.Join(root, "cache"), cache.StoreOptions{ProjectQuotaEnabled: projectQuotaEnabled})
+	store, err := cache.NewStore(filepath.Join(root, "cache"), cache.StoreOptions{
+		ProjectQuotaEnabled: projectQuotaEnabled,
+		IsGenerationMounted: mounts.sourceMounted,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1021,7 +1066,6 @@ func newTestServer(t *testing.T, spec cachev1alpha1.CacheClassSpec, quotaError e
 		ProjectQuotaEnabled: projectQuotaEnabled,
 	})
 	server.options.Health.Set(nodehealth.PhaseReady, "TestReady", false)
-	mounts := &testMounter{mounts: make(map[string]testMount)}
 	server.mounter = mounts
 	return server, mounts, store
 }
@@ -1078,7 +1122,11 @@ func prepareDamagedMountedCache(t *testing.T, server *Server, mounts *testMounte
 		t.Fatal(err)
 	}
 	mounts.sourceMountedFromTargets = true
-	mounts.mounts[request.GetTargetPath()] = testMount{source: source}
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mounts.mounts[request.GetTargetPath()] = testMount{source: source, sourceInfo: sourceInfo}
 	if err := recoverCacheLeases(store, mounts); err != nil {
 		t.Fatal(err)
 	}
@@ -1090,7 +1138,11 @@ func (mounts *testMounter) mount(source, target string, readOnly, noExec bool) e
 	if mounts.mountErr != nil {
 		return mounts.mountErr
 	}
-	mounts.mounts[target] = testMount{source: source, readOnly: readOnly, noExec: noExec}
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	mounts.mounts[target] = testMount{source: source, sourceInfo: info, readOnly: readOnly, noExec: noExec}
 	return nil
 }
 
@@ -1114,12 +1166,33 @@ func (mounts *testMounter) mountedAt(target string) (bool, error) {
 func (mounts *testMounter) sameCacheMount(source, target string, readOnly, noExec bool) (bool, error) {
 	mounts.lastVerification = mountVerification{source: source, target: target, readOnly: readOnly, noExec: noExec}
 	state, found := mounts.mounts[target]
-	return found && state.source == source && state.readOnly == readOnly && state.noExec == noExec, nil
+	sameSource, err := sameTestMountSource(state, source)
+	return found && sameSource && state.readOnly == readOnly && state.noExec == noExec, err
 }
 
 func (mounts *testMounter) sameCacheSource(source, target string) (bool, error) {
 	state, found := mounts.mounts[target]
-	return found && state.source == source, nil
+	if !found {
+		return false, nil
+	}
+	return sameTestMountSource(state, source)
+}
+
+func sameTestMountSource(state testMount, source string) (bool, error) {
+	if state.source == source {
+		return true, nil
+	}
+	if state.sourceInfo == nil {
+		return false, nil
+	}
+	current, err := os.Stat(source)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(state.sourceInfo, current), nil
 }
 
 func (mounts *testMounter) sourceWithinRoot(target, root string) (bool, error) {
@@ -1142,7 +1215,11 @@ func (mounts *testMounter) sourceMounted(source string) (bool, error) {
 	}
 	if mounts.sourceMountedFromTargets {
 		for _, mount := range mounts.mounts {
-			if mount.source == source {
+			matched, err := sameTestMountSource(mount, source)
+			if err != nil {
+				return false, err
+			}
+			if matched {
 				return true, nil
 			}
 		}

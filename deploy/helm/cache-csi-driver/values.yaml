@@ -48,24 +48,6 @@ healthController:
   tolerations:
     - operator: Exists
 
-scheduler:
-  replicaCount: 2
-  image:
-    repository: registry.k8s.io/kube-scheduler
-    tag: v1.37.1
-    pullPolicy: IfNotPresent
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 512Mi
-  nodeSelector:
-    kubernetes.io/os: linux
-  tolerations:
-    - operator: Exists
-
 podAnnotations: {}
 priorityClassName: system-node-critical
 podSecurityContext: {}

@@ -12,6 +12,7 @@ import (
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 	"github.com/walnuts1018/cache-csi-driver/internal/kube"
 	"github.com/walnuts1018/cache-csi-driver/internal/kubeletcompat"
+	"github.com/walnuts1018/cache-csi-driver/internal/nodehealth"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -109,7 +110,11 @@ func (s *Server) validatePublishRequest(req *csi.NodePublishVolumeRequest) (podV
 func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublishVolumeRequest) (string, error) {
 	mounted, err := s.mounter.mountedAt(req.GetTargetPath())
 	if err != nil {
-		return "", s.nodeBackendError(ctx, "MountInspectionFailed", err)
+		return "", s.fail(ctx, nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
+			Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+			Retryability: nodehealth.PermanentUntilProbe,
+		}, err)
 	}
 	if !mounted {
 		return "", nil
@@ -118,7 +123,7 @@ func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublish
 	if errors.Is(err, cache.ErrDegradedMetadata) {
 		verified, verifyErr := s.verifyExistingDegradedMount(req)
 		if verifyErr != nil {
-			return "", s.nodeBackendError(ctx, "DegradedMountInspectionFailed", verifyErr)
+			return "", s.fail(ctx, objectFailure(nodehealth.ReasonMountStateUnknown), verifyErr)
 		}
 		if verified {
 			return publishOutcomeHit, nil
@@ -126,7 +131,7 @@ func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublish
 		return "", status.Error(codes.Unavailable, "cache metadata is degraded and the existing mount could not be verified")
 	}
 	if err != nil {
-		return "", s.nodeBackendError(ctx, "CacheMetadataReadFailed", err)
+		return "", s.fail(ctx, storeFailure(nodehealth.ReasonMetadataRead), err)
 	}
 	if found {
 		handled, verifyErr := s.verifyExistingLeaseMount(ctx, req, lease, source)
@@ -134,6 +139,14 @@ func (s *Server) handleExistingPublish(ctx context.Context, req *csi.NodePublish
 			return "", verifyErr
 		}
 		if handled {
+			return publishOutcomeHit, nil
+		}
+	} else {
+		verified, verifyErr := s.verifyExistingDegradedMount(req)
+		if verifyErr != nil {
+			return "", s.fail(ctx, objectFailure(nodehealth.ReasonMountStateUnknown), verifyErr)
+		}
+		if verified {
 			return publishOutcomeHit, nil
 		}
 	}
@@ -166,7 +179,11 @@ func (s *Server) verifyExistingLeaseMount(ctx context.Context, req *csi.NodePubl
 	}
 	same, err := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), lease.NoExec)
 	if err != nil {
-		return false, s.nodeBackendError(ctx, "CacheMountVerificationFailed", err)
+		return false, s.fail(ctx, nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
+			Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+			Retryability: nodehealth.PermanentUntilProbe,
+		}, err)
 	}
 	if !same {
 		return false, status.Error(codes.AlreadyExists, "target is mounted from a different source or with different options")
@@ -215,21 +232,21 @@ func (s *Server) prepareLease(ctx context.Context, req *csi.NodePublishVolumeReq
 				if ctx.Err() != nil {
 					return cache.Policy{}, false, status.FromContextError(ctx.Err()).Err()
 				}
-				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheQuarantineFailed", recoverErr)
+				return cache.Policy{}, false, s.fail(ctx, objectFailure(nodehealth.ReasonQuarantine), recoverErr)
 			}
 			_, _, _, _, found, err = s.store.LeaseDetails(req.GetVolumeId())
 			if errors.Is(err, cache.ErrDegradedMetadata) {
 				return cache.Policy{}, false, status.Error(codes.Unavailable, "cache metadata is degraded and an existing generation is still mounted")
 			}
 			if err != nil {
-				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheMetadataReadFailed", err)
+				return cache.Policy{}, false, s.fail(ctx, storeFailure(nodehealth.ReasonMetadataRead), err)
 			}
 			if found {
 				return cache.Policy{}, false, status.Error(codes.AlreadyExists, "volume ID is still present after degraded cache quarantine")
 			}
 			return cache.Policy{}, false, nil
 		}
-		return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheMetadataReadFailed", err)
+		return cache.Policy{}, false, s.fail(ctx, storeFailure(nodehealth.ReasonMetadataRead), err)
 	}
 	if found {
 		if oldLease.Target != req.GetTargetPath() {
@@ -243,12 +260,12 @@ func (s *Server) prepareLease(ctx context.Context, req *csi.NodePublishVolumeReq
 				if errors.Is(err, cache.ErrLeaseGenerationRetired) {
 					return cache.Policy{}, false, status.Errorf(codes.FailedPrecondition, "begin cache publish: %v", err)
 				}
-				return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheLeaseUpdateFailed", err)
+				return cache.Policy{}, false, s.fail(ctx, storeFailure(nodehealth.ReasonLeaseUpdate), err)
 			}
 			return oldPolicy, true, nil
 		}
 		if err := s.store.Release(req.GetVolumeId(), oldLease.Target); err != nil {
-			return cache.Policy{}, false, s.nodeBackendError(ctx, "CacheLeaseReleaseFailed", err)
+			return cache.Policy{}, false, s.fail(ctx, storeFailure(nodehealth.ReasonLeaseRelease), err)
 		}
 	}
 	return cache.Policy{}, false, nil
@@ -330,7 +347,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 	_, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 	if errors.Is(err, cache.ErrDegradedMetadata) {
 		if quarantineErr := s.store.QuarantineDegradedObject(identity, s.mounter.sourceMounted); quarantineErr != nil {
-			return s.nodeBackendError(ctx, "CacheQuarantineFailed", quarantineErr)
+			return s.fail(ctx, objectFailure(nodehealth.ReasonQuarantine), quarantineErr)
 		}
 		_, _, err = s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 		if errors.Is(err, cache.ErrDegradedMetadata) {
@@ -345,12 +362,16 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 		if err == nil {
 			err = errors.New("cache lease disappeared after acquisition")
 		}
-		return s.rollbackPublish(ctx, req, status.Errorf(codes.Internal, "read acquired cache lease: %v", err))
+		return s.rollbackPublish(ctx, req, s.fail(ctx, storeFailure(nodehealth.ReasonMetadataRead), err))
 	}
 	policy = storedPolicy
 	policy.NoExec = storedLease.NoExec
 	if err := ApplyQuota(ctx, s.store, s.quota, policy, identity, source); err != nil {
-		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheQuotaUnavailable", err))
+		return s.rollbackPublish(ctx, req, s.fail(ctx, nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemQuota,
+			Reason: nodehealth.ReasonQuotaUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+			Retryability: nodehealth.PermanentUntilProbe,
+		}, err))
 	}
 	source, err = s.store.Expose(identity)
 	if err != nil {
@@ -361,7 +382,7 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 				err = errors.Join(err, quarantineErr)
 			}
 		}
-		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheGenerationExposeFailed", err))
+		return s.rollbackPublish(ctx, req, s.fail(ctx, storeFailure(nodehealth.ReasonGenerationExpose), err))
 	}
 	return s.publishMountedCache(ctx, req, source, policy.NoExec, outcome)
 }
@@ -371,15 +392,19 @@ func (s *Server) cacheAcquireError(ctx context.Context, err error) error {
 	case errors.Is(err, cache.ErrExclusivePolicyConflict), errors.Is(err, cache.ErrQuotaPolicyConflict), errors.Is(err, cache.ErrLeaseGenerationRetired):
 		return status.Errorf(codes.FailedPrecondition, "acquire cache: %v", err)
 	case errors.Is(err, cache.ErrPressureActive):
-		return s.markNodeUnavailable(ctx, "CacheFilesystemPressure", err, false)
+		return s.fail(ctx, nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemPressure,
+			Reason: nodehealth.ReasonFilesystemPressure, Impact: nodehealth.NodeImpactNoSchedule,
+			Retryability: nodehealth.Retryable,
+		}, err)
 	default:
-		return s.nodeBackendError(ctx, "CacheAcquireFailed", err)
+		return s.fail(ctx, storeFailure(nodehealth.ReasonStoreOperation), err)
 	}
 }
 
 func (s *Server) rollbackPublish(ctx context.Context, req *csi.NodePublishVolumeRequest, publishErr error) error {
 	if err := s.store.Release(req.GetVolumeId(), req.GetTargetPath()); err != nil {
-		return s.nodeBackendError(ctx, "CacheLeaseRollbackFailed", errors.Join(publishErr, err))
+		return s.fail(ctx, storeFailure(nodehealth.ReasonLeaseRollback), errors.Join(publishErr, err))
 	}
 	return publishErr
 }
@@ -391,7 +416,11 @@ func (s *Server) publishMountedCache(ctx context.Context, req *csi.NodePublishVo
 	if err := s.mounter.mount(source, req.GetTargetPath(), req.GetReadonly(), noExec); err != nil {
 		mounted, inspectErr := s.mounter.mountedAt(req.GetTargetPath())
 		if inspectErr != nil {
-			return s.nodeBackendError(ctx, "CacheMountStateUnknown", errors.Join(err, inspectErr))
+			return s.fail(ctx, nodehealth.Failure{
+				Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
+				Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+				Retryability: nodehealth.PermanentUntilProbe,
+			}, errors.Join(err, inspectErr))
 		}
 		if mounted {
 			same, verifyErr := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), noExec)
@@ -402,9 +431,9 @@ func (s *Server) publishMountedCache(ctx context.Context, req *csi.NodePublishVo
 				s.recordNormalPublish(outcome)
 				return nil
 			}
-			return s.nodeBackendError(ctx, "CacheMountStateUnknown", errors.Join(err, verifyErr))
+			return s.fail(ctx, objectFailure(nodehealth.ReasonMountStateUnknown), errors.Join(err, verifyErr))
 		}
-		return s.rollbackPublish(ctx, req, s.nodeBackendError(ctx, "CacheMountOperationFailed", err))
+		return s.rollbackPublish(ctx, req, s.mountOperationFailure(ctx, err))
 	}
 	if err := s.store.CommitPublish(req.GetVolumeId(), req.GetTargetPath()); err != nil {
 		return s.recordMountedLeaseCommitFailure(ctx, req.GetVolumeId(), err)
@@ -414,9 +443,5 @@ func (s *Server) publishMountedCache(ctx context.Context, req *csi.NodePublishVo
 }
 
 func (s *Server) recordMountedLeaseCommitFailure(ctx context.Context, volumeID string, err error) error {
-	return s.nodeBackendError(ctx, "CacheLeaseCommitFailed", fmt.Errorf("volume %s: %w", volumeID, err))
-}
-
-func (s *Server) nodeBackendError(ctx context.Context, reason string, err error) error {
-	return s.markNodeUnavailable(ctx, reason, err, true)
+	return s.fail(ctx, storeFailure(nodehealth.ReasonLeaseCommit), fmt.Errorf("volume %s: %w", volumeID, err))
 }

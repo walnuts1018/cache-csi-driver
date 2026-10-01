@@ -15,6 +15,8 @@ import (
 
 const trashDirectoryName = ".trash"
 
+const preserveMountedTrashMarker = ".cache-csi-preserve-mounted"
+
 const trashBatchSize = 16
 
 func (collector *trashCollector) run(store *Store) {
@@ -93,6 +95,14 @@ func (s *Store) cleanupTrashBatchSkipping(skip map[string]struct{}) (map[string]
 	var cleanupErr error
 	for _, trashID := range trashIDs {
 		attempted[trashID] = struct{}{}
+		preserve, err := s.trashHasMountedSources(filepath.Join(s.metadataRepository.root, trashDirectoryName, trashID))
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("inspect quarantined cache mounts %s: %w", trashID, err))
+			continue
+		}
+		if preserve {
+			continue
+		}
 		if err := s.removeTrash(filepath.Join(s.metadataRepository.root, trashDirectoryName, trashID)); err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue
@@ -172,6 +182,14 @@ func (s *Store) cleanupTrashUntilAttempted(ctx context.Context, attempted map[st
 }
 
 func (s *Store) detachToTrash(path string) error {
+	return s.detachToTrashMode(path, false)
+}
+
+func (s *Store) detachToTrashPreservingMounts(path string) error {
+	return s.detachToTrashMode(path, true)
+}
+
+func (s *Store) detachToTrashMode(path string, preserveMounts bool) error {
 	s.trashCollector.trashMu.Lock()
 	defer s.trashCollector.trashMu.Unlock()
 	relative, err := s.metadataRepository.relative(path)
@@ -181,9 +199,18 @@ func (s *Store) detachToTrash(path string) error {
 	isObject := filepath.Dir(relative) == "." && filepath.Base(relative) != trashDirectoryName
 	identity := filepath.Base(relative)
 	var meta Metadata
+	if preserveMounts && !isObject {
+		return errors.New("only a cache object can be quarantined while preserving mounts")
+	}
 	if isObject {
-		if err := s.unmountGenerationMounts(path); err != nil {
-			return fmt.Errorf("unmount cache generation before trash detach: %w", err)
+		if preserveMounts {
+			if err := s.writePreservedMountMarker(path); err != nil {
+				return fmt.Errorf("mark cache object for mount-preserving quarantine: %w", err)
+			}
+		} else {
+			if err := s.unmountGenerationMounts(path); err != nil {
+				return fmt.Errorf("unmount cache generation before trash detach: %w", err)
+			}
 		}
 		meta, _ = s.metadataRepository.readMetadata(path)
 	}
@@ -195,6 +222,9 @@ func (s *Store) detachToTrash(path string) error {
 		}
 	}
 	if err := s.metadataRepository.rename(path, trashPath); err != nil {
+		if preserveMounts {
+			err = errors.Join(err, s.removePreservedMountMarker(path))
+		}
 		if isObject {
 			err = errors.Join(err, s.restoreObjectTrashReservation(identity, trashID))
 		}
@@ -208,6 +238,94 @@ func (s *Store) detachToTrash(path string) error {
 	return errors.Join(s.metadataRepository.syncDirectory(filepath.Dir(path)), s.metadataRepository.syncDirectory(filepath.Join(s.metadataRepository.root, trashDirectoryName)))
 }
 
+func (s *Store) writePreservedMountMarker(path string) error {
+	relative, err := s.metadataRepository.relative(filepath.Join(path, preserveMountedTrashMarker))
+	if err != nil {
+		return err
+	}
+	file, err := s.metadataRepository.rootFS.OpenFile(relative, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = s.metadataRepository.rootFS.Remove(relative)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = s.metadataRepository.rootFS.Remove(relative)
+		return err
+	}
+	return s.metadataRepository.syncDirectory(path)
+}
+
+func (s *Store) removePreservedMountMarker(path string) error {
+	relative, err := s.metadataRepository.relative(filepath.Join(path, preserveMountedTrashMarker))
+	if err != nil {
+		return err
+	}
+	if err := s.metadataRepository.rootFS.Remove(relative); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) trashHasMountedSources(path string) (bool, error) {
+	marker := filepath.Join(path, preserveMountedTrashMarker)
+	if err := s.metadataRepository.stat(marker); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if s.isGenerationMounted == nil {
+		return true, nil
+	}
+	sources := make([]string, 0)
+	for _, name := range []string{generationsDirectoryName, "."} {
+		directory := path
+		if name != "." {
+			directory = filepath.Join(path, name)
+		}
+		entries, err := s.metadataRepository.readDir(directory)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return true, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() && (name == generationsDirectoryName || entry.Name() == "generation") {
+				sources = append(sources, filepath.Join(directory, entry.Name()))
+			}
+		}
+	}
+	for _, source := range sources {
+		mounted, err := s.isGenerationMounted(source)
+		if err != nil {
+			return true, err
+		}
+		if mounted {
+			return true, nil
+		}
+	}
+	if len(sources) == 0 {
+		mounted, err := s.isGenerationMounted(path)
+		if err != nil {
+			return true, err
+		}
+		if mounted {
+			return true, nil
+		}
+	}
+	if err := s.removePreservedMountMarker(path); err != nil {
+		return true, err
+	}
+	if err := s.metadataRepository.syncDirectory(path); err != nil {
+		return true, err
+	}
+	return false, nil
+}
+
 func (s *Store) unmountGenerationMounts(path string) error {
 	if s.unmountGeneration == nil {
 		return nil
@@ -217,13 +335,13 @@ func (s *Store) unmountGenerationMounts(path string) error {
 		return err
 	}
 	parts := strings.Split(relative, string(filepath.Separator))
-	if len(parts) == 3 && parts[1] == "generations" {
+	if len(parts) == 3 && parts[1] == generationsDirectoryName {
 		return s.unmountGeneration(path)
 	}
 	if len(parts) != 1 {
 		return nil
 	}
-	entries, err := s.metadataRepository.readDir(filepath.Join(path, "generations"))
+	entries, err := s.metadataRepository.readDir(filepath.Join(path, generationsDirectoryName))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -234,7 +352,7 @@ func (s *Store) unmountGenerationMounts(path string) error {
 		if !entry.IsDir() {
 			continue
 		}
-		if err := s.unmountGeneration(filepath.Join(path, "generations", entry.Name())); err != nil {
+		if err := s.unmountGeneration(filepath.Join(path, generationsDirectoryName, entry.Name())); err != nil {
 			return fmt.Errorf("unmount generation %q: %w", entry.Name(), err)
 		}
 	}

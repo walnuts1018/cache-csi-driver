@@ -67,50 +67,51 @@ func (store *Store) ProjectRegistryError() error {
 	return nil
 }
 
-func (registry *projectQuotaRegistry) loadProjectRegistry(store *Store) bool {
+func (registry *projectQuotaRegistry) loadProjectRegistry(store *Store) (bool, error) {
 	registry.projectRegistryMu.Lock()
 	defer registry.projectRegistryMu.Unlock()
 	data, err := store.metadataRepository.rootFS.ReadFile(projectRegistryName)
 	if errors.Is(err, os.ErrNotExist) {
-		return true
+		return true, nil
 	}
 	if err != nil {
-		store.mu.Lock()
-		registry.projectRegistryDamaged = true
-		store.mu.Unlock()
-		return false
+		return false, err
 	}
 	var document projectReservationDocument
 	if err := json.Unmarshal(data, &document); err != nil {
-		store.mu.Lock()
-		registry.projectRegistryDamaged = true
-		store.mu.Unlock()
-		return false
+		return true, nil
 	}
-	if document.FormatVersion != 0 && document.FormatVersion != storeFormatVersion {
-		store.mu.Lock()
-		registry.projectRegistryDamaged = true
-		store.mu.Unlock()
-		return false
+	if document.FormatVersion != storeFormatVersion {
+		return true, nil
 	}
 	store.mu.Lock()
-	defer store.mu.Unlock()
 	for _, item := range document.Reservations {
 		if item.ProjectID == 0 || !validIdentity(item.Identity) || item.Generation == "" {
 			registry.projectRegistryDamaged = true
-			continue
+			break
 		}
 		registry.addProjectReservation(item.ProjectID, projectReservation{Identity: item.Identity, Generation: item.Generation, TrashID: item.TrashID})
 	}
 	for _, reservation := range document.UnknownReservations {
 		if !validIdentity(reservation.Identity) {
 			registry.projectRegistryDamaged = true
-			continue
+			break
 		}
 		registry.unknownProjectReservations[reservation.Identity] = reservation.TrashID
 	}
+	if registry.projectRegistryDamaged {
+		clear(registry.projectReservations)
+		clear(registry.projectOwnersByID)
+		clear(registry.projectIDByGeneration)
+		clear(registry.unknownProjectReservations)
+		registry.projectRegistryDamaged = false
+		registry.projectRegistryDirty = false
+		store.mu.Unlock()
+		return true, nil
+	}
 	registry.projectRegistryDirty = false
-	return false
+	store.mu.Unlock()
+	return false, nil
 }
 
 func (registry *projectQuotaRegistry) reconcileProjectReservations(store *Store, entries, trashEntries []os.DirEntry) error {
@@ -519,7 +520,7 @@ func (registry *projectQuotaRegistry) projectID(store *Store, identity, generati
 	return 0, errors.New("no XFS project IDs are available")
 }
 
-func (s *Store) loadProjectRegistry() bool {
+func (s *Store) loadProjectRegistry() (bool, error) {
 	return s.projectQuotaRegistry.loadProjectRegistry(s)
 }
 func (s *Store) reconcileProjectReservations(entries, trashEntries []os.DirEntry) error {

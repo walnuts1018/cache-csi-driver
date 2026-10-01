@@ -120,16 +120,25 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 		s.markDegraded(options.Identity, err)
 		return "", false, err
 	}
+	generationPath := filepath.Join(entry, generationsDirectoryName, meta.Generation)
+	generationExists := true
+	if err := s.metadataRepository.stat(generationPath); errors.Is(err, os.ErrNotExist) {
+		generationExists = false
+		if s.activeLeaseCount(meta) > 0 {
+			err := fmt.Errorf("active cache leases reference missing generation %q", meta.Generation)
+			s.markDegraded(options.Identity, err)
+			return "", false, fmt.Errorf("%w: %v", ErrDegradedMetadata, err)
+		}
+	} else if err != nil {
+		return "", false, fmt.Errorf("inspect cache generation: %w", err)
+	}
 	requestedPolicyHash, err := generationPolicyHash(options.Policy)
 	if err != nil {
 		return "", false, fmt.Errorf("hash requested cache generation policy: %w", err)
 	}
-	storedPolicyHash := meta.PolicyHash
-	if storedPolicyHash == "" {
-		storedPolicyHash, err = generationPolicyHash(meta.Policy)
-		if err != nil {
-			return "", false, fmt.Errorf("hash stored cache generation policy: %w", err)
-		}
+	storedPolicyHash, err := generationPolicyHash(meta.Policy)
+	if err != nil {
+		return "", false, fmt.Errorf("hash stored cache generation policy: %w", err)
 	}
 	for _, lease := range meta.Leases {
 		_, existingPolicy, err := leaseGenerationAndPolicy(meta, lease)
@@ -141,31 +150,34 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 			return "", false, ErrExclusivePolicyConflict
 		}
 	}
-	objectHasLeases := len(meta.Leases) != 0
-	quotaPolicyChanged := meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes
+	objectHasLeases := s.activeLeaseCount(meta) > 0
+	quotaModeChanged := meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled
+	quotaPolicyChanged := quotaModeChanged || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes
 	if quotaPolicyChanged && objectHasLeases {
 		return "", false, ErrQuotaPolicyConflict
 	}
 	policyChanged := requestedPolicyHash != storedPolicyHash
-	if !objectHasLeases && (policyChanged || meta.Dirty) {
+	if !objectHasLeases && (policyChanged || quotaModeChanged || meta.Dirty) {
 		if err := s.rejectUnderPressure(); err != nil {
 			return "", false, err
 		}
 		return s.discardAndCreateGeneration(entry, options)
 	}
-	generationPath := filepath.Join(entry, "generations", meta.Generation)
-	generationExists := true
-	if err := s.metadataRepository.stat(generationPath); errors.Is(err, os.ErrNotExist) {
-		generationExists = false
+	if !objectHasLeases && meta.Policy != options.Policy {
+		meta.Policy = options.Policy
+		if err := s.writeMetadata(entry, meta); err != nil {
+			return "", false, fmt.Errorf("update cache policy without changing generation: %w", err)
+		}
+	}
+	if !generationExists {
 		if err := s.rejectUnderPressure(); err != nil {
 			return "", false, err
 		}
-	} else if err != nil {
-		return "", false, fmt.Errorf("inspect cache generation: %w", err)
 	}
 	if generationExists {
-		options.Policy = meta.Policy
-		options.Lease.NoExec = meta.Policy.NoExec
+		if !objectHasLeases {
+			options.Policy = meta.Policy
+		}
 	}
 	return s.acquireExisting(entry, options, meta)
 }
@@ -233,7 +245,7 @@ func (s *Store) existingLeasePath(options AcquireOptions) (string, bool, error) 
 			return "", true, fmt.Errorf("mark cache lease as preparing: %w", err)
 		}
 	}
-	return filepath.Join(s.metadataRepository.root, options.Identity, "generations", generation), true, nil
+	return filepath.Join(s.metadataRepository.root, options.Identity, generationsDirectoryName, generation), true, nil
 }
 
 func leaseGenerationAndPolicy(meta Metadata, lease Lease) (string, Policy, error) {
@@ -253,17 +265,18 @@ func leaseGenerationAndPolicy(meta Metadata, lease Lease) (string, Policy, error
 }
 
 func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
-	generationPath := filepath.Join(entry, "generations", meta.Generation)
+	generationPath := filepath.Join(entry, generationsDirectoryName, meta.Generation)
 	newGeneration := false
 	if statErr := s.metadataRepository.stat(generationPath); errors.Is(statErr, os.ErrNotExist) {
-		meta.Leases = slices.DeleteFunc(meta.Leases, func(lease Lease) bool {
-			return lease.Generation == "" || lease.Generation == meta.Generation
-		})
+		if s.activeLeaseCount(meta) > 0 {
+			err := fmt.Errorf("active cache leases reference missing generation %q", meta.Generation)
+			s.markDegraded(options.Identity, err)
+			return "", false, fmt.Errorf("%w: %v", ErrDegradedMetadata, err)
+		}
 		meta.Generation = uuid.NewV7().String()
 		meta.CreatedAt = time.Now().UTC()
 		meta.ProjectAssigned = false
 		meta.QuotaBytes = 0
-		meta.Leases = nil
 		meta.Dirty = false
 		newGeneration = true
 	} else if statErr != nil {
@@ -279,7 +292,7 @@ func (s *Store) acquireExisting(entry string, options AcquireOptions, meta Metad
 			if err := s.writeMetadata(entry, meta); err != nil {
 				return "", false, err
 			}
-			return filepath.Join(entry, "generations", meta.Generation), false, nil
+			return filepath.Join(entry, generationsDirectoryName, meta.Generation), false, nil
 		}
 	}
 	if newGeneration {
@@ -299,11 +312,11 @@ func (s *Store) activeLeaseCount(meta Metadata) int {
 }
 
 func (s *Store) createLease(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
-	generationPath := filepath.Join(entry, "generations", meta.Generation)
+	generationPath := filepath.Join(entry, generationsDirectoryName, meta.Generation)
 	if err := s.metadataRepository.ensureDirectory(generationPath); err != nil {
 		return "", false, fmt.Errorf("create cache generation: %w", err)
 	}
-	if len(meta.Leases) == 0 {
+	if s.activeLeaseCount(meta) == 0 {
 		relative, err := s.metadataRepository.relative(generationPath)
 		if err != nil {
 			return "", false, err
@@ -395,7 +408,7 @@ func (s *Store) LeaseDetails(leaseID string) (string, Lease, string, Policy, boo
 			s.markDegraded(identity, err)
 			return "", Lease{}, "", Policy{}, false, err
 		}
-		return identity, lease, filepath.Join(s.metadataRepository.root, identity, "generations", generation), policy, true, nil
+		return identity, lease, filepath.Join(s.metadataRepository.root, identity, generationsDirectoryName, generation), policy, true, nil
 	}
 	return "", Lease{}, "", Policy{}, false, nil
 }
@@ -448,7 +461,7 @@ func (s *Store) Expose(identity string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	generationPath := filepath.Join(entry, "generations", meta.Generation)
+	generationPath := filepath.Join(entry, generationsDirectoryName, meta.Generation)
 	relative, err := s.metadataRepository.relative(generationPath)
 	if err != nil {
 		return "", err
@@ -528,7 +541,7 @@ func (s *Store) Release(leaseID, target string) error {
 			return fmt.Errorf("record cache generation retirement: %w", err)
 		}
 		retired := meta.Retired[retiredIndex]
-		generationPath := filepath.Join(entry, "generations", generation)
+		generationPath := filepath.Join(entry, generationsDirectoryName, generation)
 		if err := s.detachGenerationToTrash(generationPath, identity, retired); err != nil {
 			s.markDegraded(identity, err)
 			return fmt.Errorf("detach released cache generation: %w", err)

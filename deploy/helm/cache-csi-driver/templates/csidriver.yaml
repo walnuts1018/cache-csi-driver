@@ -8,6 +8,7 @@ spec:
   attachRequired: false
   fsGroupPolicy: None
   podInfoOnMount: true
+  preventPodSchedulingIfMissing: true
   seLinuxMount: false
   volumeLifecycleModes:
     - Ephemeral

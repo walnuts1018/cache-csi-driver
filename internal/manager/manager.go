@@ -11,6 +11,7 @@ import (
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 	"github.com/walnuts1018/cache-csi-driver/internal/metrics"
 	"github.com/walnuts1018/cache-csi-driver/internal/nodehealth"
+	"golang.org/x/sys/unix"
 )
 
 type MountInspector func(source string, lease cache.Lease, policy cache.Policy) (bool, error)
@@ -20,7 +21,7 @@ type Options struct {
 	PressureInterval   time.Duration
 	InspectMount       MountInspector
 	ResolverReady      func() bool
-	CapabilityProbe    func(context.Context, string) error
+	MountProbe         func(context.Context) error
 	FilesystemReadOnly func(string) (bool, error)
 	QuotaRequired      bool
 	QuotaProbe         func(context.Context, string) error
@@ -35,7 +36,7 @@ type Manager struct {
 	pressureInterval   time.Duration
 	inspectMount       MountInspector
 	resolverReady      func() bool
-	capabilityProbe    func(context.Context, string) error
+	mountProbe         func(context.Context) error
 	filesystemReadOnly func(string) (bool, error)
 	quotaRequired      bool
 	quotaProbe         func(context.Context, string) error
@@ -66,7 +67,7 @@ func New(store *cache.Store, options Options) *Manager {
 		pressureInterval:   options.PressureInterval,
 		inspectMount:       options.InspectMount,
 		resolverReady:      options.ResolverReady,
-		capabilityProbe:    options.CapabilityProbe,
+		mountProbe:         options.MountProbe,
 		filesystemReadOnly: options.FilesystemReadOnly,
 		quotaRequired:      options.QuotaRequired,
 		quotaProbe:         options.QuotaProbe,
@@ -183,7 +184,7 @@ func (manager *Manager) observePressure(ctx context.Context, requests chan<- str
 	active, err := manager.store.ObservePressure()
 	if err != nil {
 		manager.logger.ErrorContext(ctx, "observe cache filesystem pressure failed", "root", manager.store.Root(), "error", err)
-		manager.health.SetCondition(nodehealth.SubsystemPressure, nodehealth.PhaseUnavailable, "CacheFilesystemUnavailable", true)
+		manager.reportFilesystemFailure(err)
 		return
 	}
 	manager.syncStoreMetrics()
@@ -219,18 +220,34 @@ func (manager *Manager) pressure(ctx context.Context) {
 	}
 	active, err := manager.store.ObservePressure()
 	if err != nil {
-		manager.health.SetCondition(nodehealth.SubsystemPressure, nodehealth.PhaseUnavailable, "CacheFilesystemUnavailable", true)
+		manager.reportFilesystemFailure(err)
 		manager.logger.ErrorContext(ctx, "inspect cache filesystem after pressure reclaim failed", "root", manager.store.Root(), "error", err)
 		return
 	}
 	if active {
-		manager.health.SetCondition(nodehealth.SubsystemPressure, nodehealth.PhaseUnavailable, "CacheFilesystemPressure", true)
+		manager.health.RecordFailure(nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemPressure,
+			Reason: nodehealth.ReasonFilesystemPressure, Impact: nodehealth.NodeImpactNoSchedule,
+			Retryability: nodehealth.Retryable,
+		})
 		manager.logger.WarnContext(ctx, "cache filesystem remains under pressure after unused cache reclamation")
 	} else {
 		manager.health.ClearCondition(nodehealth.SubsystemPressure)
 	}
 	manager.refreshHealth(ctx)
 	manager.syncStoreMetrics()
+}
+
+func (manager *Manager) reportFilesystemFailure(err error) {
+	impact := nodehealth.NodeImpactNoSchedule
+	if errors.Is(err, unix.EIO) || errors.Is(err, unix.EROFS) {
+		impact = nodehealth.NodeImpactEvict
+	}
+	manager.health.RecordFailure(nodehealth.Failure{
+		Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemFilesystem,
+		Reason: nodehealth.ReasonFilesystemUnavailable, Impact: impact,
+		Retryability: nodehealth.PermanentUntilProbe,
+	})
 }
 
 func (manager *Manager) recoverDegraded(ctx context.Context) {
@@ -271,7 +288,7 @@ func (manager *Manager) collect(ctx context.Context, now time.Time) {
 
 func (manager *Manager) refreshHealth(ctx context.Context) {
 	_ = manager.backendHealth(ctx, false)
-	manager.probeReportedCapabilities(ctx)
+	manager.probeReportedCapabilities()
 }
 
 func (manager *Manager) backendHealth(ctx context.Context, probeCapabilities bool) error {
@@ -283,14 +300,16 @@ func (manager *Manager) backendHealth(ctx context.Context, probeCapabilities boo
 		return cache.ErrStoreNotReady
 	}
 	if initialization.State == cache.InitializationRetryableFailed || initialization.State == cache.InitializationNodeWideFailed {
-		reason := "CacheStoreInitializationRetrying"
-		evict := false
-		if initialization.State == cache.InitializationNodeWideFailed {
-			reason = "CacheStoreInitializationFailed"
-			evict = true
-		}
 		failure := fmt.Errorf("cache store initialization failed: %w", initialization.Err)
-		manager.health.SetCondition(nodehealth.SubsystemStore, nodehealth.PhaseUnavailable, reason, evict)
+		impact := nodehealth.NodeImpactNoSchedule
+		if errors.Is(initialization.Err, unix.EIO) || errors.Is(initialization.Err, unix.EROFS) {
+			impact = nodehealth.NodeImpactEvict
+		}
+		manager.health.RecordFailure(nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemStore,
+			Reason: nodehealth.ReasonStoreInitialization, Impact: impact,
+			Retryability: nodehealth.PermanentUntilProbe,
+		})
 		return failure
 	}
 	if !manager.store.Ready() {
@@ -305,7 +324,7 @@ func (manager *Manager) backendHealth(ctx context.Context, probeCapabilities boo
 		if err != nil {
 			filesystemError = fmt.Errorf("inspect cache root filesystem: %w", err)
 		} else if readOnly {
-			filesystemError = errors.New("cache root filesystem is read-only")
+			filesystemError = unix.EROFS
 		}
 	}
 	if filesystemError == nil && (probeCapabilities || hasCondition(manager.health, nodehealth.SubsystemFilesystem)) {
@@ -314,15 +333,43 @@ func (manager *Manager) backendHealth(ctx context.Context, probeCapabilities boo
 		}
 	}
 	if filesystemError != nil {
-		manager.health.SetCondition(nodehealth.SubsystemFilesystem, nodehealth.PhaseUnavailable, "CacheFilesystemUnavailable", true)
+		manager.reportFilesystemFailure(filesystemError)
 		healthErrors = append(healthErrors, filesystemError)
 	} else {
 		manager.health.ClearCondition(nodehealth.SubsystemFilesystem)
 	}
+	if manager.mountProbe == nil && (probeCapabilities || hasCondition(manager.health, nodehealth.SubsystemMount)) {
+		failure := errors.New("cache mount API probe is not configured")
+		manager.health.RecordFailure(nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
+			Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+			Retryability: nodehealth.PermanentUntilProbe,
+		})
+		healthErrors = append(healthErrors, failure)
+	} else if manager.mountProbe != nil && (probeCapabilities || hasCondition(manager.health, nodehealth.SubsystemMount)) {
+		probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := manager.mountProbe(probeContext)
+		cancel()
+		if err != nil {
+			failure := fmt.Errorf("probe cache mount API: %w", err)
+			manager.health.RecordFailure(nodehealth.Failure{
+				Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
+				Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+				Retryability: nodehealth.PermanentUntilProbe,
+			})
+			healthErrors = append(healthErrors, failure)
+		} else {
+			manager.health.ClearCondition(nodehealth.SubsystemMount)
+		}
+	}
 	if manager.quotaRequired {
 		if manager.quotaProbe == nil {
 			failure := errors.New("cache quota is required but no quota capability probe is configured")
-			manager.health.SetCondition(nodehealth.SubsystemQuota, nodehealth.PhaseUnavailable, "CacheQuotaProbeUnavailable", true)
+			manager.health.RecordFailure(nodehealth.Failure{
+				Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemQuota,
+				Reason: nodehealth.ReasonQuotaUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+				Retryability: nodehealth.PermanentUntilProbe,
+			})
 			healthErrors = append(healthErrors, failure)
 		} else if probeCapabilities || hasCondition(manager.health, nodehealth.SubsystemQuota) {
 			probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -330,7 +377,11 @@ func (manager *Manager) backendHealth(ctx context.Context, probeCapabilities boo
 			cancel()
 			if err != nil {
 				failure := fmt.Errorf("probe cache quota backend: %w", err)
-				manager.health.SetCondition(nodehealth.SubsystemQuota, nodehealth.PhaseUnavailable, "CacheQuotaUnavailable", true)
+				manager.health.RecordFailure(nodehealth.Failure{
+					Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemQuota,
+					Reason: nodehealth.ReasonQuotaUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+					Retryability: nodehealth.PermanentUntilProbe,
+				})
 				healthErrors = append(healthErrors, failure)
 			} else {
 				manager.health.ClearCondition(nodehealth.SubsystemQuota)
@@ -338,7 +389,11 @@ func (manager *Manager) backendHealth(ctx context.Context, probeCapabilities boo
 		}
 		if err := manager.store.ProjectRegistryError(); err != nil {
 			failure := fmt.Errorf("cache project quota registry is unavailable: %w", err)
-			manager.health.SetCondition(nodehealth.SubsystemProjectRegistry, nodehealth.PhaseUnavailable, "CacheProjectRegistryUnavailable", true)
+			manager.health.RecordFailure(nodehealth.Failure{
+				Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemProjectRegistry,
+				Reason: nodehealth.ReasonProjectRegistry, Impact: nodehealth.NodeImpactNoSchedule,
+				Retryability: nodehealth.PermanentUntilProbe,
+			})
 			healthErrors = append(healthErrors, failure)
 		} else {
 			manager.health.ClearCondition(nodehealth.SubsystemProjectRegistry)
@@ -350,36 +405,24 @@ func (manager *Manager) backendHealth(ctx context.Context, probeCapabilities boo
 	return errors.Join(healthErrors...)
 }
 
-func (manager *Manager) probeReportedCapabilities(ctx context.Context) {
+func (manager *Manager) probeReportedCapabilities() {
 	for _, condition := range manager.health.Conditions() {
 		if condition.Phase != nodehealth.PhaseUnavailable {
 			continue
 		}
 		switch condition.Subsystem {
-		case nodehealth.SubsystemQuota:
-			if manager.quotaRequired && manager.quotaProbe != nil {
-				probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
-				err := manager.quotaProbe(probeContext, manager.store.Root())
-				cancel()
-				if err == nil {
-					manager.health.ClearCondition(condition.Subsystem)
-				}
-			}
-		case nodehealth.SubsystemMount:
-			if manager.capabilityProbe != nil {
-				probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
-				err := manager.capabilityProbe(probeContext, condition.Reason)
-				cancel()
-				if err == nil {
-					manager.health.ClearCondition(condition.Subsystem)
-				}
+		case nodehealth.SubsystemMount, nodehealth.SubsystemQuota, nodehealth.SubsystemFilesystem, nodehealth.SubsystemProjectRegistry:
+			continue
+		case nodehealth.SubsystemStoreOperations:
+			err := manager.store.CheckFilesystem()
+			if err == nil {
+				manager.health.ClearCondition(condition.Subsystem)
+			} else {
+				manager.reportFilesystemFailure(err)
 			}
 		case nodehealth.SubsystemStartup,
 			nodehealth.SubsystemRecovery,
 			nodehealth.SubsystemStore,
-			nodehealth.SubsystemStoreOperations,
-			nodehealth.SubsystemFilesystem,
-			nodehealth.SubsystemProjectRegistry,
 			nodehealth.SubsystemPressure,
 			nodehealth.SubsystemGarbageCollector,
 			nodehealth.SubsystemDegradedRecovery:

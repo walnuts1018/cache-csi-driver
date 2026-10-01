@@ -19,8 +19,13 @@ func TestPublishMetricsUseBoundedLabels(t *testing.T) {
 	if got := testutil.ToFloat64(m.publish.WithLabelValues("hit")); got != 1 {
 		t.Fatalf("hit count = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(m.publish.WithLabelValues("error")); got != 1 {
+	if got := testutil.ToFloat64(m.publish.WithLabelValues("other")); got != 1 {
 		t.Fatalf("unrecognized publish result count = %v, want 1", got)
+	}
+	recorder := httptest.NewRecorder()
+	m.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if strings.Contains(recorder.Body.String(), "secret-volume-id") {
+		t.Fatalf("metrics exposed unbounded result label: %s", recorder.Body.String())
 	}
 }
 

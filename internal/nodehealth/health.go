@@ -2,6 +2,7 @@ package nodehealth
 
 import (
 	"cmp"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"net/http"
 	"slices"
@@ -50,6 +51,12 @@ type Snapshot struct {
 	Reason    string
 	Evict     bool
 	ChangedAt time.Time
+}
+
+type HealthStatus struct {
+	Phase  Phase  `json:"phase"`
+	Reason string `json:"reason"`
+	Evict  bool   `json:"evict"`
 }
 
 func (snapshot Snapshot) Schedulable() bool {
@@ -105,16 +112,16 @@ func (tracker *Tracker) SetCondition(subsystem Subsystem, phase Phase, reason st
 	if reason == "" {
 		reason = string(phase)
 	}
-	condition := Condition{Subsystem: subsystem, Phase: phase, Reason: reason, Evict: evict, ChangedAt: time.Now()}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	if current, exists := tracker.conditions[subsystem]; exists && current.Phase == PhaseUnavailable && phase == PhaseUnavailable && current.Evict {
-		// Eviction要求はsubsystemがUnavailableから回復するまで維持します。
+	if current, exists := tracker.conditions[subsystem]; exists && current.Evict {
+		// Eviction要求はconditionを明示的にclearするまで維持します。
 		evict = true
 	}
 	if current, exists := tracker.conditions[subsystem]; exists && current.Phase == phase && current.Reason == reason && current.Evict == evict {
 		return
 	}
+	condition := Condition{Subsystem: subsystem, Phase: phase, Reason: reason, Evict: evict, ChangedAt: time.Now()}
 	tracker.conditions[subsystem] = condition
 	tracker.updateSnapshotLocked()
 }
@@ -150,7 +157,11 @@ func (tracker *Tracker) Current() Snapshot {
 
 func (tracker *Tracker) updateSnapshotLocked() {
 	next := Snapshot{Phase: PhaseReady, Reason: "CacheReady"}
+	evictUnavailable := false
 	for _, condition := range tracker.conditions {
+		if condition.Phase == PhaseUnavailable && condition.Evict {
+			evictUnavailable = true
+		}
 		if !preferredCondition(condition, next) {
 			continue
 		}
@@ -160,6 +171,9 @@ func (tracker *Tracker) updateSnapshotLocked() {
 			Reason:    condition.Reason,
 			Evict:     condition.Evict,
 		}
+	}
+	if next.Phase == PhaseUnavailable {
+		next.Evict = evictUnavailable
 	}
 	if tracker.snapshot.Subsystem == next.Subsystem && tracker.snapshot.Phase == next.Phase && tracker.snapshot.Reason == next.Reason && tracker.snapshot.Evict == next.Evict {
 		next.ChangedAt = tracker.snapshot.ChangedAt
@@ -174,9 +188,6 @@ func preferredCondition(candidate Condition, current Snapshot) bool {
 	currentPriority := phasePriority(current.Phase)
 	if candidatePriority != currentPriority {
 		return candidatePriority > currentPriority
-	}
-	if candidate.Evict != current.Evict {
-		return candidate.Evict
 	}
 	return string(candidate.Subsystem) < string(current.Subsystem)
 }
@@ -206,4 +217,13 @@ func (tracker *Tracker) ReadinessHandler(w http.ResponseWriter, _ *http.Request)
 	}
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = fmt.Fprintf(w, "cache node is %s: %s\n", snapshot.Phase, snapshot.Reason)
+}
+
+func (tracker *Tracker) HealthHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	snapshot := tracker.Current()
+	status := HealthStatus{Phase: snapshot.Phase, Reason: snapshot.Reason, Evict: snapshot.Evict}
+	if err := jsonv2.MarshalWrite(w, status); err != nil {
+		http.Error(w, "unable to encode node health", http.StatusInternalServerError)
+	}
 }

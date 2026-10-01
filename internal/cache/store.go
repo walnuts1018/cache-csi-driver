@@ -28,6 +28,8 @@ var ErrStoreNotReady = errors.New("cache store indexes are not ready")
 
 const pressureStateNormal = "normal"
 
+const generationsDirectoryName = "generations"
+
 type PressureConfig struct {
 	HighFreePercent      int
 	LowFreePercent       int
@@ -41,6 +43,7 @@ type StoreOptions struct {
 	ProjectIDCount        uint32
 	ProjectQuotaEnabled   bool
 	UnmountGeneration     func(string) error
+	IsGenerationMounted   func(string) (bool, error)
 	RequireRootMountpoint bool
 }
 
@@ -69,6 +72,7 @@ type Store struct {
 	pressureManager      pressureManager
 	trashCollector       trashCollector
 	unmountGeneration    func(string) error
+	isGenerationMounted  func(string) (bool, error)
 	mu                   sync.Mutex
 	closeOnce            sync.Once
 	closeErr             error
@@ -239,6 +243,10 @@ func (s *Store) WaitForIndexes(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.initDone:
+			status = s.InitializationStatus()
+			if status.State == InitializationReady {
+				return nil
+			}
 			if status.Err != nil {
 				return fmt.Errorf("initialize cache indexes: %w", status.Err)
 			}
@@ -376,6 +384,7 @@ func newStoreMode(root string, options StoreOptions, initializeIndexes, startTra
 		pressureManager:      pressureManager{pressure: options.Pressure, pressureState: pressureStateNormal},
 		trashCollector:       trashCollector{trashMetadata: make(map[string]Metadata), stopTrash: make(chan struct{}), trashDone: make(chan struct{}), trashRequests: make(chan chan error)},
 		unmountGeneration:    options.UnmountGeneration,
+		isGenerationMounted:  options.IsGenerationMounted,
 		initDone:             make(chan struct{}),
 		initState:            InitializationInitializing,
 	}
@@ -421,7 +430,6 @@ func (s *Store) initializeIndexes() {
 		s.mu.Lock()
 		s.initErr = err
 		s.indexReady.Store(err == nil)
-		s.ready.Store(err == nil)
 		if err == nil {
 			s.initFailures = 0
 			s.initState = InitializationReady

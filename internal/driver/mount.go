@@ -3,11 +3,31 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/walnuts1018/cache-csi-driver/internal/cache"
 )
 
 func IsMountedAt(target string) (bool, error) { return mountedAt(target) }
+
+// SourceMountedはcache root配下の指定generationがmount tableで使用中か確認する。
+func SourceMounted(root, source string) (bool, error) {
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false, fmt.Errorf("resolve cache root: %w", err)
+	}
+	source, err = filepath.EvalSymlinks(source)
+	if err != nil {
+		return false, fmt.Errorf("resolve cache generation path: %w", err)
+	}
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(source))
+	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false, errors.New("cache generation path is outside the configured cache root")
+	}
+	return newMounter().sourceMounted(source)
+}
 
 // VerifyCacheMountはleaseの情報を使ってcache bind mountを検証する。targetが不明な場合はsourceがmountされているか確認する。
 func VerifyCacheMount(source string, lease cache.Lease, policy cache.Policy) (bool, error) {

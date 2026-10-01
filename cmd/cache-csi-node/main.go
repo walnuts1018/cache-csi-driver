@@ -25,6 +25,7 @@ import (
 	"github.com/walnuts1018/cache-csi-driver/internal/metrics"
 	"github.com/walnuts1018/cache-csi-driver/internal/nodehealth"
 	"github.com/walnuts1018/cache-csi-driver/internal/quota"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -59,7 +60,6 @@ func run(logger *slog.Logger) error {
 	storageBackend := flag.String("storage-backend", "directory", "node-wide cache storage backend: directory or xfs-project")
 	requireCacheRootMountpoint := flag.Bool("require-cache-root-mountpoint", true, "require cache-root to be a filesystem mountpoint")
 	nodeID := flag.String("node-id", os.Getenv("NODE_NAME"), "Kubernetes node name")
-	healthNamespace := flag.String("health-namespace", os.Getenv("POD_NAMESPACE"), "namespace for the node health Lease")
 	kubeletRoot := flag.String("kubelet-root", "/var/lib/kubelet", "kubelet root directory")
 	gcInterval := flag.Duration("gc-interval", 30*time.Second, "cache garbage collection interval")
 	highFreePercent := flag.Int("pressure-high-free-percent", 25, "free-byte percentage at which cache pressure collection stops")
@@ -77,22 +77,14 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	paths, err := resolveRuntimePaths(*cacheRoot, *kubeletRoot, *endpoint)
-	if err != nil {
-		return err
-	}
 	metricSet := metrics.New()
 	health := nodehealth.NewTracker()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	client, resolver := kubernetesClients(logger)
+	resolver := kubernetesResolver(logger)
 	quotaBackend := quota.XFS{Binary: "xfs_quota"}
 	if resolver != nil {
 		resolver.Start(ctx)
-	}
-	reporter, err := configureNodeHealthReporter(client, *healthNamespace, *nodeID, health, logger)
-	if err != nil {
-		return err
 	}
 
 	pressure := cache.PressureConfig{
@@ -101,35 +93,61 @@ func run(logger *slog.Logger) error {
 		HighInodeFreePercent: *highInodeFreePercent,
 		LowInodeFreePercent:  *lowInodeFreePercent,
 	}
-	store, err := initializeNodeStore(ctx, *cacheRoot, cache.StoreOptions{
+	var listenConfig net.ListenConfig
+	metricsListener, err := listenConfig.Listen(ctx, "tcp", *metricsAddress)
+	if err != nil {
+		return fmt.Errorf("listen on metrics endpoint: %w", err)
+	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metricSet.Handler())
+	metricsMux.HandleFunc("GET /readyz", health.ReadinessHandler)
+	metricsMux.HandleFunc("GET /health", health.HealthHandler)
+	metricsServer := &http.Server{Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+	metricsErr := make(chan error, 1)
+	go func() { metricsErr <- serveMetrics(ctx, metricsServer, metricsListener) }()
+
+	storeOptions := cache.StoreOptions{
 		Pressure:              pressure,
 		ProjectIDStart:        uint32(*projectIDStart),
 		ProjectIDCount:        uint32(*projectIDCount),
 		ProjectQuotaEnabled:   projectQuotaEnabled,
 		RequireRootMountpoint: *requireCacheRootMountpoint,
-	}, health, reporter)
-	if err != nil {
-		return err
+		IsGenerationMounted: func(generation string) (bool, error) {
+			return driver.SourceMounted(*cacheRoot, generation)
+		},
+	}
+	var store *cache.Store
+	for {
+		store, err = initializeNodeStore(*cacheRoot, storeOptions)
+		if err == nil {
+			break
+		}
+		health.RecordFailure(storeInitializationFailure(*cacheRoot, err))
+		logger.ErrorContext(ctx, "initialize cache store failed; retrying while reporting node health", "root", *cacheRoot, "error", err)
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case metricsServeErr := <-metricsErr:
+			timer.Stop()
+			return fmt.Errorf("serve metrics endpoint while waiting for cache store: %w", metricsServeErr)
+		case <-timer.C:
+		}
 	}
 	defer func() { _ = store.Close() }()
-	if reporter != nil {
-		go reporter.Run(ctx)
+	paths, err := resolveRuntimePaths(*cacheRoot, *kubeletRoot, *endpoint)
+	if err != nil {
+		return err
 	}
 
 	cacheManager := manager.New(store, manager.Options{
 		Interval:           *gcInterval,
 		InspectMount:       driver.VerifyCacheMount,
 		ResolverReady:      resolverSynced(resolver),
+		MountProbe:         func(context.Context) error { return driver.PreflightMountAPI() },
 		FilesystemReadOnly: driver.FilesystemReadOnly,
-		CapabilityProbe: func(probeContext context.Context, reason string) error {
-			switch reason {
-			case "CacheMountUnavailable":
-				return driver.PreflightMountAPI()
-			default:
-				return fmt.Errorf("no capability probe is configured for %q", reason)
-			}
-		},
-		QuotaRequired: projectQuotaEnabled,
+		QuotaRequired:      projectQuotaEnabled,
 		QuotaProbe: func(probeContext context.Context, root string) error {
 			return quotaBackend.Check(probeContext, root)
 		},
@@ -142,6 +160,7 @@ func run(logger *slog.Logger) error {
 		KubeletRoot:         *kubeletRoot,
 		VendorVersion:       version,
 		ProjectQuotaEnabled: projectQuotaEnabled,
+		MountProbe:          func(context.Context) error { return driver.PreflightMountAPI() },
 		Metrics:             metricSet,
 		Logger:              logger,
 		Health:              health,
@@ -155,16 +174,6 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("listen on CSI endpoint: %w", err)
 	}
 	defer cleanupSocket()
-	var listenConfig net.ListenConfig
-	metricsListener, err := listenConfig.Listen(ctx, "tcp", *metricsAddress)
-	if err != nil {
-		return fmt.Errorf("listen on metrics endpoint: %w", err)
-	}
-	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", metricSet.Handler())
-	metricsMux.HandleFunc("GET /readyz", health.ReadinessHandler)
-	metricsServer := &http.Server{Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
-
 	logger.Info("starting cache CSI node driver", "version", version, "revision", revision, "nodeID", *nodeID, "endpoint", *endpoint, "metricsAddress", *metricsAddress)
 	managerContext, cancelManager := context.WithCancel(ctx)
 	managerDone := make(chan struct{})
@@ -190,8 +199,6 @@ func run(logger *slog.Logger) error {
 	}()
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- grpcServer.Serve(listener) }()
-	metricsErr := make(chan error, 1)
-	go func() { metricsErr <- serveMetrics(managerContext, metricsServer, metricsListener) }()
 
 	select {
 	case err := <-serveErr:
@@ -250,41 +257,28 @@ func validateStorageBackend(backend string, requireRootMountpoint bool) (bool, e
 	}
 }
 
-func configureNodeHealthReporter(client kubernetes.Interface, namespace, nodeID string, health *nodehealth.Tracker, logger *slog.Logger) (*nodehealth.Reporter, error) {
-	if client == nil {
-		logger.Error("Kubernetes client is unavailable; Cache CSI remains unavailable until the process restarts")
-		health.SetCondition(nodehealth.SubsystemStartup, nodehealth.PhaseUnavailable, "KubernetesClientUnavailable", false)
-		return nil, nil
-	}
-	if namespace == "" {
-		logger.Error("POD_NAMESPACE is required to publish node cache health")
-		health.SetCondition(nodehealth.SubsystemStartup, nodehealth.PhaseUnavailable, "HealthNamespaceUnavailable", false)
-		return nil, nil
-	}
-	reporter, err := nodehealth.NewReporter(client, namespace, nodeID, health, logger)
-	if err != nil {
-		return nil, fmt.Errorf("configure node health Lease reporter: %w", err)
-	}
-	return reporter, nil
-}
-
-func initializeNodeStore(ctx context.Context, root string, options cache.StoreOptions, health *nodehealth.Tracker, reporter *nodehealth.Reporter) (*cache.Store, error) {
-	if err := driver.PreflightMountAPI(); err != nil {
-		health.SetCondition(nodehealth.SubsystemMount, nodehealth.PhaseUnavailable, "CacheMountUnavailable", true)
-		if reporter != nil {
-			reporter.Publish(ctx)
-		}
-		return nil, fmt.Errorf("preflight Linux mount APIs: %w", err)
-	}
+func initializeNodeStore(root string, options cache.StoreOptions) (*cache.Store, error) {
 	store, err := cache.NewStoreAsync(root, options)
 	if err != nil {
-		health.SetCondition(nodehealth.SubsystemStore, nodehealth.PhaseUnavailable, "CacheStoreInitializationFailed", true)
-		if reporter != nil {
-			reporter.Publish(ctx)
-		}
 		return nil, fmt.Errorf("initialize cache store: %w", err)
 	}
 	return store, nil
+}
+
+func storeInitializationFailure(root string, err error) nodehealth.Failure {
+	readOnly, readOnlyErr := driver.FilesystemReadOnly(root)
+	if readOnly || errors.Is(err, unix.EIO) || errors.Is(err, unix.EROFS) || errors.Is(readOnlyErr, unix.EIO) || errors.Is(readOnlyErr, unix.EROFS) {
+		return nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemFilesystem,
+			Reason: nodehealth.ReasonFilesystemUnavailable, Impact: nodehealth.NodeImpactEvict,
+			Retryability: nodehealth.Retryable,
+		}
+	}
+	return nodehealth.Failure{
+		Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemStore,
+		Reason: nodehealth.ReasonStoreInitialization, Impact: nodehealth.NodeImpactNoSchedule,
+		Retryability: nodehealth.Retryable,
+	}
 }
 
 func resolverSynced(resolver *kube.Resolver) func() bool {
@@ -296,13 +290,14 @@ func resolverSynced(resolver *kube.Resolver) func() bool {
 
 func runHealthController(logger *slog.Logger, args []string) error {
 	flags := flag.NewFlagSet("health-controller", flag.ContinueOnError)
-	namespace := flags.String("namespace", os.Getenv("POD_NAMESPACE"), "namespace for node health Leases")
-	extenderAddress := flags.String("scheduler-extender-address", ":8090", "scheduler extender HTTP listen address")
+	namespace := flags.String("namespace", os.Getenv("POD_NAMESPACE"), "namespace containing cache CSI node plugin Pods")
+	pluginPodSelector := flags.String("plugin-pod-label-selector", "", "label selector for cache CSI node plugin Pods")
+	pluginDaemonSet := flags.String("plugin-daemonset-name", "", "name of the cache CSI node plugin DaemonSet")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *namespace == "" {
-		return errors.New("health controller namespace must be configured")
+	if *namespace == "" || *pluginPodSelector == "" || *pluginDaemonSet == "" {
+		return errors.New("health controller namespace, node-plugin DaemonSet, and Pod selector must be configured")
 	}
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -323,7 +318,7 @@ func runHealthController(logger *slog.Logger, args []string) error {
 			return fmt.Errorf("resolve health controller identity: %w", err)
 		}
 	}
-	apiCache, err := nodehealth.NewAPICache(client, *namespace)
+	apiCache, err := nodehealth.NewAPICache(client, *namespace, *pluginDaemonSet, *pluginPodSelector)
 	if err != nil {
 		return err
 	}
@@ -336,14 +331,6 @@ func runHealthController(logger *slog.Logger, args []string) error {
 	if err := apiCache.Start(ctx); err != nil {
 		return fmt.Errorf("synchronize health controller Kubernetes informer caches: %w", err)
 	}
-	extenderDone := make(chan error, 1)
-	go func() {
-		err := nodehealth.ServeSchedulerExtender(ctx, *extenderAddress, nodehealth.SchedulerExtenderHandler(apiCache))
-		if err != nil {
-			stop()
-		}
-		extenderDone <- err
-	}()
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock: &resourcelock.LeaseLock{
 			LeaseMeta: metav1.ObjectMeta{Name: "cache-csi-health-controller-leader", Namespace: *namespace},
@@ -370,10 +357,6 @@ func runHealthController(logger *slog.Logger, args []string) error {
 		ReleaseOnCancel: true,
 		Name:            "cache-csi-health-controller",
 	})
-	stop()
-	if err := <-extenderDone; err != nil {
-		return fmt.Errorf("serve scheduler extender: %w", err)
-	}
 	return nil
 }
 
@@ -477,25 +460,21 @@ func canonicalPath(path string) (string, error) {
 	}
 }
 
-func kubernetesClients(logger *slog.Logger) (kubernetes.Interface, *kube.Resolver) {
+func kubernetesResolver(logger *slog.Logger) *kube.Resolver {
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		logger.Error("in-cluster Kubernetes configuration is unavailable; Cache CSI cannot resolve policies or publish node health", "error", err)
-		return nil, nil
+		logger.Error("in-cluster Kubernetes configuration is unavailable; Cache CSI cannot resolve policies", "error", err)
+		return nil
 	}
 	config = rest.CopyConfig(config)
 	config.Timeout = 5 * time.Second
 	config.QPS = 50
 	config.Burst = 100
-	client, clientErr := kubernetes.NewForConfig(config)
-	if clientErr != nil {
-		logger.Error("create Kubernetes client failed", "error", clientErr)
-	}
 	resolver, resolverErr := kube.NewResolver(config)
 	if resolverErr != nil {
 		logger.Error("create CacheClass resolver failed", "error", resolverErr)
 	}
-	return client, resolver
+	return resolver
 }
 
 func parseEndpoint(endpoint string) (string, error) {
