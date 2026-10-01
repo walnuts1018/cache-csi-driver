@@ -13,6 +13,7 @@ import (
 )
 
 // TestMountUsesOpenTreeMountSetattrMoveMountはdriverが使用するLinux mount APIを実際に呼び出して検証する。通常のunit testではmount権限がない環境をskipし、専用integration taskではCACHE_CSI_REQUIRE_MOUNT_APIで実mountを必須にする。
+//
 //nolint:paralleltest // このテストはホストのmount namespaceを変更するため並列実行しない。
 func TestMountUsesOpenTreeMountSetattrMoveMount(t *testing.T) {
 	requireLinuxMountAPI(t)
