@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+//nolint:paralleltest // このテストは共有loopback XFSと固定project IDを使うため並列実行しない。
 func TestXFSProjectQuotaEnforcesHardLimit(t *testing.T) {
 	if os.Getenv("CACHE_CSI_REQUIRE_XFS_QUOTA") != "1" {
 		t.Skip("XFS project quota integration runs only in the dedicated loopback filesystem task")
@@ -71,6 +72,7 @@ func TestXFSProjectQuotaEnforcesHardLimit(t *testing.T) {
 	}
 }
 
+//nolint:paralleltest // このhelperは上位の共有XFS integration testから再実行される。
 func TestXFSQuotaWriteHelper(t *testing.T) {
 	path := os.Getenv("CACHE_CSI_XFS_WRITE_PATH")
 	if path == "" {
