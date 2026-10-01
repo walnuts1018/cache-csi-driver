@@ -108,7 +108,7 @@ func TestRecoverPreparingLeaseAfterDriverRestartWithAttachedMount(t *testing.T) 
 	if !created {
 		t.Fatal("initial mount recovery publish did not create a lease")
 	}
-	source, err = store.Expose(identity)
+	source, err := store.Expose(identity)
 	if err != nil {
 		t.Fatal(err)
 	}
