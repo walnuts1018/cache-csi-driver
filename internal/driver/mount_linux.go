@@ -229,26 +229,64 @@ func pathWithin(root, path string) bool {
 }
 
 func sourceMounted(source string) (bool, error) {
-	sourceInfo, err := os.Stat(source)
-	if err != nil {
-		return false, err
-	}
+	sourceInfo, statErr := os.Stat(source)
 	mounts, err := mobyMountinfo.GetMounts(nil)
 	if err != nil {
 		return false, err
 	}
-	for _, mount := range mounts {
-		if filepath.Clean(mount.Mountpoint) == filepath.Clean(source) {
-			continue
-		}
-		mountInfo, err := os.Stat(mount.Mountpoint)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+	if statErr == nil {
+		for _, mount := range mounts {
+			if filepath.Clean(mount.Mountpoint) == filepath.Clean(source) {
 				continue
 			}
+			mountInfo, err := os.Stat(mount.Mountpoint)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return false, err
+			}
+			if os.SameFile(sourceInfo, mountInfo) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	if !errors.Is(statErr, os.ErrNotExist) {
+		return false, statErr
+	}
+	return sourceMountedByPath(mounts, source)
+}
+
+func sourceMountedByPath(mounts []*mobyMountinfo.Info, source string) (bool, error) {
+	ancestor := filepath.Clean(source)
+	for {
+		if _, err := os.Stat(ancestor); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return false, err
 		}
-		if os.SameFile(sourceInfo, mountInfo) {
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return false, nil
+		}
+		ancestor = parent
+	}
+	covering, err := mounttable.Covering(mounts, ancestor)
+	if err != nil || covering == nil {
+		return false, err
+	}
+	relative, err := filepath.Rel(filepath.Clean(covering.Mountpoint), filepath.Clean(source))
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return false, errors.New("missing cache source is outside its covering filesystem")
+	}
+	expectedRoot := filepath.Clean(filepath.Join(covering.Root, relative))
+	for _, mount := range mounts {
+		if filepath.Clean(mount.Mountpoint) == filepath.Clean(covering.Mountpoint) {
+			continue
+		}
+		mountRoot := filepath.Clean(mount.Root)
+		if mount.Major == covering.Major && mount.Minor == covering.Minor && (mountRoot == expectedRoot || mountRoot == filepath.Join(expectedRoot, "deleted")) {
 			return true, nil
 		}
 	}

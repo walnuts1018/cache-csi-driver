@@ -414,7 +414,7 @@ func (manager *Manager) probeReportedCapabilities() {
 		case nodehealth.SubsystemMount, nodehealth.SubsystemQuota, nodehealth.SubsystemFilesystem, nodehealth.SubsystemProjectRegistry:
 			continue
 		case nodehealth.SubsystemStoreOperations:
-			err := manager.store.CheckFilesystem()
+			err := manager.store.CheckStoreOperations()
 			if err == nil {
 				manager.health.ClearCondition(condition.Subsystem)
 			} else {

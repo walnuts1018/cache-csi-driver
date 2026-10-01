@@ -18,10 +18,7 @@ func SourceMounted(root, source string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("resolve cache root: %w", err)
 	}
-	source, err = filepath.EvalSymlinks(source)
-	if err != nil {
-		return false, fmt.Errorf("resolve cache generation path: %w", err)
-	}
+	source = filepath.Clean(source)
 	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(source))
 	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return false, errors.New("cache generation path is outside the configured cache root")

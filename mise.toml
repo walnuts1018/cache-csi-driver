@@ -113,7 +113,7 @@ docker run --rm --privileged --platform "linux/$go_arch" \
   -v "$tmp_dir:/tmp/cache-csi-mount-api:ro" \
   --entrypoint /tmp/cache-csi-mount-api/mount-api.test \
   ubuntu:26.04 \
-  -test.v -test.count=1 -test.run '^Test(MountUsesOpenTreeMountSetattrMoveMount|RecoverPreparingLeaseAfterDriverRestartWithAttachedMount)$'
+  -test.v -test.count=1 -test.run '^Test(MountUsesOpenTreeMountSetattrMoveMount|RecoverPreparingLeaseAfterDriverRestartWithAttachedMount|SourceMountedFindsBindMountAfterSourcePathRemoval)$'
 """
 
 [tasks."test:xfs-quota"]
@@ -148,6 +148,10 @@ docker run --rm --privileged --platform "linux/$go_arch" \
 [tasks."test:e2e:kind"]
 description = "Run cache lifecycle integration checks on a two-worker Kind cluster"
 run = "bash hack/test-kind-lifecycle.sh"
+
+[tasks."test:api:kind"]
+description = "Validate Helm resources and admission CEL on a Kubernetes 1.37 API server"
+run = "bash hack/test-kind-api-validation.sh"
 
 [tasks.manifests]
 description = "Generate CacheClass API code and CRD manifests"

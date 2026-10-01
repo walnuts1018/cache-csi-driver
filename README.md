@@ -35,7 +35,7 @@ cache filesystemのpressure時は未使用cacheを古い順に回収します。
 
 NodePublishとNodeUnpublishのtarget pathはkubelet root配下の`pods/<podUID>/volumes/kubernetes.io~csi/<volumeName>/mount`形式に限定し、NodePublishでは`podInfoOnMount`のPod UIDとの一致を検証します。既存path componentのsymbolic link traversalも拒否します。この検証はKubernetes 1.37.1のCSI mounterが生成するinline volume pathに対応しています。CSI socketはkubeletとrootだけがアクセスできるようにしてください。
 
-default kube-schedulerはMutatingAdmissionPolicyが注入したready label selectorと、`CSIDriver.spec.preventPodSchedulingIfMissing: true`を使います。前者はNode cache healthを、後者はそのNodeにCSI driver自体が登録されていることを確認します。health label更新とPod bindingの間にはraceがあるため、NodePublishVolumeも現在のNode healthとStore readinessを確認し、正常なcacheを提供できない場合は失敗します。health-controllerはready labelを外した後、対象Nodeに既にboundされたCache CSI Podも確認し、evict不要の障害ではRunningかつReadyなPodを維持して新規またはmount待ちPodだけをEviction APIで退避します。controller-managed Podは別Nodeで再作成され、bare Podは自動削除しません。独自scheduler、scheduler extender、DRAは含まれません。
+default kube-schedulerはMutatingAdmissionPolicyがCache CSI inline Podへ注入したready label selectorを使い、Node cache healthを確認します。`CSIDriver.spec.preventPodSchedulingIfMissing: true`も設定しますが、Kubernetes 1.37のKind実API検証では、このfieldだけではCSI inline ephemeral volumeを持つPodの配置を防げませんでした。health label更新とPod bindingの間にはraceがあるため、NodePublishVolumeも現在のNode healthとStore readinessを確認し、正常なcacheを提供できない場合は失敗します。health-controllerはready labelを外した後、対象Nodeに既にboundされたCache CSI Podも確認し、evict不要の障害ではRunningかつReadyなPodを維持して新規またはmount待ちPodだけをEviction APIで退避します。controller-managed Podは別Nodeで再作成され、bare Podは自動削除しません。独自scheduler、scheduler extender、DRAは含まれません。
 
 ## CacheClassとPod volume
 
@@ -196,7 +196,7 @@ sequenceDiagram
     S->>N: Replacement selects a healthy Node
 ```
 
-この設計では独自scheduler、scheduler extender、DRA、Node pluginが書き込むhealth Lease、tmpfsや別Storeへのfallbackを使用しません。Kubernetes default schedulerがready labelと`CSIDriver.spec.preventPodSchedulingIfMissing`を評価します。`preventPodSchedulingIfMissing`はCSI driver未登録Nodeを除外する機能であり、Node cache healthの代わりではありません。
+この設計では独自scheduler、scheduler extender、DRA、Node pluginが書き込むhealth Lease、tmpfsや別Storeへのfallbackを使用しません。MutatingAdmissionPolicyはCache CSI inline Podへready label selectorを追加し、health-controllerが現在のnode-plugin PodをprobeしてNode labelを更新します。`CSIDriver.spec.preventPodSchedulingIfMissing`も設定しますが、Kubernetes 1.37のKind実API検証では、このfieldだけではCSI inline ephemeral volumeを持つPodの配置を防げませんでした。そのためinline volumeに対する動的なNode選択はready labelで制御します。CSI schedulerがCSINodeのdriver情報を使うvolume経路では`preventPodSchedulingIfMissing`も有効です。
 
 ## 開発とリリース
 

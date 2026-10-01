@@ -132,6 +132,8 @@ jobs:
             task: test:xfs-quota
           - name: Kind cache lifecycle E2E
             task: test:e2e:kind
+          - name: Kind Kubernetes 1.37 API validation
+            task: test:api:kind
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

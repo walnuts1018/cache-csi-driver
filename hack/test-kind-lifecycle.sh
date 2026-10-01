@@ -344,6 +344,27 @@ wait_for_health_replacement() {
   exit 1
 }
 
+wait_for_managed_replacement() {
+  local label_selector="$1" previous_pod="$2" unavailable_node="$3" pod node phase
+  for _ in $(seq 1 180); do
+    pod="$(kubectl --context "$context" get pods --namespace default -l "$label_selector" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | awk -v previous="$previous_pod" '$0 != previous && NF { print; exit }')"
+    if [[ -n "$pod" ]]; then
+      node="$(kubectl --context "$context" get pod --namespace default "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+      phase="$(kubectl --context "$context" get pod --namespace default "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      if [[ -n "$node" && "$node" != "$unavailable_node" && "$phase" == Running ]]; then
+        if kubectl --context "$context" wait --for=condition=Ready "pod/$pod" --namespace default --timeout=1s >/dev/null 2>&1; then
+          printf '%s\n' "$pod"
+          return
+        fi
+      fi
+    fi
+    sleep 1
+  done
+  echo "The health controller did not relocate a managed Pending cache Pod to a healthy Node" >&2
+  kubectl --context "$context" get pods --namespace default -l "$label_selector" -o wide >&2 || true
+  exit 1
+}
+
 wait_for_node_not_ready() {
   local node="$1" condition
   for _ in $(seq 1 180); do
@@ -620,24 +641,66 @@ if [[ -n "$health_controller_pods" ]]; then
 fi
 docker exec "$health_node_container" mount -o remount,ro /var/lib/cache-csi
 readonly_node="$health_node_container"
-write_pod pod-readonly-scheduling-race "$health_node" default lifecycle-readonly-scheduling-race
-kubectl --context "$context" apply -f "$tmp_dir/pod-readonly-scheduling-race.yaml"
+kubectl --context "$context" label node "$healthy_node" "$test_node_label-" --overwrite
+kubectl --context "$context" label node "$health_node" "$test_node_label=race-target" --overwrite
+cat > "$tmp_dir/deployment-readonly-scheduling-race.yaml" <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-readonly-scheduling-race
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cache-readonly-scheduling-race
+  template:
+    metadata:
+      labels:
+        app: cache-readonly-scheduling-race
+    spec:
+      serviceAccountName: default
+      nodeSelector:
+        $test_node_label: race-target
+      containers:
+        - name: check
+          image: $app_image
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "if [ -f /cache/marker ]; then printf 'HIT' > /tmp/cache-result; else printf 'MISS' > /tmp/cache-result; printf 'cached' > /cache/marker; fi; sleep 3600"]
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: cache
+          csi:
+            driver: cache.csi.walnuts.dev
+            volumeAttributes:
+              cacheClass: default
+              cacheKey: lifecycle-readonly-scheduling-race
+EOF
+kubectl --context "$context" apply -f "$tmp_dir/deployment-readonly-scheduling-race.yaml"
+race_pod=""
 race_node=""
 for _ in $(seq 1 30); do
-  race_node="$(kubectl --context "$context" get pod pod-readonly-scheduling-race --namespace default -o jsonpath='{.spec.nodeName}')"
+  race_pod="$(kubectl --context "$context" get pods --namespace default -l app=cache-readonly-scheduling-race -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -z "$race_pod" ]]; then
+    sleep 1
+    continue
+  fi
+  race_node="$(kubectl --context "$context" get pod "$race_pod" --namespace default -o jsonpath='{.spec.nodeName}')"
   if [[ "$race_node" == "$health_node" ]]; then
     break
   fi
   sleep 1
 done
 if [[ "$race_node" != "$health_node" ]]; then
-  echo "The scheduling race Pod did not bind to the Node whose ready label was stale" >&2
-  kubectl --context "$context" describe pod pod-readonly-scheduling-race --namespace default >&2 || true
+  echo "The managed scheduling race Pod did not bind to the Node whose ready label was stale" >&2
+  kubectl --context "$context" get pods --namespace default -l app=cache-readonly-scheduling-race -o wide >&2 || true
   exit 1
 fi
 mount_failure=""
 for _ in $(seq 1 60); do
-  mount_failure="$(kubectl --context "$context" get events --namespace default --field-selector involvedObject.kind=Pod,involvedObject.name=pod-readonly-scheduling-race -o jsonpath='{range .items[*]}{.reason}{"\t"}{.message}{"\n"}{end}')"
+  mount_failure="$(kubectl --context "$context" get events --namespace default --field-selector "involvedObject.kind=Pod,involvedObject.name=$race_pod" -o jsonpath='{range .items[*]}{.reason}{"\t"}{.message}{"\n"}{end}')"
   if grep -Fq 'FailedMount' <<<"$mount_failure"; then
     break
   fi
@@ -645,13 +708,16 @@ for _ in $(seq 1 60); do
 done
 if ! grep -Fq 'FailedMount' <<<"$mount_failure"; then
   echo "NodePublish did not fail after the cache root became read-only while the Node label was stale" >&2
-  kubectl --context "$context" describe pod pod-readonly-scheduling-race --namespace default >&2 || true
+  kubectl --context "$context" describe pod "$race_pod" --namespace default >&2 || true
   exit 1
 fi
-delete_pod pod-readonly-scheduling-race
+kubectl --context "$context" label node "$health_node" "$test_node_label-" --overwrite
+kubectl --context "$context" label node "$healthy_node" "$test_node_label=race-target" --overwrite
 kubectl --context "$context" scale deployment "$health_controller_deployment" --namespace kube-system --replicas=2
 kubectl --context "$context" rollout status deployment "$health_controller_deployment" --namespace kube-system --timeout=3m
 wait_for_cache_not_ready "$health_node"
+race_replacement="$(wait_for_managed_replacement app=cache-readonly-scheduling-race "$race_pod" "$health_node")"
+expect_result "$race_replacement" MISS
 sleep 8
 current_health_pod="$(kubectl --context "$context" get pods --namespace default -l app=cache-node-health -o jsonpath='{.items[0].metadata.name}')"
 if [[ "$current_health_pod" != "$health_pod" ]] || ! kubectl --context "$context" wait --for=condition=Ready "pod/$health_pod" --namespace default --timeout=1s >/dev/null 2>&1; then
@@ -675,6 +741,7 @@ docker exec "$health_node_container" mount -o remount,rw /var/lib/cache-csi
 readonly_node=""
 wait_for_cache_ready "$health_node"
 delete_pod pod-plugin-unavailable-existing
+kubectl --context "$context" delete deployment cache-readonly-scheduling-race --namespace default --wait=true --timeout=2m
 kubectl --context "$context" delete deployment cache-node-health --namespace default --wait=true --timeout=2m
 echo "Read-only cache root removed readiness, respected PDB and unmanaged Pod ownership, and recovered automatically on $health_node"
 

@@ -35,6 +35,7 @@ spec:
             - --namespace=$(POD_NAMESPACE)
             - --plugin-daemonset-name={{ include "cache-csi-driver.fullname" . }}
             - --plugin-pod-label-selector=app.kubernetes.io/name={{ include "cache-csi-driver.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=node
+            - --plugin-health-port={{ .Values.metrics.port }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

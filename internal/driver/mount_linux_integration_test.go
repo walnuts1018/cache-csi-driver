@@ -65,6 +65,52 @@ func TestMountUsesOpenTreeMountSetattrMoveMount(t *testing.T) {
 }
 
 //nolint:paralleltest // このテストはホストのmount namespaceと特権mount APIを使うため並列実行しない。
+func TestSourceMountedFindsBindMountAfterSourcePathRemoval(t *testing.T) {
+	requireLinuxMountAPI(t)
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "entry"), []byte("cache data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mount(source, target, false, true); err != nil {
+		if mountAPISkipError(t, err) {
+			return
+		}
+		t.Fatalf("attach source before removing its path: %v", err)
+	}
+	mounted := true
+	t.Cleanup(func() {
+		if mounted {
+			if err := unmount(target); err != nil {
+				t.Errorf("unmount target after source removal: %v", err)
+			}
+		}
+	})
+	if err := os.RemoveAll(source); err != nil {
+		t.Fatalf("remove the cache source path while its bind mount remains attached: %v", err)
+	}
+	found, err := sourceMounted(source)
+	if err != nil || !found {
+		t.Fatalf("inspect mount for removed source path = (%t, %v), want a mounted source", found, err)
+	}
+	if err := unmount(target); err != nil {
+		t.Fatal(err)
+	}
+	mounted = false
+	found, err = sourceMounted(source)
+	if err != nil || found {
+		t.Fatalf("inspect source after unmount = (%t, %v), want no mount", found, err)
+	}
+}
+
+//nolint:paralleltest // このテストはホストのmount namespaceと特権mount APIを使うため並列実行しない。
 func TestRecoverPreparingLeaseAfterDriverRestartWithAttachedMount(t *testing.T) {
 	requireLinuxMountAPI(t)
 	root := t.TempDir()

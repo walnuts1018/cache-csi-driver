@@ -293,6 +293,7 @@ func runHealthController(logger *slog.Logger, args []string) error {
 	namespace := flags.String("namespace", os.Getenv("POD_NAMESPACE"), "namespace containing cache CSI node plugin Pods")
 	pluginPodSelector := flags.String("plugin-pod-label-selector", "", "label selector for cache CSI node plugin Pods")
 	pluginDaemonSet := flags.String("plugin-daemonset-name", "", "name of the cache CSI node plugin DaemonSet")
+	pluginHealthPort := flags.Int("plugin-health-port", 9807, "node-plugin health HTTP port")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -322,7 +323,7 @@ func runHealthController(logger *slog.Logger, args []string) error {
 	if err != nil {
 		return err
 	}
-	controller, err := nodehealth.NewController(client, apiCache, *namespace, logger)
+	controller, err := nodehealth.NewController(client, apiCache, *namespace, *pluginHealthPort, logger)
 	if err != nil {
 		return err
 	}

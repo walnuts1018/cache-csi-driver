@@ -37,7 +37,7 @@ func (s *Server) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 
 func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) error {
 	target := req.GetTargetPath()
-	identity, lease, _, _, found, leaseErr := s.store.LeaseDetails(req.GetVolumeId())
+	identity, lease, source, policy, found, leaseErr := s.store.LeaseDetails(req.GetVolumeId())
 	if leaseErr != nil {
 		s.logger.WarnContext(ctx, "cache lease metadata is unavailable before target teardown", "volumeID", req.GetVolumeId(), "error", leaseErr)
 		if !errors.Is(leaseErr, cache.ErrDegradedMetadata) {
@@ -65,11 +65,23 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 		if !withinCacheRoot {
 			return status.Error(codes.FailedPrecondition, "target mount is outside the cache root")
 		}
-		candidateIdentity, _, degradedFound, identifyErr := s.store.FindDegradedGenerationForTarget(target, s.mounter.sameCacheSource)
-		if identifyErr != nil {
-			s.logger.WarnContext(ctx, "failed to identify degraded cache before unpublish", "error", identifyErr)
-			_ = s.fail(ctx, objectFailure(nodehealth.ReasonMetadataRead), identifyErr)
-		} else if degradedFound {
+		if leaseErr == nil && found {
+			matchesLease, err := verifyCacheMount(s.mounter, source, lease, policy)
+			if err != nil {
+				return s.fail(ctx, objectFailure(nodehealth.ReasonMountStateUnknown), err)
+			}
+			if !matchesLease {
+				return status.Error(codes.FailedPrecondition, "target mount does not match the cache lease")
+			}
+		} else {
+			candidateIdentity, _, degradedFound, identifyErr := s.store.FindDegradedGenerationForTarget(target, s.mounter.sameCacheSource)
+			if identifyErr != nil {
+				s.logger.WarnContext(ctx, "failed to identify degraded cache before unpublish", "error", identifyErr)
+				return s.fail(ctx, objectFailure(nodehealth.ReasonMetadataRead), identifyErr)
+			}
+			if !degradedFound {
+				return status.Error(codes.FailedPrecondition, "target mount does not match a cache generation")
+			}
 			degradedIdentity = candidateIdentity
 		}
 		if err := s.mounter.unmount(target); err != nil && !errors.Is(err, errNotMounted) && !errors.Is(err, os.ErrNotExist) {
@@ -88,14 +100,18 @@ func (s *Server) unpublishTarget(ctx context.Context, req *csi.NodeUnpublishVolu
 		if err := s.store.Release(req.GetVolumeId(), target); err != nil {
 			s.logger.WarnContext(ctx, "failed to release cache lease after target teardown", "volumeID", req.GetVolumeId(), "root", s.store.Root(), "error", err)
 			_ = s.fail(ctx, storeFailure(nodehealth.ReasonLeaseRelease), err)
-			if quarantineErr := s.store.QuarantineDegradedObject(identity, s.mounter.sourceMounted); quarantineErr != nil {
+			if quarantineErr := s.store.QuarantineDegradedObjectChecked(identity, func(source string, lease cache.Lease, policy cache.Policy) (bool, error) {
+				return verifyCacheMount(s.mounter, source, lease, policy)
+			}); quarantineErr != nil {
 				s.logger.WarnContext(ctx, "failed to quarantine cache after lease release", "root", s.store.Root(), "error", quarantineErr)
 				_ = s.fail(ctx, objectFailure(nodehealth.ReasonQuarantine), quarantineErr)
 			}
 		}
 	}
 	if degradedIdentity != "" {
-		if err := s.store.QuarantineDegradedObject(degradedIdentity, s.mounter.sourceMounted); err != nil {
+		if err := s.store.QuarantineDegradedObjectChecked(degradedIdentity, func(source string, lease cache.Lease, policy cache.Policy) (bool, error) {
+			return verifyCacheMount(s.mounter, source, lease, policy)
+		}); err != nil {
 			s.logger.WarnContext(ctx, "failed to quarantine degraded cache after target teardown", "identity", degradedIdentity, "error", err)
 			_ = s.fail(ctx, objectFailure(nodehealth.ReasonQuarantine), err)
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
@@ -105,6 +106,9 @@ func (apiCache *APICache) PluginPods() ([]*corev1.Pod, error) {
 	}
 	daemonSet, err := apiCache.daemonSetLister.DaemonSets(apiCache.namespace).Get(apiCache.pluginDaemonSet)
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return []*corev1.Pod{}, nil
+		}
 		return nil, err
 	}
 	current := make([]*corev1.Pod, 0, len(pods))

@@ -250,6 +250,22 @@ func TestNodePublishPassesReadonlyAndNoExecMountOptions(t *testing.T) {
 	}
 }
 
+func TestNodePublishDoesNotCommitWhenMountWasNotAttached(t *testing.T) {
+	t.Parallel()
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	mounts.mountWithoutAttach = true
+	request := newPublishRequest(t, server.options.KubeletRoot, "mount-not-attached")
+	if _, err := server.NodePublishVolume(t.Context(), request); status.Code(err) != codes.Unavailable {
+		t.Fatalf("publish without an attached kernel mount error = %v, want Unavailable", err)
+	}
+	if _, _, _, _, found, err := store.LeaseDetails(request.GetVolumeId()); err != nil || found {
+		t.Fatalf("lease after missing mount = (found=%t, error=%v), want rollback", found, err)
+	}
+	if mounts.lastVerification.target != "" {
+		t.Fatalf("mount verification ran for an unattached target: %+v", mounts.lastVerification)
+	}
+}
+
 func TestNodePublishRetryUsesPersistedQuotaPolicy(t *testing.T) {
 	t.Parallel()
 
@@ -689,6 +705,38 @@ func TestNodeUnpublishPreservesLeaseForForeignMount(t *testing.T) {
 	}
 }
 
+func TestNodeUnpublishPreservesLeaseForDifferentCacheGeneration(t *testing.T) {
+	t.Parallel()
+
+	server, mounts, store := newTestServer(t, cachev1alpha1.CacheClassSpec{}, nil)
+	request := newPublishRequest(t, server.options.KubeletRoot, "different-generation-unpublish-volume")
+	if _, err := server.NodePublishVolume(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	otherSource := filepath.Join(store.Root(), ".trash", "other-object", "generations", "other-generation")
+	if err := os.MkdirAll(otherSource, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mounts.mounts[request.GetTargetPath()] = testMount{source: otherSource}
+
+	_, err := server.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   request.GetVolumeId(),
+		TargetPath: request.GetTargetPath(),
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("unpublish error = %v, want FailedPrecondition", err)
+	}
+	if mounts.unmountCalls != 0 {
+		t.Fatalf("unmount calls = %d, want 0 for a different cache generation", mounts.unmountCalls)
+	}
+	if _, mounted := mounts.mounts[request.GetTargetPath()]; !mounted {
+		t.Fatal("mount was removed after the lease source check failed")
+	}
+	if _, _, _, _, found, leaseErr := store.LeaseDetails(request.GetVolumeId()); leaseErr != nil || !found {
+		t.Fatalf("cache lease found = %t, error = %v; want the lease preserved", found, leaseErr)
+	}
+}
+
 func TestNodeHealthKeepsObjectMetadataFailureScopedToVolume(t *testing.T) {
 	t.Parallel()
 
@@ -1028,6 +1076,7 @@ type testMounter struct {
 	mountCalls               int
 	unmountCalls             int
 	mountErr                 error
+	mountWithoutAttach       bool
 	unmountErr               error
 	lastVerification         mountVerification
 	sourceMountedCalls       int
@@ -1137,6 +1186,9 @@ func (mounts *testMounter) mount(source, target string, readOnly, noExec bool) e
 	mounts.mountCalls++
 	if mounts.mountErr != nil {
 		return mounts.mountErr
+	}
+	if mounts.mountWithoutAttach {
+		return nil
 	}
 	info, err := os.Stat(source)
 	if err != nil {

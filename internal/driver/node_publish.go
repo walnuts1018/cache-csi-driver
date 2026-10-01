@@ -225,8 +225,8 @@ func (s *Server) prepareLease(ctx context.Context, req *csi.NodePublishVolumeReq
 	oldIdentity, oldLease, _, oldPolicy, found, err := s.store.LeaseDetails(req.GetVolumeId())
 	if err != nil {
 		if errors.Is(err, cache.ErrDegradedMetadata) {
-			recoverErr := s.store.RecoverDegraded(ctx, func(source string, _ cache.Lease, _ cache.Policy) (bool, error) {
-				return s.mounter.sourceMounted(source)
+			recoverErr := s.store.RecoverDegraded(ctx, func(source string, lease cache.Lease, policy cache.Policy) (bool, error) {
+				return verifyCacheMount(s.mounter, source, lease, policy)
 			})
 			if recoverErr != nil {
 				if ctx.Err() != nil {
@@ -346,7 +346,9 @@ func policyFor(spec cachev1alpha1.CacheClassSpec, className, classUID, requested
 func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolumeRequest, identity string, lease cache.Lease, policy cache.Policy, outcome string) error {
 	_, _, err := s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
 	if errors.Is(err, cache.ErrDegradedMetadata) {
-		if quarantineErr := s.store.QuarantineDegradedObject(identity, s.mounter.sourceMounted); quarantineErr != nil {
+		if quarantineErr := s.store.QuarantineDegradedObjectChecked(identity, func(source string, lease cache.Lease, policy cache.Policy) (bool, error) {
+			return verifyCacheMount(s.mounter, source, lease, policy)
+		}); quarantineErr != nil {
 			return s.fail(ctx, objectFailure(nodehealth.ReasonQuarantine), quarantineErr)
 		}
 		_, _, err = s.store.Acquire(cache.AcquireOptions{Identity: identity, Lease: lease, Policy: policy})
@@ -376,7 +378,9 @@ func (s *Server) publishNewCache(ctx context.Context, req *csi.NodePublishVolume
 	source, err = s.store.Expose(identity)
 	if err != nil {
 		if errors.Is(err, cache.ErrDegradedMetadata) {
-			if quarantineErr := s.store.QuarantineDegradedObject(identity, s.mounter.sourceMounted); quarantineErr == nil {
+			if quarantineErr := s.store.QuarantineDegradedObjectChecked(identity, func(source string, lease cache.Lease, policy cache.Policy) (bool, error) {
+				return verifyCacheMount(s.mounter, source, lease, policy)
+			}); quarantineErr == nil {
 				return s.rollbackPublish(ctx, req, status.Error(codes.Unavailable, "cache metadata became degraded before mount"))
 			} else {
 				err = errors.Join(err, quarantineErr)
@@ -413,27 +417,27 @@ func (s *Server) publishMountedCache(ctx context.Context, req *csi.NodePublishVo
 	if err := makeTargetDirectory(req.GetTargetPath()); err != nil {
 		return s.rollbackPublish(ctx, req, status.Errorf(codes.Internal, "prepare cache mount target: %v", err))
 	}
-	if err := s.mounter.mount(source, req.GetTargetPath(), req.GetReadonly(), noExec); err != nil {
-		mounted, inspectErr := s.mounter.mountedAt(req.GetTargetPath())
-		if inspectErr != nil {
-			return s.fail(ctx, nodehealth.Failure{
-				Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
-				Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
-				Retryability: nodehealth.PermanentUntilProbe,
-			}, errors.Join(err, inspectErr))
+	mountErr := s.mounter.mount(source, req.GetTargetPath(), req.GetReadonly(), noExec)
+	mounted, inspectErr := s.mounter.mountedAt(req.GetTargetPath())
+	if inspectErr != nil {
+		return s.fail(ctx, nodehealth.Failure{
+			Scope: nodehealth.FailureScopeNode, Subsystem: nodehealth.SubsystemMount,
+			Reason: nodehealth.ReasonMountUnavailable, Impact: nodehealth.NodeImpactNoSchedule,
+			Retryability: nodehealth.PermanentUntilProbe,
+		}, errors.Join(mountErr, inspectErr))
+	}
+	if !mounted {
+		if mountErr == nil {
+			mountErr = errors.New("mount operation returned success without attaching a mount")
 		}
-		if mounted {
-			same, verifyErr := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), noExec)
-			if verifyErr == nil && same {
-				if commitErr := s.store.CommitPublish(req.GetVolumeId(), req.GetTargetPath()); commitErr != nil {
-					return s.recordMountedLeaseCommitFailure(ctx, req.GetVolumeId(), commitErr)
-				}
-				s.recordNormalPublish(outcome)
-				return nil
-			}
-			return s.fail(ctx, objectFailure(nodehealth.ReasonMountStateUnknown), errors.Join(err, verifyErr))
-		}
-		return s.rollbackPublish(ctx, req, s.mountOperationFailure(ctx, err))
+		return s.rollbackPublish(ctx, req, s.mountOperationFailure(ctx, mountErr))
+	}
+	same, verifyErr := s.mounter.sameCacheMount(source, req.GetTargetPath(), req.GetReadonly(), noExec)
+	if verifyErr != nil {
+		return s.fail(ctx, objectFailure(nodehealth.ReasonMountStateUnknown), errors.Join(mountErr, verifyErr))
+	}
+	if !same {
+		return s.fail(ctx, objectFailure(nodehealth.ReasonMountStateUnknown), errors.Join(mountErr, errors.New("attached mount source or options do not match the cache lease")))
 	}
 	if err := s.store.CommitPublish(req.GetVolumeId(), req.GetTargetPath()); err != nil {
 		return s.recordMountedLeaseCommitFailure(ctx, req.GetVolumeId(), err)

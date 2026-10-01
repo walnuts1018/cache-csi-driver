@@ -97,8 +97,17 @@ func (s *Store) rebuildTrashIndexes(trashEntries []os.DirEntry) error {
 				return fmt.Errorf("read cache trash metadata %s: %w", entry.Name(), err)
 			}
 			s.markDegraded(filepath.Join(trashDirectoryName, entry.Name()), err)
-			if s.projectQuotaEnabled && validIdentity(meta.Identity) {
-				s.addUnknownProjectReservation(meta.Identity, entry.Name())
+			if s.projectQuotaEnabled {
+				s.projectQuotaRegistry.projectRegistryMu.Lock()
+				s.mu.Lock()
+				if validIdentity(meta.Identity) {
+					s.addUnknownProjectReservation(meta.Identity, entry.Name())
+				} else {
+					// An unreadable trash object may still own any project ID in the configured range.
+					s.projectQuotaRegistry.projectRegistryDamaged = true
+				}
+				s.mu.Unlock()
+				s.projectQuotaRegistry.projectRegistryMu.Unlock()
 			}
 			continue
 		}
@@ -312,6 +321,15 @@ func (s *Store) QuarantineDegradedObject(identity string, sourceMounted func(sou
 	if !validIdentity(identity) || sourceMounted == nil {
 		return errors.New("valid degraded cache identity and mount inspector are required")
 	}
+	return s.QuarantineDegradedObjectChecked(identity, func(source string, _ Lease, _ Policy) (bool, error) {
+		return sourceMounted(source)
+	})
+}
+
+func (s *Store) QuarantineDegradedObjectChecked(identity string, verifyMount func(source string, lease Lease, policy Policy) (bool, error)) error {
+	if !validIdentity(identity) || verifyMount == nil {
+		return errors.New("valid degraded cache identity and mount verifier are required")
+	}
 	unlockIdentity := s.lockIdentity(identity)
 	defer unlockIdentity()
 	s.mu.Lock()
@@ -330,7 +348,7 @@ func (s *Store) QuarantineDegradedObject(identity string, sourceMounted func(sou
 			continue
 		}
 		source := filepath.Join(objectPath, generationsDirectoryName, generation.Name())
-		mounted, err := sourceMounted(source)
+		mounted, err := verifyMount(source, Lease{}, Policy{})
 		if err != nil {
 			return s.detachAndCreateFreshObject(objectPath, identity, true, s.policyForDegradedObject(objectPath, identity))
 		}
@@ -338,8 +356,28 @@ func (s *Store) QuarantineDegradedObject(identity string, sourceMounted func(sou
 			return s.detachAndCreateFreshObject(objectPath, identity, true, s.policyForDegradedObject(objectPath, identity))
 		}
 	}
+	meta, metaErr := s.metadataRepository.readMetadata(objectPath)
+	if metaErr == nil && validateMetadata(identity, meta) == nil {
+		for _, lease := range meta.Leases {
+			generation, policy, generationErr := leaseGenerationAndPolicy(meta, lease)
+			if generationErr != nil {
+				return s.detachAndCreateFreshObject(objectPath, identity, true, meta.Policy)
+			}
+			source := filepath.Join(objectPath, generationsDirectoryName, generation)
+			if statErr := s.metadataRepository.stat(source); errors.Is(statErr, os.ErrNotExist) {
+				// The kernel may retain a bind mount after its source pathname disappears.
+				return s.detachAndCreateFreshObject(objectPath, identity, true, meta.Policy)
+			} else if statErr != nil {
+				return fmt.Errorf("inspect leased cache generation before quarantine: %w", statErr)
+			}
+			mounted, verifyErr := verifyMount(source, lease, policy)
+			if verifyErr != nil || mounted {
+				return s.detachAndCreateFreshObject(objectPath, identity, true, meta.Policy)
+			}
+		}
+	}
 	if !hasGenerationDirectory(generations) {
-		mounted, err := sourceMounted(objectPath)
+		mounted, err := verifyMount(objectPath, Lease{}, Policy{})
 		if err != nil {
 			return s.detachAndCreateFreshObject(objectPath, identity, true, s.policyForDegradedObject(objectPath, identity))
 		}

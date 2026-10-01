@@ -30,7 +30,6 @@ const (
 	ControllerInterval    = 5 * time.Second
 	probeTimeout          = 2 * time.Second
 	probeConcurrency      = 16
-	pluginHealthPort      = 9807
 	acceptedEvictionGap   = 30 * time.Second
 	healthReasonMaxLength = 64
 	readyLabelValue       = "true"
@@ -70,9 +69,9 @@ type Controller struct {
 	notified   map[evictionKey]struct{}
 }
 
-func NewController(client kubernetes.Interface, apiCache *APICache, namespace string, logger *slog.Logger) (*Controller, error) {
-	if client == nil || apiCache == nil || namespace == "" || apiCache.namespace != namespace {
-		return nil, errors.New("kubernetes client, matching API cache, and controller namespace are required")
+func NewController(client kubernetes.Interface, apiCache *APICache, namespace string, healthPort int, logger *slog.Logger) (*Controller, error) {
+	if client == nil || apiCache == nil || namespace == "" || apiCache.namespace != namespace || healthPort < 1 || healthPort > 65535 {
+		return nil, errors.New("kubernetes client, matching API cache, controller namespace, and valid node-plugin health port are required")
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -83,7 +82,7 @@ func NewController(client kubernetes.Interface, apiCache *APICache, namespace st
 		namespace:  namespace,
 		logger:     logger,
 		http:       &http.Client{Timeout: probeTimeout},
-		healthPort: pluginHealthPort,
+		healthPort: healthPort,
 		nextEvict:  make(map[evictionKey]time.Time),
 		notified:   make(map[evictionKey]struct{}),
 	}, nil
@@ -183,7 +182,7 @@ func (controller *Controller) reconcileNode(ctx context.Context, node *corev1.No
 	if err := controller.setNodeReady(ctx, node, schedulable); err != nil {
 		controller.logger.ErrorContext(ctx, "update cache scheduling label", "node", node.Name, "nodeUID", node.UID, "error", err)
 	}
-	if schedulable {
+	if schedulable && !status.Evict {
 		return
 	}
 	pods, err := controller.apiCache.PodsOnNode(node.Name)
@@ -206,7 +205,7 @@ func (controller *Controller) reconcilePod(ctx context.Context, pod *corev1.Pod,
 		}
 		return
 	}
-	if !status.Evict && isEstablishedPod(pod) {
+	if isTerminalPod(pod) || (!status.Evict && pod.Status.Phase != corev1.PodPending) {
 		return
 	}
 	key := evictionKey{namespace: pod.Namespace, uid: pod.UID}
@@ -459,6 +458,6 @@ func podReady(pod *corev1.Pod) bool {
 	})
 }
 
-func isEstablishedPod(pod *corev1.Pod) bool {
-	return pod.Status.Phase == corev1.PodRunning && podReady(pod)
+func isTerminalPod(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }

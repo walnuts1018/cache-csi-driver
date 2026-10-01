@@ -157,11 +157,9 @@ func (tracker *Tracker) Current() Snapshot {
 
 func (tracker *Tracker) updateSnapshotLocked() {
 	next := Snapshot{Phase: PhaseReady, Reason: "CacheReady"}
-	evictUnavailable := false
+	requestEviction := false
 	for _, condition := range tracker.conditions {
-		if condition.Phase == PhaseUnavailable && condition.Evict {
-			evictUnavailable = true
-		}
+		requestEviction = requestEviction || condition.Evict
 		if !preferredCondition(condition, next) {
 			continue
 		}
@@ -172,9 +170,7 @@ func (tracker *Tracker) updateSnapshotLocked() {
 			Evict:     condition.Evict,
 		}
 	}
-	if next.Phase == PhaseUnavailable {
-		next.Evict = evictUnavailable
-	}
+	next.Evict = requestEviction
 	if tracker.snapshot.Subsystem == next.Subsystem && tracker.snapshot.Phase == next.Phase && tracker.snapshot.Reason == next.Reason && tracker.snapshot.Evict == next.Evict {
 		next.ChangedAt = tracker.snapshot.ChangedAt
 	} else {

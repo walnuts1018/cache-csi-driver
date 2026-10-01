@@ -120,77 +120,177 @@ func (s *Store) acquireFromMetadata(entry string, options AcquireOptions, meta M
 		s.markDegraded(options.Identity, err)
 		return "", false, err
 	}
+	generationExists, err := s.currentGenerationExists(entry, options.Identity, meta)
+	if err != nil {
+		return "", false, err
+	}
+	policyChanged, err := requestedGenerationPolicyChanged(options.Policy, meta.Policy)
+	if err != nil {
+		return "", false, err
+	}
+	if err := s.validateSharingPolicy(options, meta); err != nil {
+		return "", false, err
+	}
+	return s.acquireWithPolicy(entry, options, meta, generationExists, policyChanged)
+}
+
+func (s *Store) currentGenerationExists(entry, identity string, meta Metadata) (bool, error) {
 	generationPath := filepath.Join(entry, generationsDirectoryName, meta.Generation)
-	generationExists := true
 	if err := s.metadataRepository.stat(generationPath); errors.Is(err, os.ErrNotExist) {
-		generationExists = false
 		if s.activeLeaseCount(meta) > 0 {
 			err := fmt.Errorf("active cache leases reference missing generation %q", meta.Generation)
-			s.markDegraded(options.Identity, err)
-			return "", false, fmt.Errorf("%w: %v", ErrDegradedMetadata, err)
+			s.markDegraded(identity, err)
+			return false, fmt.Errorf("%w: %v", ErrDegradedMetadata, err)
 		}
+		return false, nil
 	} else if err != nil {
-		return "", false, fmt.Errorf("inspect cache generation: %w", err)
+		return false, fmt.Errorf("inspect cache generation: %w", err)
 	}
-	requestedPolicyHash, err := generationPolicyHash(options.Policy)
+	return true, nil
+}
+
+func requestedGenerationPolicyChanged(requested, stored Policy) (bool, error) {
+	requestedPolicyHash, err := generationPolicyHash(requested)
 	if err != nil {
-		return "", false, fmt.Errorf("hash requested cache generation policy: %w", err)
+		return false, fmt.Errorf("hash requested cache generation policy: %w", err)
 	}
-	storedPolicyHash, err := generationPolicyHash(meta.Policy)
+	storedPolicyHash, err := generationPolicyHash(stored)
 	if err != nil {
-		return "", false, fmt.Errorf("hash stored cache generation policy: %w", err)
+		return false, fmt.Errorf("hash stored cache generation policy: %w", err)
 	}
+	return requestedPolicyHash != storedPolicyHash, nil
+}
+
+func (s *Store) validateSharingPolicy(options AcquireOptions, meta Metadata) error {
 	for _, lease := range meta.Leases {
 		_, existingPolicy, err := leaseGenerationAndPolicy(meta, lease)
 		if err != nil {
 			s.markDegraded(options.Identity, err)
-			return "", false, err
+			return err
 		}
 		if options.Policy.SharingPolicy == "Exclusive" || existingPolicy.SharingPolicy == "Exclusive" {
-			return "", false, ErrExclusivePolicyConflict
+			return ErrExclusivePolicyConflict
 		}
 	}
+	return nil
+}
+
+func (s *Store) acquireWithPolicy(entry string, options AcquireOptions, meta Metadata, generationExists, policyChanged bool) (string, bool, error) {
 	objectHasLeases := s.activeLeaseCount(meta) > 0
 	quotaModeChanged := meta.Policy.QuotaEnabled != options.Policy.QuotaEnabled
 	quotaPolicyChanged := quotaModeChanged || meta.Policy.QuotaEnabled && meta.Policy.MaxBytes != options.Policy.MaxBytes
-	if quotaPolicyChanged && objectHasLeases {
+	if quotaPolicyChanged && objectHasLeases && !policyChanged {
 		return "", false, ErrQuotaPolicyConflict
 	}
-	policyChanged := requestedPolicyHash != storedPolicyHash
 	if !objectHasLeases && (policyChanged || quotaModeChanged || meta.Dirty) {
 		if err := s.rejectUnderPressure(); err != nil {
 			return "", false, err
 		}
-		return s.discardAndCreateGeneration(entry, options)
+		return s.discardAndCreateGeneration(entry, options, meta)
 	}
-	if !objectHasLeases && meta.Policy != options.Policy {
-		meta.Policy = options.Policy
-		if err := s.writeMetadata(entry, meta); err != nil {
-			return "", false, fmt.Errorf("update cache policy without changing generation: %w", err)
+	if objectHasLeases && policyChanged {
+		if err := s.rejectUnderPressure(); err != nil {
+			return "", false, err
 		}
+		return s.transitionActiveGeneration(entry, options, meta)
+	}
+	meta, err := s.updateRuntimePolicy(entry, options, meta, objectHasLeases, policyChanged, quotaPolicyChanged)
+	if err != nil {
+		return "", false, err
 	}
 	if !generationExists {
 		if err := s.rejectUnderPressure(); err != nil {
 			return "", false, err
 		}
 	}
-	if generationExists {
-		if !objectHasLeases {
-			options.Policy = meta.Policy
-		}
+	if generationExists && !objectHasLeases {
+		options.Policy = meta.Policy
 	}
 	return s.acquireExisting(entry, options, meta)
 }
 
-func (s *Store) discardAndCreateGeneration(entry string, options AcquireOptions) (string, bool, error) {
-	if err := s.detachToTrash(entry); err != nil {
-		return "", false, fmt.Errorf("discard cache before generation transition: %w", err)
+func (s *Store) updateRuntimePolicy(entry string, options AcquireOptions, meta Metadata, objectHasLeases, policyChanged, quotaPolicyChanged bool) (Metadata, error) {
+	if !objectHasLeases && meta.Policy != options.Policy {
+		meta.Policy = options.Policy
+		if err := s.writeMetadata(entry, meta); err != nil {
+			return meta, fmt.Errorf("update cache policy without changing generation: %w", err)
+		}
 	}
-	if err := s.metadataRepository.ensureDirectory(entry); err != nil {
-		return "", false, fmt.Errorf("create cache entry after generation transition: %w", err)
+	if objectHasLeases && !policyChanged && !quotaPolicyChanged && meta.Policy != options.Policy {
+		// Runtime policy changes apply to future admissions while published leases
+		// retain their mount flags and the quota already attached to their generation.
+		meta.Policy = options.Policy
+		if err := s.writeMetadata(entry, meta); err != nil {
+			return meta, fmt.Errorf("update runtime cache policy: %w", err)
+		}
 	}
-	meta := Metadata{Identity: options.Identity, Generation: uuid.NewV7().String(), CreatedAt: time.Now().UTC(), Policy: options.Policy}
-	return s.createLease(entry, options, meta)
+	return meta, nil
+}
+
+func (s *Store) discardAndCreateGeneration(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
+	oldGeneration := RetiredGeneration{
+		State:           GenerationStateRetired,
+		Generation:      meta.Generation,
+		ProjectID:       meta.ProjectID,
+		ProjectAssigned: meta.ProjectAssigned,
+		QuotaBytes:      meta.QuotaBytes,
+		Policy:          meta.Policy,
+	}
+	if err := s.detachGenerationToTrash(filepath.Join(entry, generationsDirectoryName, meta.Generation), options.Identity, oldGeneration); err != nil {
+		return "", false, fmt.Errorf("discard cache generation before policy update: %w", err)
+	}
+	meta.Generation = uuid.NewV7().String()
+	meta.GenerationState = GenerationStateActive
+	meta.CreatedAt = time.Now().UTC()
+	meta.Policy = options.Policy
+	meta.Dirty = false
+	meta.ProjectID = 0
+	meta.ProjectAssigned = false
+	meta.QuotaBytes = 0
+	path, created, err := s.createLease(entry, options, meta)
+	if err != nil {
+		relative, relativeErr := s.metadataRepository.relative(filepath.Join(entry, generationsDirectoryName, meta.Generation))
+		if relativeErr == nil {
+			err = errors.Join(err, s.metadataRepository.rootFS.RemoveAll(relative))
+		}
+		return "", false, fmt.Errorf("create cache generation after policy update: %w", err)
+	}
+	return path, created, nil
+}
+
+func (s *Store) transitionActiveGeneration(entry string, options AcquireOptions, meta Metadata) (string, bool, error) {
+	oldGeneration := meta.Generation
+	retired := RetiredGeneration{
+		State:           GenerationStateRetiring,
+		Generation:      oldGeneration,
+		ProjectID:       meta.ProjectID,
+		ProjectAssigned: meta.ProjectAssigned,
+		QuotaBytes:      meta.QuotaBytes,
+		Policy:          meta.Policy,
+	}
+	for index := range meta.Leases {
+		if meta.Leases[index].Generation == "" || meta.Leases[index].Generation == oldGeneration {
+			meta.Leases[index].Generation = oldGeneration
+		}
+	}
+	meta.Retired = append(meta.Retired, retired)
+	meta.Generation = uuid.NewV7().String()
+	meta.GenerationState = GenerationStateActive
+	meta.Policy = options.Policy
+	meta.CreatedAt = time.Now().UTC()
+	meta.Dirty = false
+	meta.ProjectID = 0
+	meta.ProjectAssigned = false
+	meta.QuotaBytes = 0
+	path, created, err := s.createLease(entry, options, meta)
+	if err != nil {
+		relative, relativeErr := s.metadataRepository.relative(filepath.Join(entry, generationsDirectoryName, meta.Generation))
+		if relativeErr == nil {
+			err = errors.Join(err, s.metadataRepository.rootFS.RemoveAll(relative))
+		}
+		return "", false, fmt.Errorf("create cache generation while retiring incompatible content: %w", err)
+	}
+	return path, created, nil
 }
 
 func (s *Store) rejectUnderPressure() error {

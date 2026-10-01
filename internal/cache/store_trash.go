@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"maps"
@@ -203,8 +204,13 @@ func (s *Store) detachToTrashMode(path string, preserveMounts bool) error {
 		return errors.New("only a cache object can be quarantined while preserving mounts")
 	}
 	if isObject {
+		meta, _ = s.metadataRepository.readMetadata(path)
 		if preserveMounts {
-			if err := s.writePreservedMountMarker(path); err != nil {
+			sources, err := s.preservedGenerationSources(path, meta)
+			if err != nil {
+				return fmt.Errorf("list cache generations for mount-preserving quarantine: %w", err)
+			}
+			if err := s.writePreservedMountMarker(path, sources); err != nil {
 				return fmt.Errorf("mark cache object for mount-preserving quarantine: %w", err)
 			}
 		} else {
@@ -212,7 +218,6 @@ func (s *Store) detachToTrashMode(path string, preserveMounts bool) error {
 				return fmt.Errorf("unmount cache generation before trash detach: %w", err)
 			}
 		}
-		meta, _ = s.metadataRepository.readMetadata(path)
 	}
 	trashPath := filepath.Join(s.metadataRepository.root, trashDirectoryName, uuid.NewV7().String())
 	trashID := filepath.Base(trashPath)
@@ -238,13 +243,57 @@ func (s *Store) detachToTrashMode(path string, preserveMounts bool) error {
 	return errors.Join(s.metadataRepository.syncDirectory(filepath.Dir(path)), s.metadataRepository.syncDirectory(filepath.Join(s.metadataRepository.root, trashDirectoryName)))
 }
 
-func (s *Store) writePreservedMountMarker(path string) error {
+func (s *Store) preservedGenerationSources(path string, meta Metadata) ([]string, error) {
+	sources := make(map[string]struct{})
+	generationsPath := filepath.Join(path, generationsDirectoryName)
+	entries, err := s.metadataRepository.readDir(generationsPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			sources[filepath.Join(generationsPath, entry.Name())] = struct{}{}
+		}
+	}
+	if meta.Generation != "" {
+		sources[filepath.Join(generationsPath, meta.Generation)] = struct{}{}
+	}
+	for _, retired := range meta.Retired {
+		if retired.Generation != "" {
+			sources[filepath.Join(generationsPath, retired.Generation)] = struct{}{}
+		}
+	}
+	if len(sources) == 0 {
+		sources[path] = struct{}{}
+	}
+	result := make([]string, 0, len(sources))
+	for source := range sources {
+		relative, err := s.metadataRepository.relative(source)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, relative)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func (s *Store) writePreservedMountMarker(path string, sources []string) error {
 	relative, err := s.metadataRepository.relative(filepath.Join(path, preserveMountedTrashMarker))
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(sources)
 	if err != nil {
 		return err
 	}
 	file, err := s.metadataRepository.rootFS.OpenFile(relative, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		_ = s.metadataRepository.rootFS.Remove(relative)
 		return err
 	}
 	if err := file.Sync(); err != nil {
@@ -280,7 +329,14 @@ func (s *Store) trashHasMountedSources(path string) (bool, error) {
 	if s.isGenerationMounted == nil {
 		return true, nil
 	}
-	sources := make([]string, 0)
+	sources, err := s.readPreservedMountSources(path)
+	if err != nil {
+		return true, err
+	}
+	seen := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		seen[source] = struct{}{}
+	}
 	for _, name := range []string{generationsDirectoryName, "."} {
 		directory := path
 		if name != "." {
@@ -295,7 +351,11 @@ func (s *Store) trashHasMountedSources(path string) (bool, error) {
 		}
 		for _, entry := range entries {
 			if entry.IsDir() && (name == generationsDirectoryName || entry.Name() == "generation") {
-				sources = append(sources, filepath.Join(directory, entry.Name()))
+				source := filepath.Join(directory, entry.Name())
+				if _, exists := seen[source]; !exists {
+					sources = append(sources, source)
+					seen[source] = struct{}{}
+				}
 			}
 		}
 	}
@@ -324,6 +384,34 @@ func (s *Store) trashHasMountedSources(path string) (bool, error) {
 		return true, err
 	}
 	return false, nil
+}
+
+func (s *Store) readPreservedMountSources(path string) ([]string, error) {
+	marker := filepath.Join(path, preserveMountedTrashMarker)
+	relative, err := s.metadataRepository.relative(marker)
+	if err != nil {
+		return nil, err
+	}
+	data, err := s.metadataRepository.rootFS.ReadFile(relative)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var saved []string
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return nil, fmt.Errorf("decode preserved cache mount sources: %w", err)
+	}
+	sources := make([]string, 0, len(saved))
+	for _, source := range saved {
+		clean := filepath.Clean(source)
+		if filepath.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return nil, errors.New("preserved cache mount source escapes the cache root")
+		}
+		sources = append(sources, filepath.Join(s.metadataRepository.root, clean))
+	}
+	return sources, nil
 }
 
 func (s *Store) unmountGenerationMounts(path string) error {

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1009,7 +1010,7 @@ func TestAcquireDoesNotDiscardGenerationsWhenMetadataIsMissing(t *testing.T) {
 	}
 }
 
-func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
+func TestAcquireUpdatesRuntimePolicyForSharedGeneration(t *testing.T) {
 	t.Parallel()
 
 	initialPolicy := Policy{
@@ -1056,8 +1057,8 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.Policy != initialPolicy {
-		t.Fatalf("shared generation policy = %+v, want immutable snapshot %+v", meta.Policy, initialPolicy)
+	if meta.Policy != updatedPolicy {
+		t.Fatalf("shared generation runtime policy = %+v, want updated policy %+v", meta.Policy, updatedPolicy)
 	}
 	_, secondLease, _, secondPolicy, found, err := store.LeaseDetails("second-shared-lease")
 	if err != nil || !found {
@@ -1066,8 +1067,12 @@ func TestAcquirePreservesSharedGenerationPolicySnapshot(t *testing.T) {
 	if secondLease.NoExec != updatedPolicy.NoExec {
 		t.Fatalf("second shared lease noexec = %t, want requested policy %t", secondLease.NoExec, updatedPolicy.NoExec)
 	}
-	if secondPolicy != initialPolicy {
-		t.Fatalf("second shared lease policy = %+v, want generation snapshot %+v", secondPolicy, initialPolicy)
+	if secondPolicy != updatedPolicy {
+		t.Fatalf("second shared lease policy = %+v, want updated runtime policy %+v", secondPolicy, updatedPolicy)
+	}
+	_, firstLease, _, _, found, err := store.LeaseDetails(firstLeaseID)
+	if err != nil || !found || !firstLease.NoExec {
+		t.Fatalf("existing shared lease = (%+v, %t, %v), want its original noexec mount option", firstLease, found, err)
 	}
 	if len(meta.Leases) != 2 || meta.Leases[0].Generation != meta.Leases[1].Generation {
 		t.Fatalf("shared leases = %+v, want both leases on the same generation", meta.Leases)
@@ -1189,6 +1194,118 @@ func TestGenerationPolicyHashTracksOnlySchemaVersion(t *testing.T) {
 	}
 }
 
+func TestRuntimePolicyChangesPreserveActiveGeneration(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(t.TempDir(), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	identity := stableIdentity("active-runtime-policy-update")
+	oldPolicy := Policy{SchemaVersion: "v1", SharingPolicy: SharingPolicyShared, NoExec: true, Retention: time.Hour}
+	oldPath, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "runtime-old", Target: filepath.Join(t.TempDir(), "runtime-old"), NoExec: true},
+		Policy:   oldPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedPolicy := oldPolicy
+	updatedPolicy.NoExec = false
+	updatedPolicy.Retention = 24 * time.Hour
+	newPath, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "runtime-new", Target: filepath.Join(t.TempDir(), "runtime-new"), NoExec: false},
+		Policy:   updatedPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newPath != oldPath {
+		t.Fatalf("runtime-only policy update changed generation path from %q to %q", oldPath, newPath)
+	}
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Policy != updatedPolicy {
+		t.Fatalf("stored runtime policy = %+v, want %+v", meta.Policy, updatedPolicy)
+	}
+	if len(meta.Leases) != 2 || !meta.Leases[0].NoExec || meta.Leases[1].NoExec {
+		t.Fatalf("lease mount policies = %+v, want existing noexec retained and new noexec disabled", meta.Leases)
+	}
+}
+
+func TestSchemaChangeRetiresActiveGenerationAndCreatesFreshCache(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(t.TempDir(), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	identity := stableIdentity("active-schema-transition")
+	oldPolicy := Policy{SchemaVersion: "v1", SharingPolicy: SharingPolicyShared}
+	oldTarget := filepath.Join(t.TempDir(), "schema-old")
+	oldPath, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "schema-old", Target: oldTarget},
+		Policy:   oldPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldPath, "warm"), []byte("warm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newPolicy := oldPolicy
+	newPolicy.SchemaVersion = "v2"
+	newPath, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "schema-new", Target: filepath.Join(t.TempDir(), "schema-new")},
+		Policy:   newPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newPath == oldPath {
+		t.Fatal("schema change reused the incompatible active generation")
+	}
+	if contents, err := os.ReadFile(filepath.Join(oldPath, "warm")); err != nil || string(contents) != "warm" {
+		t.Fatalf("old active generation data = (%q, %v), want retained until its lease is released", contents, err)
+	}
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Retired) != 1 || meta.Retired[0].Generation == meta.Generation || meta.Retired[0].State != GenerationStateRetiring {
+		t.Fatalf("retired generation metadata = %+v, want the old active generation in Retiring state", meta.Retired)
+	}
+	if len(meta.Leases) != 2 || meta.Leases[0].Generation != meta.Retired[0].Generation || meta.Leases[1].Generation != meta.Generation {
+		t.Fatalf("generation lease assignment = %+v, want old and new leases on distinct generations", meta.Leases)
+	}
+	if err := store.Release("schema-old", oldTarget); err != nil {
+		t.Fatal(err)
+	}
+	meta, err = store.metadataRepository.readMetadata(filepath.Join(store.Root(), identity))
+	if err != nil || len(meta.Retired) != 0 || meta.Generation == "" {
+		t.Fatalf("metadata after old lease release = (%+v, %v), want only the fresh active generation", meta, err)
+	}
+	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old generation remained in the canonical identity after lease release: %v", err)
+	}
+}
+
 func TestValidateMetadataRejectsNonmatchingPolicyHash(t *testing.T) {
 	t.Parallel()
 	policy := Policy{SchemaVersion: "v1", Retention: time.Hour}
@@ -1248,6 +1365,68 @@ func TestAcquireMarksMissingGenerationWithActiveLeaseAsDegraded(t *testing.T) {
 	}
 	if stored.Generation != meta.Generation || len(stored.Leases) != 1 || stored.Leases[0].ID != "active-missing-generation" {
 		t.Fatalf("metadata after missing generation = %+v, want original generation and lease preserved", stored)
+	}
+}
+
+func TestQuarantineMissingMountedGenerationPreservesTrashUntilMountEnds(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	var mounted atomic.Bool
+	var oldSource string
+	store, err := NewStore(root, StoreOptions{IsGenerationMounted: func(source string) (bool, error) {
+		return source == oldSource && mounted.Load(), nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	identity := stableIdentity("quarantine-missing-mounted-generation")
+	target := filepath.Join(t.TempDir(), "mount")
+	source, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "missing-mounted-generation", Target: target},
+		Policy:   Policy{SharingPolicy: SharingPolicyShared},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSource = source
+	mounted.Store(true)
+	if err := os.RemoveAll(source); err != nil {
+		t.Fatal(err)
+	}
+	store.markDegraded(identity, errors.New("generation directory disappeared"))
+	if err := store.QuarantineDegradedObjectChecked(identity, func(_ string, lease Lease, _ Policy) (bool, error) {
+		return lease.ID == "missing-mounted-generation", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.metadataRepository.readMetadata(filepath.Join(root, identity))
+	if err != nil || meta.Generation == "" || len(meta.Leases) != 0 {
+		t.Fatalf("fresh identity metadata = (%+v, %v), want an empty fresh generation", meta, err)
+	}
+	trashEntries, err := store.metadataRepository.readDir(filepath.Join(root, trashDirectoryName))
+	if err != nil || len(trashEntries) != 1 {
+		t.Fatalf("trash entries after quarantine = (%d, %v), want the old generation retained", len(trashEntries), err)
+	}
+	trashPath := filepath.Join(root, trashDirectoryName, trashEntries[0].Name())
+	if err := store.cleanupTrashBatch(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(trashPath); err != nil {
+		t.Fatalf("mounted generation trash was removed: %v", err)
+	}
+	mounted.Store(false)
+	if err := store.cleanupTrashBatch(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(trashPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unmounted generation trash remains: %v", err)
 	}
 }
 
@@ -1354,6 +1533,73 @@ func TestDamagedProjectRegistryIsRebuiltFromMetadata(t *testing.T) {
 		t.Fatalf("restored project ID = (%d, %v), want %d", gotProjectID, err, projectID)
 	}
 	assertDocumentFormatVersion(t, filepath.Join(root, projectRegistryName), storeFormatVersion)
+}
+
+func TestDamagedTrashMetadataDisablesProjectIDReuse(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	options := StoreOptions{ProjectQuotaEnabled: true, ProjectIDStart: 32000, ProjectIDCount: 4}
+	store, err := NewStore(root, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := stableIdentity("damaged-trash-project")
+	target := filepath.Join(t.TempDir(), "old")
+	policy := Policy{QuotaEnabled: true, MaxBytes: 1024}
+	if _, _, err := store.Acquire(AcquireOptions{
+		Identity: identity,
+		Lease:    Lease{ID: "damaged-trash-project", Target: target},
+		Policy:   policy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.QuotaState(identity, policy.MaxBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.detachToTrash(filepath.Join(root, identity)); err != nil {
+		t.Fatal(err)
+	}
+	trashEntries, err := store.metadataRepository.readDir(filepath.Join(root, trashDirectoryName))
+	if err != nil || len(trashEntries) != 1 {
+		t.Fatalf("trash entries = (%d, %v), want one project-owning object", len(trashEntries), err)
+	}
+	trashMetadataPath := filepath.Join(root, trashDirectoryName, trashEntries[0].Name(), metadataName)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trashMetadataPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, projectRegistryName), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rebuilt, err := NewStore(root, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := rebuilt.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := rebuilt.WaitForIndexes(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := rebuilt.ProjectRegistryError(); err == nil {
+		t.Fatal("damaged trash metadata allowed the project registry to be considered healthy")
+	}
+	newIdentity := stableIdentity("project-after-unknown-trash")
+	if _, _, err := rebuilt.Acquire(AcquireOptions{
+		Identity: newIdentity,
+		Lease:    Lease{ID: "project-after-unknown-trash", Target: filepath.Join(t.TempDir(), "new")},
+		Policy:   policy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := rebuilt.QuotaState(newIdentity, policy.MaxBytes); err == nil {
+		t.Fatal("project ID allocation succeeded while an unknown trash project remained")
+	}
 }
 
 func TestAcquireWaitsForCollectionOfSameIdentity(t *testing.T) {

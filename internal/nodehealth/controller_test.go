@@ -28,21 +28,22 @@ const (
 	testPluginSelector         = "app.kubernetes.io/component=node"
 	testReasonCacheReady       = "CacheReady"
 	testReasonCacheRootFailure = "CacheRootUnavailable"
+	testPendingCachePod        = "workloads/pending"
 )
 
 func TestControllerHealthSchedulingAndEviction(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name                string
-		status              HealthStatus
-		wantReady           bool
-		wantEvictions       int
-		wantEvent           bool
-		wantRunningEviction bool
+		name            string
+		status          HealthStatus
+		wantReady       bool
+		wantEvictionPod []string
+		wantEvent       bool
 	}{
 		{name: "ready", status: HealthStatus{Phase: PhaseReady, Reason: testReasonCacheReady}, wantReady: true},
-		{name: "unavailable without eviction", status: HealthStatus{Phase: PhaseUnavailable, Reason: "CachePressure"}, wantEvictions: 1},
-		{name: "unavailable with eviction", status: HealthStatus{Phase: PhaseUnavailable, Reason: testReasonCacheRootFailure, Evict: true}, wantEvictions: 2, wantEvent: true, wantRunningEviction: true},
+		{name: "unavailable without eviction", status: HealthStatus{Phase: PhaseUnavailable, Reason: "CachePressure"}, wantEvictionPod: []string{testPendingCachePod}},
+		{name: "unavailable with eviction", status: HealthStatus{Phase: PhaseUnavailable, Reason: testReasonCacheRootFailure, Evict: true}, wantEvictionPod: []string{testPendingCachePod, "workloads/running", "workloads/running-not-ready"}, wantEvent: true},
+		{name: "degraded with eviction", status: HealthStatus{Phase: PhaseDegraded, Reason: "CacheMaintenance", Evict: true}, wantReady: true, wantEvictionPod: []string{testPendingCachePod, "workloads/running", "workloads/running-not-ready"}, wantEvent: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -65,14 +66,17 @@ func TestControllerHealthSchedulingAndEviction(t *testing.T) {
 			if got := updatedNode.Labels[ReadyLabel] == readyLabelValue; got != test.wantReady {
 				t.Fatalf("Node ready label = %t, want %t", got, test.wantReady)
 			}
-			if len(evictions) != test.wantEvictions {
-				t.Fatalf("evictions = %v, want %d eviction requests", evictions, test.wantEvictions)
-			}
-			if got := slices.Contains(evictions, "workloads/running"); got != test.wantRunningEviction {
-				t.Fatalf("Running cache Pod eviction = %t, want %t", got, test.wantRunningEviction)
+			slices.Sort(evictions)
+			wantEvictions := slices.Clone(test.wantEvictionPod)
+			slices.Sort(wantEvictions)
+			if !slices.Equal(evictions, wantEvictions) {
+				t.Fatalf("evictions = %v, want %v", evictions, wantEvictions)
 			}
 			if slices.Contains(evictions, "workloads/daemonset-owned") {
 				t.Fatal("evicted a DaemonSet Pod")
+			}
+			if slices.Contains(evictions, "workloads/succeeded") || slices.Contains(evictions, "workloads/failed") {
+				t.Fatalf("evicted a terminal cache Pod: %v", evictions)
 			}
 			if slices.Contains(evictions, "workloads/bare") {
 				t.Fatal("evicted a bare Pod")
@@ -85,6 +89,54 @@ func TestControllerHealthSchedulingAndEviction(t *testing.T) {
 				t.Fatalf("warning Events = %d, want event=%t", len(events.Items), test.wantEvent)
 			}
 		})
+	}
+}
+
+func TestControllerTreatsMissingPluginDaemonSetAsUnavailable(t *testing.T) {
+	t.Parallel()
+	fixture := newControllerFixture(t, HealthStatus{Phase: PhaseReady, Reason: testReasonCacheReady})
+	if err := fixture.client.AppsV1().DaemonSets("system").Delete(t.Context(), "cache-node", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(t, func() bool {
+		pods, err := fixture.controller.apiCache.PluginPods()
+		return err == nil && len(pods) == 0
+	}) {
+		t.Fatal("deleted node-plugin DaemonSet did not produce an empty plugin Pod list")
+	}
+	fixture.controller.Reconcile(t.Context())
+	node, err := fixture.client.CoreV1().Nodes().Get(t.Context(), "worker-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := node.Labels[ReadyLabel]; exists {
+		t.Fatalf("Node kept cache-ready label after its DaemonSet disappeared: %v", node.Labels)
+	}
+}
+
+func TestControllerProbesConfiguredNodePluginHealthPort(t *testing.T) {
+	t.Parallel()
+	fixture := newControllerFixture(t, HealthStatus{Phase: PhaseReady, Reason: testReasonCacheReady})
+	nodes, err := fixture.controller.apiCache.Nodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginPods, err := fixture.controller.apiCache.PluginPods()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := fixture.controller.probeNode(t.Context(), probeCandidate{node: nodes[0], pod: pluginPods[0]})
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	select {
+	case got := <-fixture.transport.requestURLs:
+		const want = "http://127.0.0.1:19807/health"
+		if got != want {
+			t.Fatalf("health probe URL = %q, want %q", got, want)
+		}
+	default:
+		t.Fatal("health transport did not observe a probe request")
 	}
 }
 
@@ -216,25 +268,25 @@ func TestControllerRetriesPDBBlockedEviction(t *testing.T) {
 		return true, nil, nil
 	})
 	fixture.controller.Reconcile(t.Context())
-	if attempts != 2 {
-		t.Fatalf("first reconcile eviction attempts = %d, want two eligible replacement Pods", attempts)
+	if attempts != 3 {
+		t.Fatalf("first reconcile eviction attempts = %d, want three nonterminal replacement Pods", attempts)
 	}
 	fixture.controller.Reconcile(t.Context())
-	if attempts != 2 {
+	if attempts != 3 {
 		t.Fatalf("immediate retry attempts = %d, want retry backoff", attempts)
 	}
 	for key := range fixture.controller.nextEvict {
 		fixture.controller.nextEvict[key] = time.Now().Add(-time.Second)
 	}
 	fixture.controller.Reconcile(t.Context())
-	if attempts != 4 {
-		t.Fatalf("retry attempts = %d, want two retried eviction requests", attempts)
+	if attempts != 6 {
+		t.Fatalf("retry attempts = %d, want three retried eviction requests", attempts)
 	}
 }
 
 func newControllerFixture(t *testing.T, status HealthStatus) *controllerFixture {
 	t.Helper()
-	transport := &testHealthTransport{status: status}
+	transport := &testHealthTransport{status: status, requestURLs: make(chan string, 16)}
 	trueValue := true
 	controllerOwner := func(kind string, uid types.UID) metav1.OwnerReference {
 		return metav1.OwnerReference{APIVersion: "apps/v1", Kind: kind, UID: uid, Controller: &trueValue}
@@ -260,7 +312,10 @@ func newControllerFixture(t *testing.T, status HealthStatus) *controllerFixture 
 		daemonSet,
 		pluginPod,
 		workload("running", corev1.PodRunning, true, controllerOwner("ReplicaSet", "rs-uid")),
+		workload("running-not-ready", corev1.PodRunning, false, controllerOwner("ReplicaSet", "rs-uid")),
 		workload("pending", corev1.PodPending, false, controllerOwner("ReplicaSet", "rs-uid")),
+		workload("succeeded", corev1.PodSucceeded, true, controllerOwner("Job", "job-uid")),
+		workload("failed", corev1.PodFailed, false, controllerOwner("Job", "job-uid")),
 		workload("bare", corev1.PodPending, false, metav1.OwnerReference{}),
 		workload("daemonset-owned", corev1.PodPending, false, controllerOwner("DaemonSet", "workload-daemonset-uid")),
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ordinary", Namespace: "workloads", UID: "ordinary-uid", OwnerReferences: []metav1.OwnerReference{controllerOwner("ReplicaSet", "rs-uid")}}, Spec: corev1.PodSpec{NodeName: node.Name}, Status: corev1.PodStatus{Phase: corev1.PodPending}},
@@ -275,7 +330,7 @@ func newControllerFixture(t *testing.T, status HealthStatus) *controllerFixture 
 	if err := apiCache.Start(informerContext); err != nil {
 		t.Fatal(err)
 	}
-	controller, err := NewController(client, apiCache, "system", nil)
+	controller, err := NewController(client, apiCache, "system", 19807, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,9 +347,14 @@ type controllerFixture struct {
 type testHealthTransport struct {
 	status      HealthStatus
 	unavailable atomic.Bool
+	requestURLs chan string
 }
 
 func (transport *testHealthTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	select {
+	case transport.requestURLs <- request.URL.String():
+	default:
+	}
 	if transport.unavailable.Load() {
 		return nil, errors.New("test health endpoint is unavailable")
 	}
