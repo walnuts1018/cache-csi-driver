@@ -1556,7 +1556,7 @@ func TestDamagedTrashMetadataDisablesProjectIDReuse(t *testing.T) {
 	if _, _, _, err := store.QuotaState(identity, policy.MaxBytes); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.detachToTrash(filepath.Join(root, identity)); err != nil {
+	if err := store.detachToTrashPreservingMounts(filepath.Join(root, identity)); err != nil {
 		t.Fatal(err)
 	}
 	trashEntries, err := store.metadataRepository.readDir(filepath.Join(root, trashDirectoryName))
