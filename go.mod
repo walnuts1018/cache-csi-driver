@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/container-storage-interface/spec v1.13.0
-	github.com/moby/sys/mountinfo v0.7.2
+	github.com/moby/sys/mountinfo v0.7.3
 	github.com/prometheus/client_golang v1.24.1
 	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.48.0
