@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3-trixie AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3-trixie@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385 AS builder
 
 ENV GOTOOLCHAIN=local
 
@@ -32,7 +32,7 @@ RUN --mount=type=bind,source=.,target=. \
     -o /out/cache-csi-node \
     ./cmd/cache-csi-node
 
-FROM docker.io/library/debian:trixie-slim
+FROM docker.io/library/debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 
 ARG VERSION=dev
 ARG REVISION=unknown
