@@ -96,7 +96,7 @@ registrar:
 livenessProbe:
   image:
     repository: registry.k8s.io/sig-storage/livenessprobe
-    tag: v2.20.0
+    tag: v2.20.1
     pullPolicy: IfNotPresent
   resources:
     requests:
