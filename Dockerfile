@@ -32,7 +32,7 @@ RUN --mount=type=bind,source=.,target=. \
     -o /out/cache-csi-node \
     ./cmd/cache-csi-node
 
-FROM docker.io/library/debian:trixie-slim
+FROM docker.io/library/debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
 
 ARG VERSION=dev
 ARG REVISION=unknown
